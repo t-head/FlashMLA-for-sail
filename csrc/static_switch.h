@@ -1,5 +1,15 @@
 #pragma once
 
+#ifdef FLASHATTENTION_DISABLE_UNEVEN_K
+  #define EVENK_SWITCH(COND, CONST_NAME, ...)   \
+  [&] {                                         \
+    constexpr static bool CONST_NAME = true;    \
+    return __VA_ARGS__();                       \
+  }()
+#else
+  #define EVENK_SWITCH BOOL_SWITCH
+#endif
+
 #define CHECK_CUDA(call)                                                                                  \
     do {                                                                                                  \
         cudaError_t status_ = call;                                                                       \

@@ -40,6 +40,17 @@ struct Flash_fwd_mla_params {
 
     void *__restrict__ softmax_lseaccum_ptr;
     void *__restrict__ oaccum_ptr;
+
+    // SAIl Addition
+    int d_rounded, num_splits, seqlen_k, total_q, seqlen_knew,rotary_dim;
+    // array of length b+1 holding starting offset of each sequence.
+    int * __restrict__ cu_seqlens_q;
+    bool is_seqlens_k_cumulative;
+    // If provided, the actual length of each k sequence.
+    int * __restrict__ seqused_k;
+    // The K_new matrices.
+    void * __restrict__ knew_ptr;
+
 };
 
 static constexpr int TileSchedulerMetaDataSize = 8;

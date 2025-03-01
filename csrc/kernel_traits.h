@@ -90,8 +90,8 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemCopyAtom = typename Base::SmemCopyAtom;
     using SmemCopyAtomTransposed = typename Base::SmemCopyAtomTransposed;
 
-    static constexpr bool Share_Q_K_smem = Share_Q_K_smem_;
-    static constexpr bool Is_Q_in_regs = Is_Q_in_regs_ || Share_Q_K_smem;
+    // static constexpr bool Share_Q_K_smem = Share_Q_K_smem_;
+    // static constexpr bool Is_Q_in_regs = Is_Q_in_regs_ || Share_Q_K_smem;
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
@@ -165,7 +165,8 @@ struct Flash_fwd_kernel_traits : public Base {
 
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     static constexpr int kSmemKVSize = (size(SmemLayoutK{}) + size(SmemLayoutV{})) * sizeof(Element);
-    static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
+    // static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
+    static constexpr int kSmemSize = kSmemQSize + kSmemKVSize;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");

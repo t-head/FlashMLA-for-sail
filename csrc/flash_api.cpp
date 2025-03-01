@@ -1,15 +1,15 @@
-/ Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/flash_api.cpp
+// Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/flash_api.cpp
 
 #include <torch/python.h>
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include <mctlass/fast_math.h>
+#include <cutlass/fast_math.h>
 
 #include "flash_mla.h"
 #include "static_switch.h"
-#include "run_mha.h"
+// #include "run_mha.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -36,7 +36,7 @@ get_mla_metadata(
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     int sm_count = dprops->multiProcessorCount;
-    int num_sm_parts = sm_count / num_heads_k / mctlass::ceil_div(num_heads_per_head_k, block_size_m);
+    int num_sm_parts = sm_count / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
 
     auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
     auto num_splits = torch::empty({batch_size + 1}, options);
@@ -129,13 +129,16 @@ mha_fwd_kvcache_mla(
     CHECK_CONTIGUOUS(seqlens_k);
     CHECK_SHAPE(seqlens_k, batch_size);
 
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size_rounded = head_size <= 192 ? round_multiple(head_size, 32) : 256;
+
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
     at::Tensor out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts);
     at::Tensor softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
-    mcFlashAttn::Flash_fwd_mla_params params = {};
+    Flash_fwd_mla_params params = {};
     params.rotary_dim = 0;
     // Set the sizes.
     params.b = batch_size;
@@ -148,6 +151,7 @@ mha_fwd_kvcache_mla(
     params.is_causal = is_causal;
     params.d = head_size;
     params.d_v = head_size_v;
+    params.d_rounded = head_size_rounded;
     params.scale_softmax = softmax_scale;
     params.scale_softmax_log2 = float(softmax_scale * M_LOG2E);
     // Set the pointers and strides.
@@ -173,6 +177,8 @@ mha_fwd_kvcache_mla(
     params.block_table = block_table.data_ptr<int>();
     params.block_table_batch_stride = block_table.stride(0);
     params.page_block_size = page_block_size;
+
+    params.total_q = q.sizes()[0];
 
     TORCH_CHECK(tile_scheduler_metadata.dtype() == torch::kInt32, "tile_scheduler_metadata must have dtype int32");
     TORCH_CHECK(tile_scheduler_metadata.size(1) == TileSchedulerMetaDataSize);

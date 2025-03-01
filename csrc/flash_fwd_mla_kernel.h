@@ -7,6 +7,10 @@
 
 using namespace cute;
 
+#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
+// #include <ATen/cuda/CUDAContext.h>
+#include "flash_mla.h"
+#include "static_switch.h"
 #include "block_info.h"
 #include "kernel_traits.h"
 #include "utils.h"
@@ -23,24 +27,6 @@ using namespace cute;
 
 // Define a macro for unsupported architecture handling to centralize the error message
 #define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires building with sm version sm80-sm90, but was built for < 8.0!");
-
-// Use a macro to clean up kernel definitions
-#define DEFINE_FLASH_FORWARD_KERNEL(kernelName, ...) \
-template<typename Kernel_traits, __VA_ARGS__> \
-__global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_fwd_params params)
-
-DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Split) {
-    #if defined(ARCH_SUPPORTS_FLASH)
-        flash::compute_attn_splitkv<Kernel_traits, Is_causal, Split>(params);
-    #else
-        FLASH_UNSUPPORTED_ARCH
-    #endif
-}
-
-DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int Log_max_splits, bool Is_even_K) {
-    static_assert(Log_max_splits >= 1);
-    flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
-}
 
 namespace flash {
 
@@ -95,7 +81,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
             + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
         const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
-            + m_block * kBlockM) * params.d_value_rounded;
+            + m_block * kBlockM) * params.d_rounded;
         const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
         Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
                                      Shape<Int<kBlockM>, Int<kHeadDimV>>{},
@@ -134,7 +120,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
 
     // We move K and V to the last block.
-    const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
+    const int bidb_cache = bidb;
     const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
     const int block_table_idx = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN / params.page_block_size;
     const int block_table_offset = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
@@ -277,7 +263,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 #if USE_AIU
     int aiu_offset_k = Is_even_K ? 0 : (params.k_row_stride - params.d);
-    int aiu_offset_v = Is_even_K ? 0 : (params.v_row_stride - params.d_value);
+    int aiu_offset_v = Is_even_K ? 0 : (params.v_row_stride - params.d_v);
     gmem_tiled_copy_K.desc_ = AiuDesc{nullptr, kBlockN, params.k_row_stride, kBlockN, Kernel_traits::kBlockKSmem, aiu_offset_k};
     gmem_tiled_copy_V.desc_ = AiuDesc{nullptr, kBlockN, params.v_row_stride, kBlockN, Kernel_traits::kBlockKSmemV, aiu_offset_v};
 
@@ -320,9 +306,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
     // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
-    constexpr int n_masking_steps = (!Is_causal && !Is_local)
-        ? 1
-        : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+    // constexpr int n_masking_steps = (!Is_causal && !Is_local)
+    //     ? 1
+    //     : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+    constexpr int n_masking_steps = 1;
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -356,9 +343,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         );
         // if (cute::thread0()) { print(acc_s); }
 
-        mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
-        );
+        // mask.template apply_mask<Is_causal, Is_even_MN>(
+        //     acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+        // );
 
         flash::cp_async_wait<0>();
         __syncthreads();
@@ -450,9 +437,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             cute::cp_async_fence();
         }
 
-        mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
-        );
+        // mask.template apply_mask</*Causal_mask=*/false>(
+        //     acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+        // );
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/false>(acc_s, acc_o, params.scale_softmax_log2);
 #ifdef USE_PPU
         Tensor rP = flash::convert_acc<Element>(acc_s);
@@ -494,8 +481,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
-                                         + m_block * kBlockM) * params.d_value_rounded;
-    const index_t row_offset_lseaccum = (Split || !params.unpadded_lse ?
+                                         + m_block * kBlockM) * params.d_rounded;
+    // const index_t row_offset_lseaccum = (Split || !params.unpadded_lse ?
+    //         ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q : bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
+    //     ) + m_block * kBlockM;
+    const index_t row_offset_lseaccum = (Split ?
             ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q : bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
         ) + m_block * kBlockM;
 
@@ -543,7 +533,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
     if (!Is_even_K) {
         #pragma unroll
-        for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d_value; }
+        for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d_v; }
     }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
@@ -562,7 +552,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Split, true, true>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Split, true, true, Params>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
@@ -601,7 +591,8 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // This layout maps row_offset_lse to {bidh, q_offset, bidb} or {bidh, bidb, q_offset}.
     Layout flat_layout = make_layout(lse_size);
     Layout orig_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b));
-    auto transposed_stride = params.seqlenq_ngroups_swapped ? make_stride(params.b, params.seqlen_q * params.b, 1) : make_stride(1, params.seqlen_q * params.b, params.seqlen_q);
+    // auto transposed_stride = params.seqlenq_ngroups_swapped ? make_stride(params.b, params.seqlen_q * params.b, 1) : make_stride(1, params.seqlen_q * params.b, params.seqlen_q);
+    auto transposed_stride = make_stride(1, params.seqlen_q * params.b, params.seqlen_q);
     Layout remapped_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b), transposed_stride);
     Layout final_layout = cute::composition(remapped_layout, cute::composition(orig_layout, flat_layout));
 
@@ -655,7 +646,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
     // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
     if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
-        if (params.unpadded_lse) {
+        if (/*params.unpadded_lse=*/false) {
             const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
             if (lse_offset < lse_size) {
                 gLSE_unpadded(lse_offset) = lse_logsum;
@@ -673,7 +664,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     }
     __syncthreads();
 
-    const index_t row_offset_oaccum = bidx * kBlockM * params.d_value_rounded;
+    const index_t row_offset_oaccum = bidx * kBlockM * params.d_rounded;
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum),
                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                  Stride<Int<kHeadDim>, _1>{});
@@ -697,7 +688,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     Tensor tOpOaccum = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
     if (!Is_even_K) {
         #pragma unroll
-        for (int k = 0; k < size(tOpOaccum); ++k) { tOpOaccum(k) = get<1>(tOcOaccum(0, 0, k)) < params.d_value; }
+        for (int k = 0; k < size(tOpOaccum); ++k) { tOpOaccum(k) = get<1>(tOcOaccum(0, 0, k)) < params.d_v; }
     }
     // Load Oaccum in then scale and accumulate to O
     for (int split = 0; split < params.num_splits; ++split) {
@@ -717,7 +708,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             }
         // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
         }
-        tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_value_rounded;
+        tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_rounded;
     }
     // if (cute::thread0()) { print_tensor(tOrO); }
 
@@ -751,14 +742,33 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
 
 } // namespace flash
 
+
+// Use a macro to clean up kernel definitions
+#define DEFINE_FLASH_FORWARD_KERNEL(kernelName, ...) \
+template<typename Kernel_traits, __VA_ARGS__> \
+__global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_fwd_mla_params params)
+
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Split) {
+    #if defined(ARCH_SUPPORTS_FLASH)
+        flash::compute_attn_splitkv<Kernel_traits, Is_causal, Split>(params);
+    #else
+        FLASH_UNSUPPORTED_ARCH
+    #endif
+}
+
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int Log_max_splits, bool Is_even_K) {
+    static_assert(Log_max_splits >= 1);
+    flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 template<typename Kernel_traits, bool Is_causal>
-void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+void run_flash_splitkv_fwd(Flash_fwd_mla_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
     // const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
-    // const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     BOOL_SWITCH(params.num_splits > 1, Split, [&] {                      
         auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, Split>;                    
         if (smem_size >= 48 * 1024) {
@@ -774,13 +784,13 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
         cudaFuncAttributes attr;
         cudaFuncGetAttributes(&attr, kernel);
-        auto dprops = at::cuda::getCurrentDeviceProperties();
+        // auto dprops = at::cuda::getCurrentDeviceProperties();
 
-        printf("blockM:%d, blockN:%d, threads:%d, params.num_splits:%d\n",
-            Kernel_traits::kBlockM, Kernel_traits::kBlockN, Kernel_traits::kNThreads, params.num_splits);
-        printf("seq[%d, %d], grid_n[%d, %d, %d]\n", params.seqlen_q, params.seqlen_k, grid.x, grid.y, grid.z);
-        printf("verg:%d, stack:%d, occpuancy:%0.3f\n", int(attr.numRegs), int(attr.localSizeBytes),
-                float(grid.x * grid.y * grid.z) / float(dprops->multiProcessorCount * ctas_per_sm));
+        // printf("blockM:%d, blockN:%d, threads:%d, params.num_splits:%d\n",
+        //     Kernel_traits::kBlockM, Kernel_traits::kBlockN, Kernel_traits::kNThreads, params.num_splits);
+        // printf("seq[%d, %d], grid_n[%d, %d, %d]\n", params.seqlen_q, params.seqlen_k, grid.x, grid.y, grid.z);
+        // printf("verg:%d, stack:%d, occpuancy:%0.3f\n", int(attr.numRegs), int(attr.localSizeBytes),
+        //         float(grid.x * grid.y * grid.z) / float(dprops->multiProcessorCount * ctas_per_sm));
 
         kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -824,5 +834,5 @@ void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params &params, cudaStream_t stream) 
     constexpr static int kBlockN = 16;
     using Kernel_traits = Flash_fwd_kernel_traits<576, kBlockM, kBlockN, kBlockM / 16, T, 512>;
 
-    run_flash_splitkv_fwd<Kernel_traits, false>>(params, stream);
+    run_flash_splitkv_fwd<Kernel_traits, false>(params, stream);
 }
