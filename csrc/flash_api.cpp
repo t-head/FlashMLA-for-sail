@@ -2,7 +2,7 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
-#include <torch/python.h>
+// #include <torch/python.h>
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include <torch/nn/functional.h>
@@ -639,8 +639,19 @@ mha_fwd_kvcache_mla(
 
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashMLA";
-    m.def("get_mla_metadata", &get_mla_metadata);
-    m.def("fwd_kvcache_mla", &mha_fwd_kvcache_mla);
+#include <Python.h>
+#include "pytorch_shim.h"
+
+TORCH_LIBRARY(_flashmla_C, m) {
+    m.def("get_mla_metadata", make_pytorch_shim(&get_mla_metadata));
+    m.impl("get_mla_metadata", torch::kCUDA, make_pytorch_shim(&get_mla_metadata));
+
+    m.def("fwd_kvcache_mla", make_pytorch_shim(&mha_fwd_kvcache_mla));
+    m.impl("fwd_kvcache_mla", torch::kCUDA, make_pytorch_shim(&mha_fwd_kvcache_mla));
+}
+
+PyMODINIT_FUNC PyInit__flashmla_C() {
+    static struct PyModuleDef module = {
+        PyModuleDef_HEAD_INIT, "_flashmla_C", nullptr, 0, nullptr};
+    return PyModule_Create(&module);                                           
 }
