@@ -1,44 +1,19 @@
+// Inspired by
+// https://github.com/NVIDIA/DALI/blob/main/include/dali/core/static_switch.h
+// and https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/Dispatch.h
+
 #pragma once
 
-#ifdef FLASHATTENTION_DISABLE_UNEVEN_K
-  #define EVENK_SWITCH(COND, CONST_NAME, ...)   \
-  [&] {                                         \
-    constexpr static bool CONST_NAME = true;    \
-    return __VA_ARGS__();                       \
-  }()
-#else
-  #define EVENK_SWITCH BOOL_SWITCH
-#endif
-
-#define CHECK_CUDA(call)                                                                                  \
-    do {                                                                                                  \
-        cudaError_t status_ = call;                                                                       \
-        if (status_ != cudaSuccess) {                                                                     \
-            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(status_)); \
-            exit(1);                                                                                      \
-        }                                                                                                 \
-    } while(0)
-
-#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
-
-
-#define FLASH_ASSERT(cond)                                                                                \
-    do {                                                                                                  \
-        if (not (cond)) {                                                                                 \
-            fprintf(stderr, "Assertion failed (%s:%d): %s\n", __FILE__, __LINE__, #cond);                 \
-            exit(1);                                                                                      \
-        }                                                                                                 \
-    } while(0)
-
-
-#define FLASH_DEVICE_ASSERT(cond)                                                                         \
-    do {                                                                                                  \
-        if (not (cond)) {                                                                                 \
-            printf("Assertion failed (%s:%d): %s\n", __FILE__, __LINE__, #cond);                          \
-            asm("trap;");                                                                                 \
-        }                                                                                                 \
-    } while(0)
-
+/// @param COND       - a boolean expression to switch by
+/// @param CONST_NAME - a name given for the constexpr bool variable.
+/// @param ...       - code to execute for true and false
+///
+/// Usage:
+/// ```
+/// BOOL_SWITCH(flag, BoolConst, [&] {
+///     some_function<BoolConst>(...);
+/// });
+/// ```
 
 #define BOOL_SWITCH(COND, CONST_NAME, ...)      \
   [&] {                                         \
@@ -51,25 +26,95 @@
     }                                           \
   }()
 
+#ifdef FLASHATTENTION_DISABLE_DROPOUT
+  #define DROPOUT_SWITCH(COND, CONST_NAME, ...) \
+  [&] {                                         \
+    constexpr static bool CONST_NAME = false;   \
+    return __VA_ARGS__();                       \
+  }()
+#else
+  #define DROPOUT_SWITCH BOOL_SWITCH
+#endif
 
-#define MLA_NUM_SPLITS_SWITCH(NUM_SPLITS, NAME, ...) \
-  [&] {                                              \
-    if (NUM_SPLITS <= 32) {                          \
-      constexpr static int NAME = 32;                \
-      return __VA_ARGS__();                          \
-    } else if (NUM_SPLITS <= 64) {                   \
-      constexpr static int NAME = 64;                \
-      return __VA_ARGS__();                          \
-    } else if (NUM_SPLITS <= 96) {                   \
-      constexpr static int NAME = 96;                \
-      return __VA_ARGS__();                          \
-    } else if (NUM_SPLITS <= 128) {                  \
-      constexpr static int NAME = 128;               \
-      return __VA_ARGS__();                          \
-    } else if (NUM_SPLITS <= 160) {                  \
-      constexpr static int NAME = 160;               \
-      return __VA_ARGS__();                          \
-    } else {                                         \
-      FLASH_ASSERT(false);                           \
-    }                                                \
+#ifdef FLASHATTENTION_DISABLE_ALIBI
+  #define ALIBI_SWITCH(COND, CONST_NAME, ...)   \
+  [&] {                                         \
+    constexpr static bool CONST_NAME = false;   \
+    return __VA_ARGS__();                       \
+  }()
+#else
+  #define ALIBI_SWITCH BOOL_SWITCH
+#endif
+
+#ifdef FLASHATTENTION_DISABLE_UNEVEN_K
+  #define EVENK_SWITCH(COND, CONST_NAME, ...)   \
+  [&] {                                         \
+    constexpr static bool CONST_NAME = true;    \
+    return __VA_ARGS__();                       \
+  }()
+#else
+  #define EVENK_SWITCH BOOL_SWITCH
+#endif
+
+#ifdef FLASHATTENTION_DISABLE_SOFTCAP
+  #define SOFTCAP_SWITCH(COND, CONST_NAME, ...)   \
+  [&] {                                         \
+    constexpr static bool CONST_NAME = false;    \
+    return __VA_ARGS__();                       \
+  }()
+#else
+  #define SOFTCAP_SWITCH BOOL_SWITCH
+#endif
+
+#ifdef FLASHATTENTION_DISABLE_LOCAL
+  #define LOCAL_SWITCH(COND, CONST_NAME, ...)   \
+  [&] {                                         \
+    constexpr static bool CONST_NAME = false;    \
+    return __VA_ARGS__();                       \
+  }()
+#else
+  #define LOCAL_SWITCH BOOL_SWITCH
+#endif
+
+#define FP16_SWITCH(COND, ...)               \
+  [&] {                                      \
+    if (COND) {                              \
+      using elem_type = cutlass::half_t;     \
+      return __VA_ARGS__();                  \
+    } else {                                 \
+      using elem_type = cutlass::bfloat16_t; \
+      return __VA_ARGS__();                  \
+    }                                        \
+  }()
+
+#define HEADDIM_SWITCH(HEADDIM, ...)   \
+  [&] {                                    \
+    if (HEADDIM <= 32) {                   \
+      constexpr static int kHeadDim = 32;  \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 64) {            \
+      constexpr static int kHeadDim = 64;  \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 96) {            \
+      constexpr static int kHeadDim = 96;  \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 128) {           \
+      constexpr static int kHeadDim = 128; \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 160) {           \
+      constexpr static int kHeadDim = 160; \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 192) {           \
+      constexpr static int kHeadDim = 192; \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 256) {           \
+      constexpr static int kHeadDim = 256; \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 512) {           \
+      constexpr static int kHeadDim = 512; \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 576) {           \
+      constexpr static int kHeadDim = 576; \
+      return __VA_ARGS__();                \
+    }                                      \
   }()

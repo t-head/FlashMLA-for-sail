@@ -64,4 +64,4 @@ def flash_mla_with_kvcache(
         tile_scheduler_metadata,
         num_splits,
     )
-    return out, softmax_lse
+    return out[..., :head_dim_v], softmax_lse

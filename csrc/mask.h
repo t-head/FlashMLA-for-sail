@@ -3,10 +3,11 @@
  ******************************************************************************/
 
 #pragma once
+#include "namespace_config.h"
 
 #include <cute/tensor.hpp>
 
-namespace flash {
+namespace FLASH_NAMESPACE {
 
 using namespace cute;
 
@@ -21,7 +22,6 @@ __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const
 #else
     const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
 #endif
-
     #pragma unroll
     for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
 #ifdef USE_PPU
@@ -166,7 +166,7 @@ struct Mask {
         // if (cute::thread0()) { printf("Has_alibi = %d, Causal_mask=%d, Is_local=%d, Is_even_MN = %d, Need_masking = %d\n", Has_alibi, Causal_mask, Is_local, Is_even_MN, Need_masking); }
         if constexpr (Need_masking) {
             // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
-            Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
+            Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
             // Do we need both row and column indices, or just column incides?
             static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
             const int lane_id = threadIdx.x % 32;
@@ -190,6 +190,7 @@ struct Mask {
 #else
                         const int col_idx = col_idx_base + j;
 #endif
+
                         #pragma unroll
                         for (int mi = 0; mi < size<0>(tensor); ++mi) {
                             // No causal, no local
@@ -223,7 +224,7 @@ struct Mask {
 #ifdef USE_PPU
                                 const int col_idx = col_idx_base + j * 4;
 #else
-                                const int col_idx = col_idx_base + j;  
+                                const int col_idx = col_idx_base + j;
 #endif
                                 if constexpr (Has_alibi) {
                                     if constexpr (Is_causal) {
@@ -259,4 +260,4 @@ struct Mask {
 
 };
 
-} // namespace flash
+} // namespace FLASH_NAMESPACE
