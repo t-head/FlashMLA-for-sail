@@ -2,7 +2,7 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
-// #include <torch/python.h>
+#include <torch/python.h>
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include <torch/nn/functional.h>
@@ -23,6 +23,12 @@
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+/*
+ * TODO: Things to check:
+ * seqlenq_ngroups_swapped
+ * how to determinie num_splits more efficient
+ *
+ */
 namespace FLASH_NAMESPACE {
 
 void set_params_fprop(Flash_fwd_params &params,
@@ -52,7 +58,9 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_right,
                       const float softcap,
                       bool seqlenq_ngroups_swapped=false,
-                      const bool unpadded_lse=false) {
+                      const bool unpadded_lse=false,
+                      int d_v=0,
+                      int d_v_rounded=0) {
 
     // Reset the parameters
     params = {};
@@ -106,6 +114,8 @@ void set_params_fprop(Flash_fwd_params &params,
     params.seqlen_k_rounded = seqlen_k_rounded;
     params.d = d;
     params.d_rounded = d_rounded;
+    params.d_value = d_v;
+    params.d_value_rounded = d_v_rounded;
 
     // Set the different scale values.
     #ifdef FLASHATTENTION_DISABLE_SOFTCAP
@@ -158,11 +168,27 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.unpadded_lse = unpadded_lse;
     params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
+
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
-    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 576, Is_causal>(params, stream);
+    FP16_SWITCH(!params.is_bf16, [&] {
+        HEADDIM_SWITCH(params.d, [&] {
+            HEADDIM_V_SWITCH(params.d_value, [&] {
+                BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+                    if constexpr (kHeadDim == kHeadDim_V) {
+                        if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+                            // run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+                        } else {
+                            // run_mha_fwd_splitkv_dispatch<elem_type, 128, false>(params, stream);
+                        }
+                    } else {
+                        // run_mha_fwd_splithd_splitkv_dispatch<elem_type, 576, 512, Is_causal>(params, stream);
+                        run_mha_fwd_splithd_splitkv_dispatch<elem_type, 576, 512, Is_causal>(params, stream);
+                    }
+                });
+            });
+        });
     });
 }
 
@@ -240,25 +266,6 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     return std::make_tuple(softmax_lse_accum, out_accum);
 }
 
-void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi_slopes_, int batch_size, int num_heads){
-#ifdef FLASHATTENTION_DISABLE_ALIBI
-    TORCH_CHECK(!alibi_slopes_.has_value(), "This flash attention build does not support alibi.");
-    params.alibi_slopes_ptr = nullptr;
-#else
-    if (alibi_slopes_.has_value()) {
-        auto alibi_slopes = alibi_slopes_.value();
-        TORCH_CHECK(alibi_slopes.dtype() == torch::kFloat32, "ALiBi slopes must have dtype fp32");
-        CHECK_DEVICE(alibi_slopes);
-        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
-        TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({num_heads}) || alibi_slopes.sizes() == torch::IntArrayRef({batch_size, num_heads}));
-        params.alibi_slopes_ptr = alibi_slopes.data_ptr();
-        params.alibi_slopes_batch_stride = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
-    } else {
-        params.alibi_slopes_ptr = nullptr;
-    }
-#endif
-}
-
 std::vector<at::Tensor>
 mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
                 const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
@@ -281,17 +288,23 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits
                 ) {
-
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    // bool is_sm75 = cc_major == 7 && cc_minor == 5;
+    bool is_sm8x = cc_major == 8 && cc_minor >= 0;
+    bool is_sm90 = cc_major == 9 && cc_minor == 0;
+    TORCH_CHECK(is_sm90 || is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
+    // We will support Turing in the near future
+    // TORCH_CHECK(is_sm90 || is_sm8x || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
+    if (q_dtype == torch::kBFloat16) {
+        TORCH_CHECK(is_sm90 || is_sm8x, "bfloat16 is only supported on Ampere GPUs or newer");
+    }
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
 
@@ -302,11 +315,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(vcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
     at::Tensor block_table;
-    //const bool paged_KV = block_table_.has_value();
     const bool paged_KV = true;
     if (paged_KV) {
         TORCH_CHECK(!cache_batch_idx_.has_value(), "Paged KVcache does not support cache_batch_idx");
-        //block_table = block_table_.value();
         block_table = block_table_;
         CHECK_DEVICE(block_table);
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
@@ -319,18 +330,17 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     int seqlen_q = sizes[1];
     int num_heads = sizes[2];
     const int head_size_og = sizes[3];
-    const int seqlen_q_og = seqlen_q;
-    const int num_heads_og = num_heads;
+    const int head_size_og_value = vcache.size(3);
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
     const int page_block_size = !paged_KV ? 1 : kcache.size(1);
-    TORCH_CHECK(!paged_KV || page_block_size % 16 == 0, "Paged KV cache block size must be divisible by 16");
+    //TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
     const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size;
     const int num_heads_k = kcache.size(2);
     const int batch_size_c = !paged_KV ? kcache.size(0) : batch_size;
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size_og <= 576, "FlashAttention forward only supports head dimension at most 576"); // to support MLA
+    // TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     // causal=true is the same as causal=false in this case
@@ -353,10 +363,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     if (!paged_KV) {
         CHECK_SHAPE(kcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
-        CHECK_SHAPE(vcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
+        CHECK_SHAPE(vcache, batch_size_c, seqlen_k, num_heads_k, head_size_og_value);
     } else {
         CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_og);
-        CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_og);
+        CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_og_value);
         CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
 
@@ -371,30 +381,30 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         vcache_padded = vcache;
     }
 
+    auto opts = q.options();
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        CHECK_SHAPE(out, batch_size, seqlen_q_og, num_heads_og, head_size_og);
-        if (head_size_og % 8 != 0) {
-            out = torch::empty_like(q_padded);
-        } else if (seqlenq_ngroups_swapped) {
-            out = out.reshape({batch_size, num_heads, seqlen_q, head_size_og}).transpose(1, 2);
-        }
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og_value);
+        if (head_size_og_value % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
-        out = torch::empty_like(q_padded);
+        out = torch::empty({ batch_size, seqlen_q, num_heads, head_size_og_value }, opts);
+    }
+
+    if (head_size_og_value % 8 != 0) {
+        out = torch::nn::functional::pad(out, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og_value % 8}));
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size = round_multiple(head_size_og, 8);
-    //const int head_size_rounded = head_size <= 192 ? round_multiple(head_size, 32) : 256;
-    const int head_size_rounded = round_multiple(head_size, 32); // to support MLA
+    const int head_size_rounded = round_multiple(head_size, 32);
+    const int head_size_v = round_multiple(head_size_og_value, 8);
+    const int head_size_v_rounded = round_multiple(head_size_v, 32);
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
-
-    auto opts = q.options();
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
@@ -415,8 +425,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     softcap
-                     );
+                     softcap,
+                     false,
+                     false,
+                     head_size_v,
+                     head_size_v_rounded);
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
@@ -432,14 +445,17 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         TORCH_CHECK(v.stride(-1) == 1, "Value tensor must have contiguous last dimension");
         int seqlen_knew = k.size(1);
         CHECK_SHAPE(k, batch_size, seqlen_knew, num_heads_k, head_size_og);
-        CHECK_SHAPE(v, batch_size, seqlen_knew, num_heads_k, head_size_og);
-        if (head_size_og % 8 != 0) {
-            k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-            v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-        } else {
-            k_padded = k;
-            v_padded = v;
-        }
+        CHECK_SHAPE(v, batch_size, seqlen_knew, num_heads_k, head_size_og_value);
+        // if (head_size_og % 8 != 0) {
+        //     k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        //     v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        // } else {
+        //     k_padded = k;
+        //     v_padded = v;
+        // }
+        TORCH_CHECK(head_size_og % 8 == 0, "KV head size must be divisible by 8");
+        k_padded = k;
+        v_padded = v;
         params.seqlen_knew = seqlen_knew;
         params.knew_ptr = k_padded.data_ptr();
         params.vnew_ptr = v_padded.data_ptr();
@@ -509,7 +525,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     at::Tensor softmax_lse_accum, out_accum;
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
-        head_size_rounded, /*dropout*/ 0.f, num_splits, get_num_sm(get_current_device()), opts);
+        head_size_v_rounded, /*dropout*/ 0.f, num_splits, get_num_sm(get_current_device()), opts);
+
+    params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
@@ -517,8 +535,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     params.page_block_size = page_block_size;
 
+    //set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
-    set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
     // export PPU_LIB_SHOW_PARAMS=1
     ppu::fmha::FmhaProfParam fmha_prof_params;
     if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
@@ -526,7 +544,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
             true/*dir*/, params.is_bf16/*data_type*/,
             params.is_causal/*custom_mask*/, params.b/*batch_size*/,
             params.h/*num_heads*/, params.h_k/*num_heads_k*/,
-            params.d/*head_dim*/, params.d/*head_dim_value*/,
+            params.d/*head_dim*/, params.d_value/*head_dim_value*/,
             params.seqlen_q/*seqlen_q*/, params.seqlen_k/*seqlen_k*/,
             params.p_dropout/*dropout*/, params.scale_softmax/*scale*/,
             params.window_size_left, /*window_size_left*/
@@ -540,27 +558,30 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
     // or paged KV cache
+
+    // if (params.d == params.d_value)
     run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
+    // else
+    // run_gqa_splithd_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
 
-    ppu::fmha::ProfilingInterface::Instance().instrument(false, fmha_prof_params);
-
-    if (head_size_og % 8 != 0) {
-        out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-        if (out_.has_value()) { out_.value().copy_(out); }
-        if (k_.has_value()) {
-            // It's expensive to copy the KV cache here for the case where head size not divisible by 8,
-            // but we don't expect to get this case in practice. This is just so that the code works for that case.
-            kcache.copy_(kcache_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
-            vcache.copy_(vcache_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
-        }
-    }
+    // if (head_size_og % 8 != 0) {
+    //     out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+    //     if (out_.has_value()) { out_.value().copy_(out); }
+    //     if (k_.has_value()) {
+    //         // It's expensive to copy the KV cache here for the case where head size not divisible by 8,
+    //         // but we don't expect to get this case in practice. This is just so that the code works for that case.
+    //         kcache.copy_(kcache_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
+    //         vcache.copy_(vcache_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
+    //     }
+    // }
 
     if (seqlenq_ngroups_swapped) {
-        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
+        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og_value});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
     return {out, softmax_lse};
 }
+
 } // namespace FLASH_NAMESPACE
 
 std::vector<at::Tensor>
@@ -590,6 +611,7 @@ get_mla_metadata(
         num_splits,
     )
     */
+
 
 std::vector<at::Tensor>
 mha_fwd_kvcache_mla(
@@ -629,7 +651,14 @@ mha_fwd_kvcache_mla(
 
      */
     std::optional<at::Tensor> fake_tensor;
-    return flash::mha_fwd_kvcache(q, kcache, kcache, \
+    at::Tensor vcache  = kcache.index({
+        at::indexing::Slice(),
+        at::indexing::Slice(),
+        at::indexing::Slice(),
+        at::indexing::Slice(0, 512)    // 第二个维度取前100列
+    }).clone();
+
+    return flash::mha_fwd_kvcache(q, kcache, vcache, \
                            std::nullopt, std::nullopt, \
                            seqlens_k, \
                            std::nullopt, std::nullopt, std::nullopt, std::nullopt, \
@@ -639,19 +668,8 @@ mha_fwd_kvcache_mla(
 
 }
 
-#include <Python.h>
-#include "pytorch_shim.h"
-
-TORCH_LIBRARY(_flashmla_C, m) {
-    m.def("get_mla_metadata", make_pytorch_shim(&get_mla_metadata));
-    m.impl("get_mla_metadata", torch::kCUDA, make_pytorch_shim(&get_mla_metadata));
-
-    m.def("fwd_kvcache_mla", make_pytorch_shim(&mha_fwd_kvcache_mla));
-    m.impl("fwd_kvcache_mla", torch::kCUDA, make_pytorch_shim(&mha_fwd_kvcache_mla));
-}
-
-PyMODINIT_FUNC PyInit__flashmla_C() {
-    static struct PyModuleDef module = {
-        PyModuleDef_HEAD_INIT, "_flashmla_C", nullptr, 0, nullptr};
-    return PyModule_Create(&module);                                           
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "FlashMLA";
+    m.def("get_mla_metadata", &get_mla_metadata);
+    m.def("fwd_kvcache_mla", &mha_fwd_kvcache_mla);
 }

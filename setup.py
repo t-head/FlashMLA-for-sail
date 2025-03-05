@@ -22,13 +22,13 @@ def append_nvcc_threads(nvcc_extra_args):
 def get_sources():
     sources = [
         "csrc/flash_api.cpp",
-        "csrc/flash_fwd_split_hdim576_bf16_causal_sm80.cu",
-        "csrc/flash_fwd_split_hdim576_bf16_sm80.cu",
+        "csrc/flash_fwd_split_hdim576_512_bf16_causal_sm80.cu",
+        "csrc/flash_fwd_split_hdim576_512_bf16_sm80.cu",
     ]
 
     if not DISABLE_FP16:
-        sources.append("csrc/flash_fwd_split_hdim576_fp16_causal_sm80.cu")
-        sources.append("csrc/flash_fwd_split_hdim576_fp16_sm80.cu")
+        sources.append("csrc/flash_fwd_split_hdim576_512_fp16_causal_sm80.cu")
+        sources.append("csrc/flash_fwd_split_hdim576_512_fp16_sm80.cu")
 
     return sources
 
@@ -40,7 +40,7 @@ def get_features_args():
     return features_args
 
 
-# subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 cc_flag = []
 cc_flag.append("-gencode")

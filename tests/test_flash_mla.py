@@ -38,9 +38,9 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str) -> None:
 
 
 @torch.inference_mode()
-def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
+def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_block_size):
     print(
-        f"{b=}, {s_q=}, {mean_sk=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {causal=}, {varlen=}"
+        f"{b=}, {s_q=}, {mean_sk=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {causal=}, {varlen=}, {paged_block_size=}"
     )
 
     cache_seqlens = torch.full((b,), mean_sk, dtype=torch.int32)
@@ -54,15 +54,14 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
     # print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
 
     q = torch.randn(b, s_q, h_q, d)
-    block_size = 64
+    block_size = paged_block_size
     block_table = torch.arange(
         b * max_seqlen_pad // block_size, dtype=torch.int32
     ).view(b, max_seqlen_pad // block_size)
     blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = (
-            0.0
-            #float("nan")
+            float("nan")
         )
     blocked_v = blocked_k[..., :dv]
 
@@ -100,8 +99,11 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
             lse[i] = LSE
         return out, lse
 
-    out_flash, lse_flash = flash_mla()
+    out_flash_, lse_flash = flash_mla()
+    out_flash = out_flash_[..., :dv]
     out_torch, lse_torch = ref_mla()
+    diff = out_flash - out_torch
+    print(f'diff.max = {diff.max()}, diff.min = {diff.min()}')
     cal_diff(out_flash, out_torch, "out")
     cal_diff(lse_flash, lse_torch, "lse")
 
@@ -132,7 +134,8 @@ def main(torch_dtype):
             for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
                 for s_q in [1, 2]:  # MTP = 1, 2
                     for varlen in [False, True]:
-                        test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen)
+                        for paged_block_size in [64, 16, 256]:
+                            test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ python setup.py install
 python tests/test_flash_mla.py
 ```
 
-Achieving up to 3000 GB/s in memory-bound configuration and 580 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.6.
+Achieving up to 3000 GB/s in memory-bound configuration and 580 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.8.
 
 ### Usage
 
@@ -42,6 +42,7 @@ for i in range(num_layers):
 
 - Hopper GPUs
 - CUDA 12.3 and above
+    - **But we highly recommend 12.8 or above for the best performance**
 - PyTorch 2.0 and above
 
 ## Acknowledgement
@@ -52,7 +53,7 @@ FlashMLA is inspired by [FlashAttention 2&3](https://github.com/dao-AILab/flash-
 
 ```bibtex
 @misc{flashmla2025,
-      title={FlashMLA: Efficient MLA decoding kernel}, 
+      title={FlashMLA: Efficient MLA decoding kernels},
       author={Jiashi Li},
       year={2025},
       publisher = {GitHub},
