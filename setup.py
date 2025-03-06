@@ -37,6 +37,8 @@ def get_features_args():
     features_args = []
     if DISABLE_FP16:
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    features_args.append("-DFLASH_MLA_STANDALONE_BUILD")
+
     return features_args
 
 

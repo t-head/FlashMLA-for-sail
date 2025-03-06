@@ -668,6 +668,18 @@ mha_fwd_kvcache_mla(
 
 }
 
+
+#ifdef FLASH_MLA_STANDALONE_BUILD
+
+#include <torch/python.h>
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "FlashMLA";
+    m.def("get_mla_metadata", &get_mla_metadata);
+    m.def("fwd_kvcache_mla", &mha_fwd_kvcache_mla);
+}
+
+#else
+
 #include <Python.h>
 #include "pytorch_shim.h"
 
@@ -684,3 +696,4 @@ PyMODINIT_FUNC PyInit__flashmla_C() {
         PyModuleDef_HEAD_INIT, "_flashmla_C", nullptr, 0, nullptr};
     return PyModule_Create(&module);                                           
 }
+#endif // FLASH_MLA_STANDALONE_BUILD
