@@ -42,18 +42,15 @@ def get_features_args():
     return features_args
 
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+# subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 cc_flag = []
 cc_flag.append("-gencode")
-cc_flag.append("arch=compute_90a,code=sm_90a")
+cc_flag.append("arch=compute_80,code=sm_80")
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-if IS_WINDOWS:
-    cxx_args = ["/O2", "/std:c++17", "/DNDEBUG", "/W0"]
-else:
-    cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
+cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
 ext_modules = []
 ext_modules.append(

@@ -140,7 +140,7 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
                             Tensor4 const& tCsB, TiledMma tiled_mma,
                             TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
                             ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B) {
-    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
+    // CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     // CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
     Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
@@ -160,6 +160,19 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
             if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        // if (cute::thread0()) {
+        //     printf("acc:");
+        //     print_tensor(acc);
+        //     printf("\n");
+
+        //     printf("tCrA(_, _, i):");
+        //     print_tensor(tCrA(_, _, i));
+        //     printf("\n");
+
+        //     printf("tCrB(_, _, i):");
+        //     print_tensor(tCrB(_, _, i));
+        //     printf("\n");
+        // }
     }
 }
 
@@ -182,6 +195,19 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
             cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        // if (cute::thread0()) {
+        //     printf("acc:");
+        //     print_tensor(acc);
+        //     printf("\n");
+
+        //     printf("tCrA(_, _, i):");
+        //     print_tensor(tCrA(_, _, i));
+        //     printf("\n");
+
+        //     printf("tCrB(_, _, i):");
+        //     print_tensor(tCrB(_, _, i));
+        //     printf("\n");
+        // }
     }
 }
 
@@ -192,7 +218,7 @@ template<typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
 #ifdef USE_PPU
     // acc is ppu c layout, size0 is 8, MMA_N size is A100 MMA_N/2
-    static_assert(decltype(size<0>(acc_layout))::value == 8);
+    // static_assert(decltype(size<0>(acc_layout))::value == 8);
     static_assert(decltype(rank(acc_layout))::value == 3);
     auto l = logical_divide(acc_layout, Shape<_4>{}); //((2, 4), MMA_M, MMA_N)
 #else

@@ -23,7 +23,7 @@
 #define make_mix_tensor_like(x)  x
 #endif
 
-using namespace cute;
+using namespace cute;;
 
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t>
 struct Flash_kernel_traits {
@@ -43,8 +43,10 @@ struct Flash_kernel_traits {
     using MMA_Atom_Arch = std::conditional_t<
         std::is_same_v<elem_type, cutlass::half_t>,
 #ifdef USE_PPU
-        MMA_Atom<PPU_16x16x16_F32F16F16F32_TN>,
-        MMA_Atom<PPU_16x16x16_F32BF16BF16F32_TN>
+        // MMA_Atom<PPU_16x16x16_F32F16F16F32_TN>,
+        // MMA_Atom<PPU_16x16x16_F32BF16BF16F32_TN>
+        MMA_Atom<Acompute10000_8x16x16_F32F16F16F32_TN>,
+        MMA_Atom<Acompute10000_8x16x16_F32BF16BF16F32_TN>
 #else
         MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
         MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>
@@ -55,11 +57,13 @@ struct Flash_kernel_traits {
 #endif
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
-    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
+    // using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
+    using SmemCopyAtom = Copy_Atom<SM75_U32x2_LDSM_N, elem_type>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+
 #if USE_AIU
     static constexpr int kBlockKSmem = kHeadDim_ % 64 == 0 ? 64 : 32;
-    using SmemCopyOpQ = Acompute10000_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false>;
+    using SmemCopyOpQ = Acompute10000_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false, 1, 2>;
     using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, elem_type>;
 
     using SmemCopyOpQt = Acompute10000_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, true>;
@@ -123,7 +127,7 @@ struct Flash_fwd_kernel_traits : public Base {
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
-        Tile<Int<16 * kNWarps>, _16, _16>>;
+        Tile<Int<8 * kNWarps>, _16, _16>>;
 
 #if USE_AIU
     using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>;
@@ -168,7 +172,8 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>;
 
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
-    static constexpr int kSmemKVSize = (size(SmemLayoutK{}) + size(SmemLayoutV{})) * sizeof(Element);
+    // static constexpr int kSmemKVSize = (size(SmemLayoutK{}) + size(SmemLayoutV{})) * sizeof(Element);
+    static constexpr int kSmemKVSize = (size(SmemLayoutK{}) * 2) * sizeof(Element);
     static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -261,6 +266,7 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
                         GmemLayoutAtomOaccum{},
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
+
     using GmemLayoutAtomRotcossin = GmemLayoutAtom;
     using GmemTiledCopyRotcossin = decltype(
         make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},

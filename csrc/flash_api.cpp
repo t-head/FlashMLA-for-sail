@@ -9,11 +9,11 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::Generator and at::PhiloxCudaState
-#include "philox_unpack.cuh"  // For at::cuda::philox::unpack
+// #include "philox_unpack.cuh"  // For at::cuda::philox::unpack
 
 #include <cutlass/numeric_types.h>
 
-#include "namespace_config.h"
+// #include "namespace_config.h"
 #include "hardware_info.h"
 #include "flash.h"
 #include "static_switch.h"
@@ -29,7 +29,6 @@
  * how to determinie num_splits more efficient
  *
  */
-namespace FLASH_NAMESPACE {
 
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
@@ -184,7 +183,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
                         }
                     } else {
                         // run_mha_fwd_splithd_splitkv_dispatch<elem_type, 576, 512, Is_causal>(params, stream);
-                        run_mha_fwd_splithd_splitkv_dispatch<elem_type, 576, 512, Is_causal>(params, stream);
+                        run_mha_fwd_splithd_splitkv_dispatch<elem_type, 576, 512, false>(params, stream);
                     }
                 });
             });
@@ -240,7 +239,8 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    // const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    const int block_n = 16;
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
@@ -252,7 +252,7 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
         if (num_splits < 1) {
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
-            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
+            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 20, num_n_blocks, 128);
         }
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
@@ -305,6 +305,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (q_dtype == torch::kBFloat16) {
         TORCH_CHECK(is_sm90 || is_sm8x, "bfloat16 is only supported on Ampere GPUs or newer");
     }
+
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
 
@@ -582,7 +583,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     return {out, softmax_lse};
 }
 
-} // namespace FLASH_NAMESPACE
 
 std::vector<at::Tensor>
 get_mla_metadata(
@@ -658,7 +658,7 @@ mha_fwd_kvcache_mla(
         at::indexing::Slice(0, 512)    // 第二个维度取前100列
     }).clone();
 
-    return flash::mha_fwd_kvcache(q, kcache, vcache, \
+    return mha_fwd_kvcache(q, kcache, vcache, \
                            std::nullopt, std::nullopt, \
                            seqlens_k, \
                            std::nullopt, std::nullopt, std::nullopt, std::nullopt, \

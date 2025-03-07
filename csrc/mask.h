@@ -158,7 +158,7 @@ struct Mask {
         static_assert(!(Causal_mask && Is_local), "Cannot be both causal and local");
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
 #ifdef USE_PPU
-        static_assert(decltype(size<0>(tensor_))::value == 8, "First dimension must be 8");
+        static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
 #else
         static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
 #endif

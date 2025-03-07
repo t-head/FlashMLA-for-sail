@@ -44,6 +44,8 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
     )
 
     cache_seqlens = torch.full((b,), mean_sk, dtype=torch.int32)
+    # print(cache_seqlens)
+
     if varlen:
         for i in range(b):
             cache_seqlens[i] = max(random.normalvariate(mean_sk, mean_sk / 2), s_q)
@@ -51,14 +53,19 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
     mean_seqlens = cache_seqlens.float().mean().int().item()
     max_seqlen = cache_seqlens.max().item()
     max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
-    # print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
+    print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
 
     q = torch.randn(b, s_q, h_q, d)
+    # q = torch.ones(b, s_q, h_q, d)
+
     block_size = paged_block_size
     block_table = torch.arange(
         b * max_seqlen_pad // block_size, dtype=torch.int32
     ).view(b, max_seqlen_pad // block_size)
     blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
+
+    # blocked_k = torch.ones(block_table.numel(), block_size, h_kv, d)
+    
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = (
             float("nan")
@@ -102,19 +109,25 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
     out_flash_, lse_flash = flash_mla()
     out_flash = out_flash_[..., :dv]
     out_torch, lse_torch = ref_mla()
+    # print("out_flash:")
+    # print(out_flash)
+
+    # print("out_torch:")
+    # print(out_torch)
+
     diff = out_flash - out_torch
     print(f'diff.max = {diff.max()}, diff.min = {diff.min()}')
     cal_diff(out_flash, out_torch, "out")
     cal_diff(lse_flash, lse_torch, "lse")
 
-    t = triton.testing.do_bench(flash_mla)
-    FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
-    bytes = (total_seqlens * h_kv * d + b * s_q * h_q * d + b * s_q * h_q * dv) * (
-        torch.finfo(q.dtype).bits // 8
-    )
-    print(
-        f"{t:.3f} ms, {FLOPS / 10 ** 9 / t:.0f} TFLOPS, {bytes / 10 ** 6 / t:.0f} GB/s"
-    )
+    # t = triton.testing.do_bench(flash_mla)
+    # FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
+    # bytes = (total_seqlens * h_kv * d + b * s_q * h_q * d + b * s_q * h_q * dv) * (
+    #     torch.finfo(q.dtype).bits // 8
+    # )
+    # print(
+    #     f"{t:.3f} ms, {FLOPS / 10 ** 9 / t:.0f} TFLOPS, {bytes / 10 ** 6 / t:.0f} GB/s"
+    # )
 
 
 def main(torch_dtype):
@@ -127,7 +140,15 @@ def main(torch_dtype):
 
     h_kv = 1
     d, dv = 576, 512
-    causal = True
+    causal = False
+
+    # b = 2
+    # s = 2048
+    # s_q = 1
+    # h_q = 128
+    # varlen = False
+    # paged_block_size = 64
+    # test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
 
     for b in [128]:
         for s in [4096, 8192]:
