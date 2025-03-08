@@ -109,11 +109,6 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
     out_flash_, lse_flash = flash_mla()
     out_flash = out_flash_[..., :dv]
     out_torch, lse_torch = ref_mla()
-    # print("out_flash:")
-    # print(out_flash)
-
-    # print("out_torch:")
-    # print(out_torch)
 
     diff = out_flash - out_torch
     print(f'diff.max = {diff.max()}, diff.min = {diff.min()}')
@@ -142,8 +137,8 @@ def main(torch_dtype):
     d, dv = 576, 512
     causal = False
 
-    # b = 2
-    # s = 2048
+    # b = 1
+    # s = 1024
     # s_q = 1
     # h_q = 128
     # varlen = False
