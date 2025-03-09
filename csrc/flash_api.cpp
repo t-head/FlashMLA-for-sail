@@ -79,7 +79,6 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     if (num_splits < 1) {
         // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
         params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 20 * 3, num_n_blocks, 128);
-        // params.num_splits = 4;
     }
         
     if (params.num_splits > 1) {
@@ -180,6 +179,7 @@ mha_fwd_kvcache_mla(
     params.h_h_k_ratio = num_heads / num_heads_k;
     params.ngroups = ngroups;
     params.is_causal = is_causal;
+
     params.d = head_size;
     params.d_v = head_size_v;
     params.scale_softmax = softmax_scale;

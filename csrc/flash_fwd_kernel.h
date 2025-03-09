@@ -58,12 +58,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
     if (Is_causal) {
         n_block_max = std::min(n_block_max,
-                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q, kBlockN));
+                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q / params.ngroups, kBlockN));
     }
-
-    // if (cute::thread0()) {
-    //     printf("n_block_max:%d, n_block_min:%d, binfo.actual_seqlen_k:%d, kBlockN:%d, n_blocks_per_split:%d, num_n_splits:%d,\n",
-    //         n_block_max, n_block_min, binfo.actual_seqlen_k, kBlockN, n_blocks_per_split, num_n_splits);
+    // if (threadIdx.x == 0) {
+    //     printf("block:%d, n_block_max:%d, n_block_min:%d, binfo.actual_seqlen_k:%d, kBlockN:%d, n_blocks_per_split:%d, num_n_splits:%d,\n",
+    //         blockIdx.x, n_block_max, n_block_min, binfo.actual_seqlen_k, kBlockN, n_blocks_per_split, num_n_splits);
     // }
 
     if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
@@ -282,16 +281,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
     cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
 
-
     clear(acc_o);
 
     flash::Softmax<size<1>(acc_o)> softmax;
 
-    flash::Mask<Is_causal, false, false> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, 0, 0, 0.0f);
+    flash::Mask mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
     constexpr int n_masking_steps = (!Is_causal)
         ? 1
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -330,7 +329,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         );
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 8 + (tidx % 32) / 4, kNWarps * 8, params.ngroups
         );
 
         // We have key_padding_mask so we'll need to Check_inf
@@ -366,7 +365,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         flash::cp_async_wait<0>();
         __syncthreads();
 
-
         if (n_block > n_block_min) {
             // Advance gK
             auto tKsK_current = kv_store_num % 2 == 0 ? tKsK : tKsK_double;
@@ -395,9 +393,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             smem_thr_copy_Q, smem_thr_copy_K
         );
 
-        mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
-        );
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/false>(acc_s, acc_o, params.scale_softmax_log2);
 #ifdef USE_PPU
         Tensor rP = flash::convert_acc<Element>(acc_s);

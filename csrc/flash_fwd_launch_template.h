@@ -51,7 +51,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 C10_CUDA_CHECK(cudaFuncSetAttribute(
                     kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
             }
-
+#if 0
             int ctas_per_sm;
             cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
@@ -65,11 +65,12 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             int sm_count = dprops->multiProcessorCount == 64 ? 20 : dprops->multiProcessorCount;
             printf("blockM:%d, blockN:%d, threads:%d, params.num_splits:%d, block_size:%d\n",
                     Kernel_traits::kBlockM, Kernel_traits::kBlockN, Kernel_traits::kNThreads, params.num_splits, params.page_block_size);
+            printf("Is_causal:%d, ngroups:%d\n", Is_causal, params.ngroups);
             printf("seq[%d, %d], grid_n[%d, %d, %d]\n",
                     params.seqlen_q, params.seqlen_k, grid.x, grid.y, grid.z);
             printf("verg:%d, stack:%d, sm:%d, occpuancy:%0.3f\n", int(attr.numRegs), int(attr.localSizeBytes), sm_count,
                     float(grid.x * grid.y * grid.z) / float(sm_count * ctas_per_sm));
-
+#endif
             kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });

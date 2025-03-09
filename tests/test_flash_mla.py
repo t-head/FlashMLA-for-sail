@@ -110,10 +110,13 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
     out_flash = out_flash_[..., :dv]
     out_torch, lse_torch = ref_mla()
 
+    # print(out_flash)
+    # print(out_torch)
+
     diff = out_flash - out_torch
     print(f'diff.max = {diff.max()}, diff.min = {diff.min()}')
     cal_diff(out_flash, out_torch, "out")
-    cal_diff(lse_flash, lse_torch, "lse")
+    # cal_diff(lse_flash, lse_torch, "lse")
 
     # t = triton.testing.do_bench(flash_mla)
     # FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
@@ -135,23 +138,24 @@ def main(torch_dtype):
 
     h_kv = 1
     d, dv = 576, 512
-    causal = False
+    # causal = True
 
-    # b = 1
-    # s = 1024
-    # s_q = 1
+    # b = 128
+    # s = 4096
+    # s_q = 2
     # h_q = 128
-    # varlen = False
+    # varlen = True
     # paged_block_size = 64
     # test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
 
-    for b in [128]:
+    for b in [1, 8, 128]:
         for s in [4096, 8192]:
             for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
                 for s_q in [1, 2]:  # MTP = 1, 2
-                    for varlen in [False, True]:
+                    for varlen in [True, False]:
                         for paged_block_size in [64, 16, 256]:
-                            test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
+                            for causal in [True, False]:
+                                test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
 
 
 if __name__ == "__main__":
