@@ -535,7 +535,6 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
                                    Shape<Int<kMaxSplits>, Int<kBlockM>>{},
                                    make_stride(lse_size, _1{}));
 
-
     // LSE format is different depending on params.unpadded_lse and params.seqlenq_ngroups_swapped, see comment in get_lse_tile.
     // This tensor's layout maps row_offset_lse to {bidb, bidh, q_offset}.
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
@@ -547,8 +546,6 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     auto transposed_stride = make_stride(params.b, params.seqlen_q * params.b, 1);
     Layout remapped_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b), transposed_stride);
     Layout final_layout = cute::composition(remapped_layout, cute::composition(orig_layout, flat_layout));
-
-    Tensor gLSE_unpadded = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr)), final_layout);
 
     constexpr int kNLsePerThread = (kMaxSplits * kBlockM + kNThreads - 1) / kNThreads;
 
@@ -598,16 +595,11 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
     ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
     // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
+
     if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
-        if (true) {
-            const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
-            if (lse_offset < lse_size) {
-                gLSE_unpadded(lse_offset) = lse_logsum;
-            }
-        } else {
-            gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
-        }
+        gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
     }
+
     // Store the scales exp(lse - lse_logsum) in shared memory.
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {

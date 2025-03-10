@@ -77,10 +77,13 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 
     if (params.num_splits > 1) {
-        constexpr static int kBlockM = 4;
+       // We want kBlockM to be as small as possible for more parallelism.
+        // With 128 threads we can load 512 elements at a time, so if headdim is divisible by 128, kBlockM = 4.
+        // If headdim is divisible by 64, then we set kBlockM = 8, etc.
+        constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
         dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
-
         constexpr static int kNThreads = 128;
+
         if (params.num_splits <= 2) {
             flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1><<<grid_combine, kNThreads, 0, stream>>>(params);
         } else if (params.num_splits <= 4) {
