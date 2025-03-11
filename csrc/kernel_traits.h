@@ -165,16 +165,22 @@ struct Flash_fwd_kernel_traits : public Base {
         composition(Swizzle<kSwizzleV, 3, 3>{},
                     Layout<Shape<Int<8>, Int<kBlockKSmemV>>,
                            Stride<Int<kBlockKSmemV>, _1>>{}));
+
     using SmemLayoutO = decltype(tile_to_shape(
         SmemLayoutAtomO{},
         Shape<Int<kBlockM>, Int<kHeadDimV>>{}));
+
     using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
-    using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>;
+    using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<64>, ElementAccum>;
 
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     // static constexpr int kSmemKVSize = (size(SmemLayoutK{}) + size(SmemLayoutV{})) * sizeof(Element);
     static constexpr int kSmemKVSize = (size(SmemLayoutK{}) * 2) * sizeof(Element);
-    static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
+    static constexpr int OSmemSize = size(SmemLayoutO{}) * sizeof(Element);
+    static constexpr int OSmemSizeAccum = size(SmemLayoutO{}) * sizeof(ElementAccum);
+
+    static constexpr int kSmemSize = std::max(kSmemQSize + kSmemKVSize, OSmemSize);
+    static constexpr int kSmemSizeAccum = std::max(kSmemQSize + kSmemKVSize, OSmemSizeAccum);
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");

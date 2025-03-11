@@ -41,11 +41,11 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
 
 template<typename Kernel_traits>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr size_t smem_size = Kernel_traits::kSmemSize;
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
     BOOL_SWITCH(params.num_splits > 1, Split, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+            constexpr size_t smem_size = Split ? Kernel_traits::kSmemSizeAccum: Kernel_traits::kSmemSize;
             auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, Split>;
             if (smem_size >= 48 * 1024) {
                 C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -105,7 +105,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
 template<typename T, int Headdim, int Headdim_V>
 void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr static int kBlockM = 32;  // Fixed for all head dimensions
+    constexpr static int kBlockM = 64;  // Fixed for all head dimensions
     constexpr static int kBlockN = 16;
     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kBlockM / 8, false, false, T, Headdim_V>>(params, stream);
 }

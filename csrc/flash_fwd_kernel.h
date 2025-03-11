@@ -16,6 +16,8 @@
 #include "softmax.h"
 #include "mask.h"
 
+#include <cute/util/debug.hpp>
+
 namespace flash {
 
 using namespace cute;
@@ -212,11 +214,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                                         binfo.actual_seqlen_q - m_block * kBlockM);
     cute::cp_async_fence(); 
 
-    // if (cute::thread0()) {
-    //     printf("tQgQ:");
-    //     print_tensor(tQgQ);
-    //     printf("\n");
-    // }
     auto tKgK_data = tKgK.data();
     { // use new namespace to create mix tensor with the same name
 
@@ -420,9 +417,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         typename Kernel_traits::SmemCopyAtomO,
         typename Kernel_traits::SmemCopyAtomOaccum
     >;
-    
+
     auto smem_tiled_copy_Oaccum = make_tiled_copy_C(SmemTiledCopyO{}, tiled_mma);
     auto smem_thr_copy_Oaccum = smem_tiled_copy_Oaccum.get_thread_slice(tidx);
+
     Tensor rO = flash::convert_type<ElementO>(acc_o);
     Tensor taccOrOaccum = smem_thr_copy_Oaccum.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
     Tensor taccOsOaccum = smem_thr_copy_Oaccum.partition_D(sOaccum);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
@@ -488,6 +486,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     flash::copy<false, true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
     );
+
     } // new namespace end for the mix tensor
 }
 
