@@ -513,11 +513,11 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     using index_t = typename Kernel_traits::index_t;
     constexpr int kMaxSplits = 1 << Log_max_splits;
     constexpr int kHeadDim = Kernel_traits::kHeadDimV;
-    constexpr int kNThreads = 128;
+    constexpr int kNThreads = kBlockM * 32;
 
     static_assert(kMaxSplits <= 128, "kMaxSplits must be <= 128");
-    static_assert(kBlockM == 4 || kBlockM == 8 || kBlockM == 16 || kBlockM == 32, "kBlockM must be 4, 8, 16 or 32");
-    static_assert(kNThreads == 128, "We assume that each block has 128 threads");
+    // static_assert(kBlockM == 4 || kBlockM == 8 || kBlockM == 16 || kBlockM == 32, "kBlockM must be 4, 8, 16 or 32");
+    // static_assert(kNThreads == 128, "We assume that each block has 128 threads");
 
     // Shared memory.
     // kBlockM + 1 instead of kBlockM to reduce bank conflicts.

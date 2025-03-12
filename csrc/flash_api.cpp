@@ -68,26 +68,33 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     // This needs to match with run_mha_fwd_splitkv_dispatch
     // const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
     const int block_n = 16;
+    const int block_m = max_seqlen_q <= 32 ? (max_seqlen_q + 8 - 1) / 8 * 8: 64;
+    // const int block_m = 64;
+    // static set occpuancy priori knowledge.
+    const int occpuancy = block_m == 8 ? 5 : block_m == 16 ? 4 : block_m == 32 ? 3 : 2;
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
-    const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
-    // const int num_m_blocks = (max_seqlen_q + 16 - 1) / 16;
+
+    // const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
+    const int num_m_blocks = (max_seqlen_q + block_m - 1) / block_m;
     params.num_splits = num_splits;
     at::Tensor softmax_lse_accum;
     at::Tensor out_accum;
     if (num_splits < 1) {
         // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
         // params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 20 * 3, num_n_blocks, 128);
+
         char *pEnv_params = std::getenv("splitkv");
         if (pEnv_params && isdigit(*pEnv_params)) {
             int value = std::stoi(std::string(pEnv_params));
             if (value > 0)
                 params.num_splits = value;
             else
-                params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 20 * 2, num_n_blocks, 128);
+                params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 20 * occpuancy, num_n_blocks, 32);
         } else {
-            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 20 * 2, num_n_blocks, 128);
+            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 20 * occpuancy, num_n_blocks, 32);
         }
     }
 
