@@ -4,7 +4,7 @@ FlashMLA is an efficient MLA decoding kernel for Hopper GPUs, optimized for vari
 
 Currently released:
 - BF16, FP16
-- Paged kvcache with block size of 64
+- Paged kvcache with block size of 16, 64, 256
 
 ## Quick start
 
@@ -19,8 +19,6 @@ python setup.py install
 ```bash
 python tests/test_flash_mla.py
 ```
-
-Achieving up to 3000 GB/s in memory-bound configuration and 580 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.8.
 
 ### Usage
 
@@ -40,7 +38,7 @@ for i in range(num_layers):
 
 ## Requirements
 
-- Hopper GPUs
+- PPU
 - CUDA 12.3 and above
     - **But we highly recommend 12.8 or above for the best performance**
 - PyTorch 2.0 and above

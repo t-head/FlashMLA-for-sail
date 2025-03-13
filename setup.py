@@ -39,14 +39,28 @@ def get_features_args():
 
     return features_args
 
-
+this_dir = os.path.dirname(os.path.abspath(__file__))
 # subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+dir_cutlass3 = this_dir +  "/csrc/cutlass3"
+# check the existence of cutlass3
+if not os.path.exists(dir_cutlass3):
+    try:
+        repo_cutlass3 = os.path.dirname(this_dir) + "/cutlass3"
+        if not os.path.exists(repo_cutlass3):
+            raise RuntimeError(
+                f"cutlass3 does not exist: cutlass3 must be fetched in advance as:\n"
+                f" \"{repo_cutlass3}\" or \"{dir_cutlass3}\""
+            )
+        else:
+            os.symlink(repo_cutlass3, dir_cutlass3)
+    except Exception as e:
+        raise EnvironmentError("setup dependencies FAILED: " + repr(e))
 
 cc_flag = []
 cc_flag.append("-gencode")
 cc_flag.append("arch=compute_80,code=sm_80")
 
-this_dir = os.path.dirname(os.path.abspath(__file__))
+
 
 cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
 

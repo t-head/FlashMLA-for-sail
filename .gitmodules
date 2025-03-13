@@ -1,0 +1,4 @@
+[submodule "csrc/cutlass3"]
+	path = csrc/cutlass3
+	url = git@gitlab.alibaba-inc.com:ppu_open_source/cutlass3.git
+	branch = v3.3.0_ppu_1v5_release
