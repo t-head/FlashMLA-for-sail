@@ -269,7 +269,7 @@ struct Flash_fwd_kernel_traits : public Base {
 #endif
     >;
     using GmemTiledCopyOaccum = decltype(
-        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, ElementAccum>{},
                         GmemLayoutAtomOaccum{},
-                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
+                        Layout<Shape < _1, _1>>{}));  // Val layout, 4 vals per store
 };
