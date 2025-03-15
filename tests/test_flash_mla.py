@@ -39,9 +39,9 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str) -> None:
 
 @torch.inference_mode()
 def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_block_size):
-    print(
-        f"{b=}, {s_q=}, {mean_sk=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {causal=}, {varlen=}, {paged_block_size=}"
-    )
+
+    case_name = f"{varlen=},b{b},sq{s_q},sk{mean_sk},hq{h_q},hkv{h_kv},d{d},dv{dv},causal{causal},page{paged_block_size}"
+    print(case_name)
 
     cache_seqlens = torch.full((b,), mean_sk, dtype=torch.int32)
     # print(cache_seqlens)
@@ -72,6 +72,7 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
         )
     blocked_v = blocked_k[..., :dv]
 
+    torch.cuda.nvtx.range_push(case_name)
     tile_scheduler_metadata, num_splits = get_mla_metadata(
         cache_seqlens, s_q * h_q // h_kv, h_kv
     )
@@ -107,6 +108,7 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
         return out, lse
 
     out_flash_, lse_flash = flash_mla()
+    torch.cuda.nvtx.range_pop()
     out_flash = out_flash_[..., :dv]
     out_torch, lse_torch = ref_mla()
     
@@ -136,24 +138,36 @@ def main(torch_dtype):
 
     h_kv = 1
     d, dv = 576, 512
-    # causal = False
+    if 1:
+        if 0:
+            causal = False
+            b = 1
+            s = 4096
+            s_q = 1
+            h_q = 64
+            varlen = True
+            paged_block_size = 64
+            test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
+        else:
+            for b in [1, 2, 4, 8, 16, 32, 128]:
+                for s in [256, 512, 1024, 4096, 8192]:
+                    for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
+                        for s_q in [1, 2]:  # MTP = 1, 2
+                            for varlen in [False, True]:
+                                for paged_block_size in [64, 16, 256]:
+                                    for causal in [True, False]:
+                                        test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
+    else:
+        for b in [1, 8, 128]:
+            for s in [4096, 8192]:
+                for h_q in [16, 32]:  # TP = 8, 4, 2, 1
+                    for s_q in [1]:  # MTP = 1, 2
+                        for varlen in [True, False]:
+                            for paged_block_size in [64, 16, 256]:
+                                for causal in [True, False]:
+                                    test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
 
-    # b = 2
-    # s = 16
-    # s_q = 1
-    # h_q = 2
-    # varlen = False
-    # paged_block_size = 64
-    # test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
 
-    for b in [1, 8, 128]:
-        for s in [4096, 8192]:
-            for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
-                for s_q in [1, 2]:  # MTP = 1, 2
-                    for varlen in [True, False]:
-                        for paged_block_size in [64, 16, 256]:
-                            for causal in [True, False]:
-                                test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
 
 
 if __name__ == "__main__":

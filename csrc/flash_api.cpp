@@ -4,7 +4,8 @@
 #include <torch/nn/functional.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-
+#include <ATen/cuda/CUDAContext.h>
+#include <cutlass/fast_math.h>
 #include <cutlass/numeric_types.h>
 
 #include "hardware_info.h"
@@ -16,99 +17,6 @@
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
-
-#ifndef USE_TS
-// Find the number of splits that maximizes the occupancy. For example, if we have
-// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
-// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
-// splits as that would incur more HBM reads/writes.
-// So we find the best efficiency, then find the smallest number of splits that gets 85%
-// of the best efficiency.
-inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
-    // If we have enough to almost fill the SMs, then just use 1 split
-    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
-    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
-    float max_efficiency = 0.f;
-    std::vector<float> efficiency;
-    efficiency.reserve(max_splits);
-    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
-    // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits,
-    // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
-    // (i.e. it's 11 splits anyway).
-    // So we check if the number of blocks per split is the same as the previous num_splits.
-    auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
-        return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
-    };
-    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) {
-            efficiency.push_back(0.f);
-        } else {
-            float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
-            float eff = n_waves / ceil(n_waves);
-            // printf("num_splits = %d, eff = %f\n", num_splits, eff);
-            if (eff > max_efficiency) { max_efficiency = eff; }
-            efficiency.push_back(eff);
-        }
-    }
-    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) { continue; }
-        if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
-            // printf("num_splits chosen = %d\n", num_splits);
-            return num_splits;
-        }
-    }
-    return 1;
-}
-
-std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
-    const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
-    const int head_size_rounded,
-    const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
-
-    // This needs to match with run_mha_fwd_splitkv_dispatch
-    // const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
-    const int block_n = 16;
-    const int block_m = max_seqlen_q <= 32 ? (max_seqlen_q + 8 - 1) / 8 * 8: 64;
-    // const int block_m = 64;
-    // static set occpuancy priori knowledge.
-    const int occpuancy = block_m == 8 ? 5 : block_m == 16 ? 4 : block_m == 32 ? 3 : 2;
-    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
-
-    // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
-    // In any case we don't expect seqlen_q to be larger than 64 for inference.
-
-    // const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
-    const int num_m_blocks = (max_seqlen_q + block_m - 1) / block_m;
-    params.num_splits = num_splits;
-    at::Tensor softmax_lse_accum;
-    at::Tensor out_accum;
-    if (num_splits < 1) {
-        // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
-        // params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 20 * 3, num_n_blocks, 128);
-
-        char *pEnv_params = std::getenv("splitkv");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int value = std::stoi(std::string(pEnv_params));
-            if (value > 0)
-                params.num_splits = value;
-            else
-                params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 20 * occpuancy, num_n_blocks, 32);
-        } else {
-            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 20 * occpuancy, num_n_blocks, 32);
-        }
-    }
-
-    if (params.num_splits > 1) {
-        softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-        out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
-        params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
-        params.oaccum_ptr = out_accum.data_ptr();
-    }
-    TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
-
-    return std::make_tuple(softmax_lse_accum, out_accum);
-}
-#endif
 
 std::vector<at::Tensor>
 mha_fwd_kvcache_mla(
@@ -159,7 +67,7 @@ mha_fwd_kvcache_mla(
     const int num_blocks = kcache.size(0);
     const int page_block_size = kcache.size(1);
     const int num_heads_k = kcache.size(2);
-    const int seqlen_k = max_num_blocks_per_seq * page_block_size;
+    //const int seqlen_k = max_num_blocks_per_seq * page_block_size;
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(num_heads_ori % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
@@ -223,9 +131,8 @@ mha_fwd_kvcache_mla(
     params.block_table = block_table.data_ptr<int>();
     params.block_table_batch_stride = block_table.stride(0);
     params.page_block_size = page_block_size;
-    params.seqlen_k = seqlen_k;
+    //params.seqlen_k = seqlen_k;
 
-#ifdef USE_TS
     // tile_scheduler
     TORCH_CHECK(tile_scheduler_metadata.dtype() == torch::kInt32, "tile_scheduler_metadata must have dtype int32");
     TORCH_CHECK(tile_scheduler_metadata.size(1) == TileSchedulerMetaDataSize);
@@ -241,13 +148,11 @@ mha_fwd_kvcache_mla(
     at::Tensor out_accum = torch::empty({batch_size + params.num_sm_parts, num_heads, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
     params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
     params.oaccum_ptr = out_accum.data_ptr();
-#else
      // splitkv
-    at::Tensor softmax_lse_accum, out_accum;
-    std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
-        params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
-        head_size, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
-#endif
+    //at::Tensor softmax_lse_accum, out_accum;
+    //std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
+    //    params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
+    //    head_size, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(head_size == 576);
@@ -269,16 +174,58 @@ mha_fwd_kvcache_mla(
     return {out, softmax_lse};
 }
 
-
 std::vector<at::Tensor>
 get_mla_metadata(
     at::Tensor &seqlens_k,
     const int num_heads_per_head_k,
     const int num_heads_k
 ) {
+    // This should match the logic in the MLA kernel.
+    //static constexpr int block_size_m = 64;
+    //static constexpr int block_size_n = 64;
+    const int block_size_m = num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 8 - 1) / 8 * 8: 64;
+    // static set occpuancy priori knowledge.
+    int occupancy = block_size_m == 8 ? 5 : block_size_m == 16 ? 4 : block_size_m == 32 ? 3 : 2;
+
+    static constexpr int block_size_n = 16;
+    static constexpr int fixed_overhead_num_blocks = 5;
+
+    CHECK_DEVICE(seqlens_k);
+    TORCH_CHECK(seqlens_k.is_contiguous());
+    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
+
+    int batch_size = seqlens_k.size(0);
+    int *seqlens_k_ptr = seqlens_k.data_ptr<int>();
     auto options = seqlens_k.options();
-    auto tile_scheduler_metadata = torch::empty({1}, options);
-    auto num_splits = torch::empty({1}, options);
+
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    int sm_count = dprops->multiProcessorCount;
+    if (std::string(dprops->name).find("810E") != std::string::npos) {
+        sm_count = 20;
+    } else {
+        occupancy = 1;
+    }
+
+    int num_sm_parts = (occupancy * sm_count) / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
+
+
+    auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
+    auto num_splits = torch::empty({batch_size + 1}, options);
+    int *tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
+    int *num_splits_ptr = num_splits.data_ptr<int>();
+
+    at::cuda::CUDAGuard device_guard{(char)seqlens_k.get_device()};
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    Mla_metadata_params params = {};
+    params.seqlens_k_ptr = seqlens_k_ptr;
+    params.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
+    params.num_splits_ptr = num_splits_ptr;
+    params.batch_size = batch_size;
+    params.block_size_n = block_size_n;
+    params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
+    params.num_sm_parts = num_sm_parts;
+    get_mla_metadata_func(params, stream);
+
     return {tile_scheduler_metadata, num_splits};
 }
 

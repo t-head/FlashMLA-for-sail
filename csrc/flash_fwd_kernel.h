@@ -22,8 +22,120 @@ namespace flash {
 
 using namespace cute;
 
-template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, bool Split, typename Params>
-inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
+template<typename Kernel_traits, bool Split, /*typename SharedStorage,*/ typename AccO, typename Softmax>
+__forceinline__ __device__ void store(const Flash_fwd_params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
+                                      /*SharedStorage &shared_storage,*/__shared__ char* smem_,  AccO acc_o, Softmax softmax) {
+
+    using Element = typename Kernel_traits::Element;
+    using ElementAccum = typename Kernel_traits::ElementAccum;
+    using index_t = typename Kernel_traits::index_t;
+    using GmemTiledCopyO = std::conditional_t<
+        !Split,
+        typename Kernel_traits::GmemTiledCopyO,
+        typename Kernel_traits::GmemTiledCopyOaccum
+    >;
+
+    constexpr int kBlockM = Kernel_traits::kBlockM;
+    constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
+    constexpr int kBlockKSmemV = Kernel_traits::kBlockKSmemV; // 64
+    const int tidx = threadIdx.x;
+
+    // Epilogue
+    const int split_offset = __ldg(params.num_splits_ptr + bidb);
+
+    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax);
+
+    using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
+    Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N) // Sw<3,3,3> o _0 o (_32,(_64,_8)):(_64,(_1,_2048))
+                                                                                                                             // Partition sO to match the accumulator partitioning
+    using SmemTiledCopyO = std::conditional_t<
+        !Split,
+        typename Kernel_traits::SmemCopyAtomO,
+        typename Kernel_traits::SmemCopyAtomOaccum
+    >;
+    
+    typename Kernel_traits::TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(tidx);
+    auto smem_tiled_copy_Oaccum = make_tiled_copy_C(SmemTiledCopyO{}, tiled_mma);
+    auto smem_thr_copy_Oaccum = smem_tiled_copy_Oaccum.get_thread_slice(tidx);
+    Tensor rO = flash::convert_type<ElementO>(acc_o);
+    Tensor taccOrOaccum = smem_thr_copy_Oaccum.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
+    Tensor taccOsOaccum = smem_thr_copy_Oaccum.partition_D(sOaccum);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
+
+    // sOaccum is larger than sQ, so we need to syncthreads here
+    // TODO: allocate enough smem for sOaccum
+    if constexpr (Split) { __syncthreads(); }
+    /// move: reg -> tsm
+    cute::copy(smem_tiled_copy_Oaccum, taccOrOaccum, taccOsOaccum);
+
+    //const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
+    //    + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
+    //const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
+    //                                     + m_block * kBlockM) * params.d_v;
+    //const index_t row_offset_lseaccum = (Split ?
+    //        ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q : bidh * params.b + binfo.q_offset(params.seqlen_q, 1, bidb)
+    //    ) + m_block * kBlockM;
+    
+    const index_t row_offset_o = bidb * params.o_batch_stride + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
+    const index_t row_offset_oaccum = (((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + m_block * kBlockM) * params.d_v;
+    const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+    const index_t row_offset_lseaccum = ((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+
+    Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
+                                 Shape<Int<kBlockM>, Int<kHeadDimV>>{},
+                                 make_stride(Split ? kHeadDimV : params.o_row_stride, _1{}));
+    Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + (Split ? row_offset_lseaccum : row_offset_lse)),
+                                   Shape<Int<kBlockM>>{}, Stride<_1>{});
+    // if (tidx == 0) { printf("row_offset_o = %d, bidh = %d, gOaccum = %p\n", row_offset_o, bidh, gOaccum.data()); }
+    //
+    /// move: tsm -> reg -> glboal
+    GmemTiledCopyO gmem_tiled_copy_Oaccum;
+    auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
+    Tensor tOsOaccum = gmem_thr_copy_Oaccum.partition_S(sOaccum);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_D(gOaccum);
+
+    __syncthreads();
+
+    Tensor tOrOaccum = make_tensor<ElementO>(shape(tOgOaccum));
+    /// tsm -> reg
+    cute::copy(gmem_tiled_copy_Oaccum, tOsOaccum, tOrOaccum);
+
+    Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDimV>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    Tensor taccOcO = thr_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
+#ifdef USE_PPU
+    static_assert(decltype(size<0>(taccOcO))::value == 4);
+    // Convert to ((2, 4), MMA_M, MMA_K) then take only the row indices.
+    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_4>{})(make_coord(0, _), _, 0);
+#else
+    static_assert(decltype(size<0>(taccOcO))::value == 4);
+    // Convert to ((2, 2), MMA_M, MMA_K) then take only the row indices.
+    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
+#endif
+    // CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
+    if (get<1>(taccOcO_row(0)) == 0) {
+        #pragma unroll
+        for (int mi = 0; mi < size(lse); ++mi) {
+            const int row = get<0>(taccOcO_row(mi));
+            if (row < params.seqlen_q - m_block * kBlockM) { gLSEaccum(row) = lse(mi); }
+        }
+    }
+
+    // Construct identity layout for sO
+    Tensor cO = make_identity_tensor(make_shape(size<0>(sOaccum), size<1>(sOaccum)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    // Repeat the partitioning with identity layouts
+    Tensor tOcO = gmem_thr_copy_Oaccum.partition_D(cO);                           // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
+
+    // Clear_OOB_K must be false since we don't want to write zeros to gmem
+    flash::copy<false, true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+        gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, params.seqlen_q - m_block * kBlockM
+    );
+}
+
+template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, typename Params>
+__forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block,
+                                                               const int n_split_idx, const int seqlen_k, const int n_block_min, int n_block_max,
+                                                               const bool NoSplit) {
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -41,22 +153,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
     constexpr int kNWarps = Kernel_traits::kNWarps;
 
-    using GmemTiledCopyO = std::conditional_t<
-        !Split,
-        typename Kernel_traits::GmemTiledCopyO,
-        typename Kernel_traits::GmemTiledCopyOaccum
-    >;
-
-    using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
-
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("Is_even_MN = %d, is_cumulativ = %d, seqlen_k_cache = %d, actual_seqlen_k = %d\n", Is_even_MN, params.is_seqlens_k_cumulative, binfo.seqlen_k_cache, binfo.actual_seqlen_k); }
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-    const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
-    const int n_block_min = n_split_idx * n_blocks_per_split;
-    int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
+    //const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+    //const int n_block_min = n_split_idx * n_blocks_per_split;
+    //int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
     if (Is_causal) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q / params.ngroups, kBlockN));
@@ -66,43 +170,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     //         blockIdx.x, n_block_max, n_block_min, binfo.actual_seqlen_k, kBlockN, n_blocks_per_split, num_n_splits);
     // }
 
-    if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
-        // We exit early and write 0 to gOaccum and -inf to gLSEaccum.
-        // Otherwise we might read OOB elements from gK and gV,
-        // or get wrong results when we combine gOaccum from different blocks.
-        const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
-            + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
-        const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
-            + m_block * kBlockM) * params.d_v;
-        const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
-        Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
-                                     Shape<Int<kBlockM>, Int<kHeadDimV>>{},
-                                     make_stride(Split ? kHeadDimV : params.o_row_stride, _1{}));
-        Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
-                                      Shape<Int<kBlockM>>{}, Stride<_1>{});
-
-        GmemTiledCopyO gmem_tiled_copy_Oaccum;
-        auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
-        Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_D(gOaccum);
-        Tensor tOrOaccum = make_tensor<ElementO>(shape(tOgOaccum));
-        clear(tOrOaccum);
-        // Construct identity layout for sO
-        Tensor cO = make_identity_tensor(make_shape(size<0>(gOaccum), size<1>(gOaccum)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-        // Repeat the partitioning with identity layouts
-        Tensor tOcO = gmem_thr_copy_Oaccum.partition_D(cO);
-        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
-
-        // Clear_OOB_K must be false since we don't want to write zeros to gmem
-        flash::copy<Is_even_MN, true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
-        );
-        #pragma unroll
-        for (int m = 0; m < size<1>(tOgOaccum); ++m) {
-            const int row = get<0>(tOcO(0, m, 0));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSEaccum(row) = Split ? -INFINITY : INFINITY; }
-        }
-        return;
-    }
+    // never has n_block_min >= n_block_max in tile scheduler mode
+    assert(n_block_min < n_block_max);
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
@@ -110,17 +179,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // We move K and V to the last block.
     const int bidb_cache = bidb;
-    const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
-    const int block_table_idx = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN / params.page_block_size;
-    const int block_table_offset = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
-    const index_t row_offset_k = block_table == nullptr
-        ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
-          + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
-        : block_table[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
-    const index_t row_offset_v = block_table == nullptr
-        ? binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
-          + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
-        : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+    const int *block_table = params.block_table + bidb * params.block_table_batch_stride;
+    const int block_table_idx = (n_block_max - 1) * kBlockN / params.page_block_size;
+    const int block_table_offset = (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
+    const index_t row_offset_k = block_table[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+    const index_t row_offset_v = block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
                                           + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
@@ -405,282 +468,138 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     }
 
     // Epilogue
-
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax);
-
-    Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
-
-    // Partition sO to match the accumulator partitioning
-    using SmemTiledCopyO = std::conditional_t<
-        !Split,
-        typename Kernel_traits::SmemCopyAtomO,
-        typename Kernel_traits::SmemCopyAtomOaccum
-    >;
-
-    auto smem_tiled_copy_Oaccum = make_tiled_copy_C(SmemTiledCopyO{}, tiled_mma);
-    auto smem_thr_copy_Oaccum = smem_tiled_copy_Oaccum.get_thread_slice(tidx);
-
-    Tensor rO = flash::convert_type<ElementO>(acc_o);
-    Tensor taccOrOaccum = smem_thr_copy_Oaccum.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
-    Tensor taccOsOaccum = smem_thr_copy_Oaccum.partition_D(sOaccum);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
-
-    // sOaccum is larger than sQ, so we need to syncthreads here
-    // TODO: allocate enough smem for sOaccum
-    if constexpr (Split) { __syncthreads(); }
-
-    cute::copy(smem_tiled_copy_Oaccum, taccOrOaccum, taccOsOaccum);
-
-    const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
-        + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
-    const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
-                                         + m_block * kBlockM) * params.d_v;
-    const index_t row_offset_lseaccum = (Split ?
-            ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q : bidh * params.b + binfo.q_offset(params.seqlen_q, 1, bidb)
-        ) + m_block * kBlockM;
-
-    Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
-                                 Shape<Int<kBlockM>, Int<kHeadDimV>>{},
-                                 make_stride(Split ? kHeadDimV : params.o_row_stride, _1{}));
-    Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
-                                   Shape<Int<kBlockM>>{}, Stride<_1>{});
-    // if (tidx == 0) { printf("row_offset_o = %d, bidh = %d, gOaccum = %p\n", row_offset_o, bidh, gOaccum.data()); }
-
-    GmemTiledCopyO gmem_tiled_copy_Oaccum;
-    auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
-    Tensor tOsOaccum = gmem_thr_copy_Oaccum.partition_S(sOaccum);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
-    Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_D(gOaccum);
-
-    __syncthreads();
-
-    Tensor tOrOaccum = make_tensor<ElementO>(shape(tOgOaccum));
-    cute::copy(gmem_tiled_copy_Oaccum, tOsOaccum, tOrOaccum);
-
-    Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDimV>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-    Tensor taccOcO = thr_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
-#ifdef USE_PPU
-    static_assert(decltype(size<0>(taccOcO))::value == 4);
-    // Convert to ((2, 4), MMA_M, MMA_K) then take only the row indices.
-    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_4>{})(make_coord(0, _), _, 0);
-#else
-    static_assert(decltype(size<0>(taccOcO))::value == 4);
-    // Convert to ((2, 2), MMA_M, MMA_K) then take only the row indices.
-    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
-#endif
-    // CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
-    if (get<1>(taccOcO_row(0)) == 0) {
-        #pragma unroll
-        for (int mi = 0; mi < size(lse); ++mi) {
-            const int row = get<0>(taccOcO_row(mi));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSEaccum(row) = lse(mi); }
-        }
+    if (NoSplit) {
+        store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+    } else {
+        store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
     }
-
-    // Construct identity layout for sO
-    Tensor cO = make_identity_tensor(make_shape(size<0>(sOaccum), size<1>(sOaccum)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-    // Repeat the partitioning with identity layouts
-    Tensor tOcO = gmem_thr_copy_Oaccum.partition_D(cO);                           // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
-    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
-
-    // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy<false, true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
-    );
-
     } // new namespace end for the mix tensor
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, bool Split, typename Params>
-inline __device__ void compute_attn_splitkv(const Params &params) {
-    const int m_block = blockIdx.x;
-    // The block index for the batch.
-    const int bidb = Split ? blockIdx.z / params.h : blockIdx.y;
-    // The block index for the head.
-    const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
-    const int n_split_idx = Split ? blockIdx.y : 0;
-    const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_even_MN, Split>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
-inline __device__ void combine_attn_seqk_parallel(const Params &params) {
+template<typename Kernel_traits, int kMaxSplits>
+__global__ void __launch_bounds__(256, 1, 1)
+flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_params params) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
-    constexpr int kMaxSplits = 1 << Log_max_splits;
-    constexpr int kHeadDim = Kernel_traits::kHeadDimV;
-    constexpr int kNThreads = kBlockM * 32;
 
-    static_assert(kMaxSplits <= 128, "kMaxSplits must be <= 128");
-    // static_assert(kBlockM == 4 || kBlockM == 8 || kBlockM == 16 || kBlockM == 32, "kBlockM must be 4, 8, 16 or 32");
-    // static_assert(kNThreads == 128, "We assume that each block has 128 threads");
+    constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
+    constexpr int kNThreads = 128;
 
-    // Shared memory.
-    // kBlockM + 1 instead of kBlockM to reduce bank conflicts.
-    __shared__ ElementAccum sLSE[kMaxSplits][kBlockM + 1];
-
-    // The thread and block index.
     const int tidx = threadIdx.x;
     const int bidx = blockIdx.x;
+    const int hs = params.h * params.seqlen_q;
+    const int batch_idx = bidx / hs;
+    const int hs_idx = bidx % hs;
 
-    const index_t lse_size = params.b * params.h * params.seqlen_q;
+    const int split_offset = __ldg(params.num_splits_ptr + batch_idx);
+    const int actual_num_splits = __ldg(params.num_splits_ptr + batch_idx + 1) - split_offset;
+    FLASH_DEVICE_ASSERT(actual_num_splits <= kMaxSplits);
+    if (actual_num_splits == 1) return;
 
-    const index_t row_offset_lse = bidx * kBlockM;
-    Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lse),
-                                   Shape<Int<kMaxSplits>, Int<kBlockM>>{},
-                                   make_stride(lse_size, _1{}));
+    __shared__ ElementAccum sLseScale[kMaxSplits];
 
-    // LSE format is different depending on params.unpadded_lse and params.seqlenq_ngroups_swapped, see comment in get_lse_tile.
-    // This tensor's layout maps row_offset_lse to {bidb, bidh, q_offset}.
+    const index_t row_offset_lseaccum = split_offset * hs + hs_idx;
+    const index_t row_offset_lse = bidx;
+    Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
+                                   Shape<Int<kMaxSplits>>{}, make_stride(hs));
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
-                              Shape<Int<kBlockM>>{}, Stride<_1>{});
+                              Shape<_1>{}, Stride<_1>{});
 
-    // This layout maps row_offset_lse to {bidh, q_offset, bidb} or {bidh, bidb, q_offset}.
-    Layout flat_layout = make_layout(lse_size);
-    Layout orig_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b));
-    auto transposed_stride = make_stride(params.b, params.seqlen_q * params.b, 1);
-    Layout remapped_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b), transposed_stride);
-    Layout final_layout = cute::composition(remapped_layout, cute::composition(orig_layout, flat_layout));
+    int warp_idx = cutlass::canonical_warp_idx_sync();
+    if (warp_idx == 0) {
+        constexpr int kNLsePerThread = cute::ceil_div(kMaxSplits, 32);
 
-    constexpr int kNLsePerThread = (kMaxSplits * kBlockM + kNThreads - 1) / kNThreads;
+        float local_lse[kNLsePerThread];
+        for (int i = 0; i < kNLsePerThread; ++i) {
+            const int split = i * 32 + tidx;
+            local_lse[i] = split < actual_num_splits ? gLSEaccum(split) : -INFINITY;
+        }
 
-    // Read the LSE values from gmem and store them in shared memory, then transpose them.
-    constexpr int kRowsPerLoadLSE = kNThreads / kBlockM;
+        float max_lse = -INFINITY;
+        for (int i = 0; i < kNLsePerThread; ++i) max_lse = max(max_lse, local_lse[i]);
+        for (int offset = 16; offset >= 1; offset /= 2) max_lse = max(max_lse, __shfl_xor_sync(uint32_t(-1), max_lse, offset));
+        max_lse = max_lse == -INFINITY ? 0.0f : max_lse;  // In case all local LSEs are -inf
 
-    #pragma unroll
-    for (int l = 0; l < kNLsePerThread; ++l) {
-        const int row = l * kRowsPerLoadLSE + tidx / kBlockM;
-        const int col = tidx % kBlockM;
-        ElementAccum lse = (row < params.num_splits && col < lse_size - bidx * kBlockM) ? gLSEaccum(row, col) : -INFINITY;
-        if (row < kMaxSplits) { sLSE[row][col] = lse; }
-        // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse); }
-    }
-    // if (bidx == 1 && tidx < 32) { printf("tidx = %d, row_offset_lse = %d, lse = %f\n", tidx, row_offset_lse, lse_accum(0)); }
-    __syncthreads();
-    Tensor lse_accum = make_tensor<ElementAccum>(Shape<Int<kNLsePerThread>>{});
-    constexpr int kRowsPerLoadTranspose = std::min(kRowsPerLoadLSE, kMaxSplits);
-    // To make sure that kMaxSplits is within 1 warp: we decide how many elements within kMaxSplits
-    // each thread should hold. If kMaxSplits = 16, then each thread holds 2 elements (128 threads,
-    // kBlockM rows, so each time we load we can load 128 / kBlockM rows).
-    // constexpr int kThreadsPerSplit = kMaxSplits / kRowsPerLoadTranspose;
-    // static_assert(kThreadsPerSplit <= 32);
-    static_assert(kRowsPerLoadTranspose <= 32);
-    static_assert(kNLsePerThread * kRowsPerLoadTranspose <= kMaxSplits);
-    #pragma unroll
-    for (int l = 0; l < kNLsePerThread; ++l) {
-        const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
-        const int col = tidx / kRowsPerLoadTranspose;
-        lse_accum(l) = (row < kMaxSplits && col < kBlockM) ? sLSE[row][col] : -INFINITY;
-        // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse_accum(l)); }
-    }
+        float sum_lse = 0;
+        for (int i = 0; i < kNLsePerThread; ++i) sum_lse = sum_lse + expf(local_lse[i] - max_lse);
+        for (int offset = 16; offset >= 1; offset /= 2) sum_lse = sum_lse + __shfl_xor_sync(uint32_t(-1), sum_lse, offset);
 
-    // Compute the logsumexp of the LSE along the split dimension.
-    ElementAccum lse_max = lse_accum(0);
-    #pragma unroll
-    for (int l = 1; l < kNLsePerThread; ++l) { lse_max = max(lse_max, lse_accum(l)); }
-    MaxOp<float> max_op;
-    lse_max = Allreduce<kRowsPerLoadTranspose>::run(lse_max, max_op);
-    lse_max = lse_max == -INFINITY ? 0.0f : lse_max;  // In case all local LSEs are -inf
-    float lse_sum = expf(lse_accum(0) - lse_max);
-    #pragma unroll
-    for (int l = 1; l < kNLsePerThread; ++l) { lse_sum += expf(lse_accum(l) - lse_max); }
-    SumOp<float> sum_op;
-    lse_sum = Allreduce<kRowsPerLoadTranspose>::run(lse_sum, sum_op);
-    // For the case where all local lse == -INFINITY, we want to set lse_logsum to INFINITY. Otherwise
-    // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
-    ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
-    // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
+        float global_lse = (sum_lse == 0.f || sum_lse != sum_lse) ? INFINITY : logf(sum_lse) + max_lse;
+        if (tidx == 0) gLSE(0) = global_lse;
 
-    if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
-        gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
-    }
-
-    // Store the scales exp(lse - lse_logsum) in shared memory.
-    #pragma unroll
-    for (int l = 0; l < kNLsePerThread; ++l) {
-        const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
-        const int col = tidx / kRowsPerLoadTranspose;
-        if (row < params.num_splits && col < kBlockM) { sLSE[row][col] = expf(lse_accum(l) - lse_logsum); }
+        for (int i = 0; i < kNLsePerThread; ++i) {
+            const int split = i * 32 + tidx;
+            if (split < actual_num_splits) sLseScale[split] = expf(local_lse[i] - global_lse);
+        }
     }
     __syncthreads();
 
-    const index_t row_offset_oaccum = bidx * kBlockM * params.d_v;
+    static_assert(kHeadDimV % kNThreads == 0);
+    constexpr int Elements = kHeadDimV / kNThreads;
+    const index_t row_offset_oaccum = (split_offset * hs + hs_idx) * kHeadDimV;
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum),
-                                 Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                 Stride<Int<kHeadDim>, _1>{});
-    constexpr int kBlockN = kNThreads / kBlockM;
-    using GmemLayoutAtomOaccum = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>;
-    using GmemTiledCopyOaccum = decltype(
-        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
-                        GmemLayoutAtomOaccum{},
-                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
+                                 Shape<Int<kHeadDimV>>{}, Stride<_1>{});
+    using GmemTiledCopyOaccum = decltype(make_tiled_copy(
+            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+            Layout<Shape<Int<kNThreads>>>{},
+            Layout<Shape<Int<Elements>>>{}));
     GmemTiledCopyOaccum gmem_tiled_copy_Oaccum;
     auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
     Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_S(gOaccum);
-    Tensor tOrO = make_tensor<ElementAccum>(shape(tOgOaccum));
     Tensor tOrOaccum = make_tensor<ElementAccum>(shape(tOgOaccum));
+    Tensor tOrO = make_tensor<ElementAccum>(shape(tOgOaccum));
     clear(tOrO);
 
-    // Predicates
-    Tensor cOaccum = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
-    // Repeat the partitioning with identity layouts
-    Tensor tOcOaccum = gmem_thr_copy_Oaccum.partition_S(cOaccum);
-    Tensor tOpOaccum = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
-    if (!Is_even_K) {
-        #pragma unroll
-        for (int k = 0; k < size(tOpOaccum); ++k) { tOpOaccum(k) = get<1>(tOcOaccum(0, 0, k)) < params.d_v; }
-    }
-    // Load Oaccum in then scale and accumulate to O
-    for (int split = 0; split < params.num_splits; ++split) {
-        flash::copy</*Is_even_MN=*/false, Is_even_K>(
-            gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
-        );
-        #pragma unroll
-        for (int m = 0; m < size<1>(tOrOaccum); ++m) {
-            int row = get<0>(tOcOaccum(0, m, 0));
-            ElementAccum lse_scale = sLSE[split][row];
-            #pragma unroll
-            for (int k = 0; k < size<2>(tOrOaccum); ++k) {
-                #pragma unroll
-                for (int i = 0; i < size<0>(tOrOaccum); ++i) {
-                    tOrO(i, m, k) += lse_scale * tOrOaccum(i, m, k);
-                }
-            }
-        // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
+    for (int split = 0; split < actual_num_splits; ++split) {
+        cute::copy(tOgOaccum, tOrOaccum);
+        ElementAccum lse_scale = sLseScale[split];
+        for (int i = 0; i < size(tOrO); ++i) {
+            tOrO(i) += lse_scale * tOrOaccum(i);
         }
-        tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_v;
+        tOgOaccum.data() = tOgOaccum.data() + hs * kHeadDimV;
     }
-    // if (cute::thread0()) { print_tensor(tOrO); }
 
     Tensor rO = flash::convert_type<Element>(tOrO);
-    // Write to gO
-    #pragma unroll
-    for (int m = 0; m < size<1>(rO); ++m) {
-        const int idx = bidx * kBlockM + get<0>(tOcOaccum(0, m, 0));
-        if (idx < params.b * params.h * params.seqlen_q) {
-            const int batch_idx = idx / (params.h * params.seqlen_q);
-            const int head_idx = (idx - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
-            // The index to the rows of Q
-            const int row = idx - batch_idx * (params.h * params.seqlen_q) - head_idx * params.seqlen_q;
-            auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride
-                + head_idx * params.o_head_stride + row * params.o_row_stride;
-            #pragma unroll
-            for (int k = 0; k < size<2>(rO); ++k) {
-                if (Is_even_K || tOpOaccum(k)) {
-                    const int col = get<1>(tOcOaccum(0, m, k));
-                    Tensor gO = make_tensor(make_gmem_ptr(o_ptr + col),
-                                            Shape<Int<decltype(size<0>(rO))::value>>{}, Stride<_1>{});
-                    // TODO: Should check if this is using vectorized store, but it seems pretty fast
-                    copy(rO(_, m, k), gO);
-                    // if (bidx == 0 && tidx == 0) { printf("tidx = %d, idx = %d, batch_idx = %d, head_idx = %d, row = %d, col = %d\n", tidx, idx, batch_idx, head_idx, row, col); print(rO(_, m, k)); print(gO); }
-                    // reinterpret_cast<uint64_t *>(o_ptr)[col / 4] = recast<uint64_t>(rO)(0, m, k);
-                }
-            }
-        }
-    }
+    const int head_idx = (bidx - batch_idx * hs) / params.seqlen_q;
+    const int row = bidx - batch_idx * hs - head_idx * params.seqlen_q;
+    auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride + head_idx * params.o_head_stride + row * params.o_row_stride;
+    Tensor gO = make_tensor(make_gmem_ptr(o_ptr + tidx * Elements), Shape<Int<decltype(size<0>(rO))::value>>{}, Stride<_1>{});
+    cute::copy(rO, gO);
 }
 
+template<typename Kernel_traits, bool Is_causal>
+__global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
+flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_params params) {
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    const int m_block = blockIdx.x;
+    const int bidh = blockIdx.y;
+    const int partition_idx = blockIdx.z;
+
+    //extern __shared__ char shared_memory[];
+    //auto &shared_storage = *reinterpret_cast<SharedStorage *>(shared_memory);
+
+    int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr + partition_idx * TileSchedulerMetaDataSize;
+    int4 tile_scheduler_metadata = __ldg(reinterpret_cast<int4 *>(tile_scheduler_metadata_ptr));
+    int begin_idx = tile_scheduler_metadata.x;
+    int begin_seqlen = tile_scheduler_metadata.y;
+    int end_idx = tile_scheduler_metadata.z;
+    int end_seqlen = tile_scheduler_metadata.w;
+    if (begin_idx >= params.b) return;
+    int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
+
+#pragma unroll 1
+    for (int batch_id = begin_idx; batch_id <= end_idx; ++batch_id) {
+        const int n_split_idx = batch_id == begin_idx ? begin_n_split_idx : 0;
+        const int seqlen_k = __ldg(params.cu_seqlens_k + batch_id);
+        const int n_block_min = batch_id == begin_idx ? begin_seqlen / kBlockN : 0;
+        int n_block_max = batch_id == end_idx ? cute::ceil_div(end_seqlen, kBlockN) : cute::ceil_div(seqlen_k, kBlockN);
+        const bool NoSplit = n_block_min == 0 && n_block_max == cute::ceil_div(seqlen_k, kBlockN);
+        if (batch_id > begin_idx) {
+            __syncthreads();  // Barrier between two tiles.
+        }
+        compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, false>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit);
+    }
+}
+ 
 } // namespace flash

@@ -56,3 +56,25 @@
       return __VA_ARGS__();               \
     }                                      \
   }()
+
+#define MLA_NUM_SPLITS_SWITCH(NUM_SPLITS, NAME, ...) \
+  [&] {                                              \
+    if (NUM_SPLITS <= 32) {                          \
+      constexpr static int NAME = 32;                \
+      return __VA_ARGS__();                          \
+    } else if (NUM_SPLITS <= 64) {                   \
+      constexpr static int NAME = 64;                \
+      return __VA_ARGS__();                          \
+    } else if (NUM_SPLITS <= 96) {                   \
+      constexpr static int NAME = 96;                \
+      return __VA_ARGS__();                          \
+    } else if (NUM_SPLITS <= 128) {                  \
+      constexpr static int NAME = 128;               \
+      return __VA_ARGS__();                          \
+    } else if (NUM_SPLITS <= 160) {                  \
+      constexpr static int NAME = 160;               \
+      return __VA_ARGS__();                          \
+    } else {                                         \
+      FLASH_ASSERT(false);                           \
+    }                                                \
+  }()

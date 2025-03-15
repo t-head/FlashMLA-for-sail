@@ -4,9 +4,6 @@
 
 #pragma once
 
-// use TileScheduler
-// #define USE_TS
-
 struct Flash_fwd_params {
     using index_t = int64_t;
 
@@ -39,14 +36,11 @@ struct Flash_fwd_params {
     index_t block_table_batch_stride;
     int page_block_size;
 
-#ifdef USE_TS
     int *__restrict__ tile_scheduler_metadata_ptr;
     int num_sm_parts;
     int *__restrict__ num_splits_ptr;
-#else
     int num_splits;  // For split-KV version
     int seqlen_k; // real kvsize.
-#endif
 
     void *__restrict__ softmax_lseaccum_ptr;
     void *__restrict__ oaccum_ptr;
@@ -54,5 +48,36 @@ struct Flash_fwd_params {
 
 static constexpr int TileSchedulerMetaDataSize = 8;
 // [begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, _, _, _]
+
+template<typename T, int Headdim>
+void run_mha_fwd_splitkv_mla(Flash_fwd_params &params, cudaStream_t stream);
+struct Mla_metadata_params {
+    int *__restrict__ seqlens_k_ptr;
+    int *__restrict__ tile_scheduler_metadata_ptr;
+    int *__restrict__ num_splits_ptr;
+    int batch_size;
+    int block_size_n;
+    int fixed_overhead_num_blocks;
+    int num_sm_parts;
+};
+void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);
+
+#define FLASH_DEVICE_ASSERT(cond)                                                                         \
+    do {                                                                                                  \
+        if (not (cond)) {                                                                                 \
+            printf("Assertion failed (%s:%d): %s\n", __FILE__, __LINE__, #cond);                          \
+            asm("trap;");                                                                                 \
+        }                                                                                                 \
+    } while(0)
+
+#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
+
+#define FLASH_ASSERT(cond)                                                                                \
+    do {                                                                                                  \
+        if (not (cond)) {                                                                                 \
+            fprintf(stderr, "Assertion failed (%s:%d): %s\n", __FILE__, __LINE__, #cond);                 \
+            exit(1);                                                                                      \
+        }                                                                                                 \
+    } while(0)
 
 template<typename T, int Headdim, int Headdim_V> void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
