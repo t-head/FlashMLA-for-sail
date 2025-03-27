@@ -102,19 +102,15 @@ struct Flash_kernel_traits {
 #endif
 };
 
-// If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
          int kHeadDimV_ = kHeadDim_, typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
 struct Flash_fwd_kernel_traits : public Base {
-    using Element = typename Base::Element;
+    using Element = typename Base::Element; 
     using ElementAccum = typename Base::ElementAccum;
     using index_t = typename Base::index_t;
     static constexpr bool Has_cp_async = Base::Has_cp_async;
     using SmemCopyAtom = typename Base::SmemCopyAtom;
     using SmemCopyAtomTransposed = typename Base::SmemCopyAtomTransposed;
-
-    static constexpr bool Share_Q_K_smem = Share_Q_K_smem_;
-    static constexpr bool Is_Q_in_regs = Is_Q_in_regs_ || Share_Q_K_smem;
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
@@ -202,8 +198,8 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int OSmemSize = size(SmemLayoutO{}) * sizeof(Element);
     static constexpr int OSmemSizeAccum = size(SmemLayoutO{}) * sizeof(ElementAccum);
 
-    static constexpr int kSmemSize = std::max(kSmemQSize + kSmemKVSize, OSmemSize);
-    static constexpr int kSmemSizeAccum = std::max(kSmemQSize + kSmemKVSize, OSmemSizeAccum);
+    static constexpr int kSmemSize = std::max(std::max(kSmemQSize, kSmemKVSize), OSmemSize);
+    static constexpr int kSmemSizeAccum = std::max(std::max(kSmemQSize, kSmemKVSize), OSmemSizeAccum);
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");

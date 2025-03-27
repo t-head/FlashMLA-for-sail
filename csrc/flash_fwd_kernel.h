@@ -207,7 +207,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
-    Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutK{});
+    Tensor sK = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutK{});
 
     //use k/v shared
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutV{});
@@ -290,6 +290,14 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
                                         binfo.actual_seqlen_q - m_block * kBlockM);
     cute::cp_async_fence();
 
+    // load Q from tsm to verg and keep use.
+    flash::cp_async_wait<0>();
+    __syncthreads();
+    Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+    CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
+    cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+    __syncthreads();
+
     auto tKgK_data = tKgK.data();
     { // use new namespace to create mix tensor with the same name
 
@@ -337,8 +345,6 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     auto tOsVt = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt));
     auto tOsVt_double = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt_double));
 
-    //////////////////////// switch to mix tensors end ////////////////////////
-
     int n_block = n_block_max - 1;
 
     // use kv_block_num to decide number.
@@ -350,13 +356,6 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
                                        binfo.actual_seqlen_k - n_block * kBlockN);
     kv_store_num++;
     cute::cp_async_fence();
-
-    // load Q from tsm to verg and keep use.
-    flash::cp_async_wait<1>();
-    __syncthreads();
-    Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
-    CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
-    cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
 
     clear(acc_o);
 

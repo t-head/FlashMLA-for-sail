@@ -201,7 +201,7 @@ get_num_sm_parts(
     const int block_size_m = num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 16 - 1) / 16 * 16: 64;
 #endif
     // static set occpuancy priori knowledge.
-    int occupancy = block_size_m == 8 ? 5 : block_size_m == 16 ? 4 : block_size_m == 32 ? 3 : 2;
+    int occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : 2;
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     int sm_count = dprops->multiProcessorCount;

@@ -583,3 +583,24 @@
 [MLA] --format=batch_size:256,seqlen_q:1,seqlen_k:8192,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
 [MLA] --format=batch_size:256,seqlen_q:1,seqlen_k:8192,num_heads:64,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
 [MLA] --format=batch_size:256,seqlen_q:1,seqlen_k:8192,num_heads:128,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+
+[MLA] --format=batch_size:8,seqlen_q:2,seqlen_k:1024,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:8,seqlen_q:2,seqlen_k:4096,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:8,seqlen_q:2,seqlen_k:8192,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:8,seqlen_q:2,seqlen_k:10240,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:16,seqlen_q:2,seqlen_k:1024,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:16,seqlen_q:2,seqlen_k:4096,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:16,seqlen_q:2,seqlen_k:8192,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:16,seqlen_q:2,seqlen_k:10240,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:32,seqlen_q:2,seqlen_k:1024,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:32,seqlen_q:2,seqlen_k:4096,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:32,seqlen_q:2,seqlen_k:8192,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:32,seqlen_q:2,seqlen_k:10240,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:64,seqlen_q:2,seqlen_k:1024,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:64,seqlen_q:2,seqlen_k:4096,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:64,seqlen_q:2,seqlen_k:8192,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:64,seqlen_q:2,seqlen_k:10240,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:128,seqlen_q:2,seqlen_k:1024,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:128,seqlen_q:2,seqlen_k:4096,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:128,seqlen_q:2,seqlen_k:8192,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
+[MLA] --format=batch_size:128,seqlen_q:2,seqlen_k:10240,num_heads:32,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:1,dtype:fp16
