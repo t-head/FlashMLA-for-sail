@@ -13,15 +13,16 @@ if USE_PPU:
     os.environ['HGGC_RESET_CACHE'] = '1'
     os.environ['ALIPPU_RESET_CE_MASK'] = '1'
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Performance Testing for FA with format or list.')
     parser.add_argument('--caselist', default=None, type=str, required=False, help='the list of FA cases')
     parser.add_argument('--string', default=None, type=str, required=False, help='the string of FA cases')
     parser.add_argument('--format', default=None, type=str, required=False, help='the string of FA cases')
-    parser.add_argument('--output', default="output.csv", type=str, required=False, help='the output storing cycles of FA cases')
+    parser.add_argument('--output', default="output", type=str, required=False, help='the output storing cycles of FA cases')
     parser.add_argument('--local', default=False, action="store_true", required=False, help='specify if run local')
+    parser.add_argument('--backend', default="flash_mla", type=str, required=False, help='specify backend, all, flash_mla, flash_infer, flash_mla_triton')
+
     args = parser.parse_args()
     fa_cases = list()
     if args.string:
@@ -37,8 +38,9 @@ if __name__ == '__main__':
     else:
         print("Must give a string a format or a caselist file!")
         exit(-1)
-    if USE_PPU:
-        # run_fa_cycle_on_ppu(fa_cases, args.output)
-        run_fa_cycle_on_device(fa_cases, args.output, "ppu", args.local)
+
+    if args.backend == "all":
+        for backend in ['flash_mla', 'flash_infer', 'flash_mla_triton'] :
+            run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, backend)
     else:
-        run_fa_cycle_on_device(fa_cases, args.output)
+        run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend)

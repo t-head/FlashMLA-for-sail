@@ -133,6 +133,19 @@ mha_fwd_kvcache_mla(
     params.page_block_size = page_block_size;
     //params.seqlen_k = seqlen_k;
 
+    // export PPU_LIB_SHOW_PARAMS=1
+    ppu::fmha::FmhaProfParam fmha_prof_params;
+    if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
+        fmha_prof_params.set_flash_attn_params(
+            q_dtype == torch::kFloat16/*data_type*/,
+            params.is_causal/*custom_mask*/, params.b/*batch_size*/,
+            num_heads_ori/*num_heads*/, num_heads_k/*num_heads_k*/,
+            params.d/*head_dim*/, params.d_v/*head_dim_value*/,
+            seqlen_q_ori/*seqlen_q*/, params.seqlen_k/*seqlen_k*/
+        );
+    }
+    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
+
     // tile_scheduler
     TORCH_CHECK(tile_scheduler_metadata.dtype() == torch::kInt32, "tile_scheduler_metadata must have dtype int32");
     TORCH_CHECK(tile_scheduler_metadata.size(1) == TileSchedulerMetaDataSize);

@@ -70,19 +70,23 @@ def run_torch_mla(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q,
 def run_flash_mla(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
+    # blocked_k = blocked_k.to('cuda')
     blocked_v = blocked_k[..., :dv]
+
+    # q.to('cuda')
+    cache_seqlens = cache_seqlens.to('cuda')
 
     tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, s_q * h_q // h_kv, h_kv)
 
     def flash_mla():
         return flash_mla_with_kvcache(
-            q, blocked_k, block_table, cache_seqlens, dv,
+            q.to('cuda'), blocked_k.to('cuda'), block_table.to('cuda'), cache_seqlens, dv,
             tile_scheduler_metadata, num_splits, causal=causal,
         )
 
     out_flash, lse_flash = flash_mla()
-    t = triton.testing.do_bench(flash_mla)
-    return out_flash, lse_flash, t
+    # t = triton.testing.do_bench(flash_mla)
+    return out_flash, lse_flash
 
 
 @torch.inference_mode()
@@ -91,11 +95,13 @@ def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
 
+    # blocked_k.to('cuda')
+    # cache_seqlens = cache_seqlens.to('cuda')
+
     assert d > dv, "mla with rope dim should be larger than no rope dim"
     q_nope, q_pe = q[..., :dv].contiguous(), q[..., dv:].contiguous()
     blocked_k_nope, blocked_k_pe = blocked_k[..., :dv].contiguous(), blocked_k[..., dv:].contiguous()
-    
-    
+        
     kv_indptr = [0]
     kv_indices = []
     for i in range(b):
@@ -107,7 +113,7 @@ def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_
     for seq_len in cache_seqlens[1:]:
         kv_indptr.append((seq_len + block_size - 1) // block_size + kv_indptr[-1])
         
-    q_indptr = torch.arange(0, b + 1).int() * s_q
+    q_indptr = torch.arange(0, b + 1, device='cpu').int() * s_q
     kv_indptr = torch.tensor(kv_indptr, dtype=torch.int32)
     kv_indices = torch.tensor(kv_indices, dtype=torch.int32)
 
@@ -115,11 +121,12 @@ def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_
         torch.empty(128 * 1024 * 1024, dtype=torch.int8),
         backend=FLASHINFER_BACKEND
     )
+
     mla_wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        cache_seqlens,
+        q_indptr.to('cuda'),
+        kv_indptr.to('cuda'),
+        kv_indices.to('cuda'),
+        cache_seqlens.to('cuda'),
         h_q,
         dv,
         d-dv,
@@ -131,13 +138,12 @@ def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_
     )
 
     def flash_infer():
-        output, lse = mla_wrapper.run(q_nope.view(-1, h_q, dv), q_pe.view(-1, h_q, d-dv), blocked_k_nope, blocked_k_pe, return_lse=True)
+        output, lse = mla_wrapper.run(q_nope.view(-1, h_q, dv).to('cuda'), q_pe.view(-1, h_q, d-dv).to('cuda'), blocked_k_nope.to('cuda'), blocked_k_pe.to('cuda'), return_lse=True)
         return output.view(b, -1, h_q, dv), lse.view(b, h_q, 1)
 
     out_flash, lse_flash = flash_infer()
-    t = triton.testing.do_bench(flash_infer)
-    return out_flash, lse_flash, t
-
+    # # t = triton.testing.do_bench(flash_infer)
+    return out_flash, lse_flash
 
 @triton.jit
 def _mla_attn_kernel(
@@ -389,22 +395,36 @@ def run_flash_mla_triton(q, block_table, blocked_k, max_seqlen_pad, block_size, 
     
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
+
     blocked_v = blocked_k[..., :dv]
-    
+
     assert d > dv, "mla with rope dim should be larger than no rope dim"
     q_nope, q_pe = q[..., :dv].contiguous(), q[..., dv:].contiguous()
     blocked_k_nope, blocked_k_pe = blocked_k[..., :dv].contiguous(), blocked_k[..., dv:].contiguous()
+
+    # blocked_k = blocked_k.to('cuda')
+    # blocked_v = blocked_v.to('cuda')
+    # cache_seqlens = cache_seqlens.to('cuda')
+
+    # blocked_k_nope.to('cuda')
+    # blocked_k_pe.to('cuda')
+    # q_nope.to('cuda')
+    # q_pe.to('cuda')
 
     def flash_mla_triton():
         num_kv_splits = 32
         o = torch.empty([b * s_q, h_q, dv])
         attn_logits = torch.empty([b * s_q, h_q, num_kv_splits, dv + 1])
-        mla_decode_triton(q_nope.view(-1, h_q, dv), q_pe.view(-1, h_q, d-dv), blocked_k_nope.view(-1, dv), blocked_k_pe.view(-1, d-dv), o, block_table, cache_seqlens, attn_logits, num_kv_splits, 1 / math.sqrt(d), block_size)
+        mla_decode_triton(q_nope.view(-1, h_q, dv).to('cuda'), 
+                        q_pe.view(-1, h_q, d-dv).to('cuda'),
+                        blocked_k_nope.view(-1, dv).to('cuda'),
+                        blocked_k_pe.view(-1, d-dv).to('cuda'), o.to('cuda'),
+                        block_table.to('cuda'), cache_seqlens.to('cuda'), attn_logits, num_kv_splits, 1 / math.sqrt(d), block_size)
         return o.view([b, s_q, h_q, dv])
 
     out_flash = flash_mla_triton()
-    t = triton.testing.do_bench(flash_mla_triton)
-    return out_flash, None, t
+    # # t = triton.testing.do_bench(flash_mla_triton)
+    return out_flash, None
 
 
 FUNC_TABLE = {
@@ -424,24 +444,31 @@ def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
     random.seed(0)
     assert target in FUNC_TABLE
     target_func = FUNC_TABLE[target]
-    
+
+    # print(cache_seqlens)
     total_seqlens = cache_seqlens.sum().item()
     mean_seqlens = cache_seqlens.float().mean().int().item()
     max_seqlen = cache_seqlens.max().item()
     max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
-    # print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
+    print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
 
-    q = torch.randn(b, s_q, h_q, d)
+    # q = torch.randn(b, s_q, h_q, d, device='cpu')
+    q = torch.randn(b, s_q, h_q, d, device='cpu')
+    # q = torch.randn(b, s_q, h_q, d)
     block_size = 64
-    block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
-    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
+    block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32,
+        device='cpu').view(b, max_seqlen_pad // block_size)
+    # block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
+    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device='cpu')
+    # blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
     
-    out_b, lse_b, perf_b = target_func(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype)
+    out_b, lse_b = target_func(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype)
 
-    FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
-    bytes = (total_seqlens * h_kv * d + b * s_q * h_q * d + b * s_q * h_q * dv) * (torch.finfo(dtype).bits // 8)
-    print(f"perf {target}: {perf_b:.3f} ms, {FLOPS / 10 ** 9 / perf_b:.0f} TFLOPS, {bytes / 10 ** 6 / perf_b:.0f} GB/s")
-    return bytes / 10 ** 6 / perf_b
+    # FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
+    # bytes = (total_seqlens * h_kv * d + b * s_q * h_q * d + b * s_q * h_q * dv) * (torch.finfo(dtype).bits // 8)
+    # print(f"perf {target}: {perf_b:.3f} ms, {FLOPS / 10 ** 9 / perf_b:.0f} TFLOPS, {bytes / 10 ** 6 / perf_b:.0f} GB/s")
+    # return bytes / 10 ** 6 / perf_b
+    return 1
 
 
 available_targets = [
@@ -450,10 +477,10 @@ available_targets = [
     "flash_mla_triton",
 ]
 
-shape_configs = [
-    {"b": batch, "s_q": 1, "cache_seqlens": torch.tensor([seqlen + 2 * i for i in range(batch)], dtype=torch.int32, device="cuda"), "h_q": head, "h_kv": 1, "d": 512+64, "dv": 512, "causal": True, "dtype": torch.bfloat16}
-    for batch in [128] for seqlen in [1024, 2048, 4096, 8192, 8192*2, 8192*4] for head in [128]
-]
+# shape_configs = [
+#     {"b": batch, "s_q": 1, "cache_seqlens": torch.tensor([seqlen + 2 * i for i in range(batch)], dtype=torch.int32, device="cuda"), "h_q": head, "h_kv": 1, "d": 512+64, "dv": 512, "causal": True, "dtype": torch.bfloat16}
+#     for batch in [128] for seqlen in [1024, 2048, 4096, 8192, 8192*2, 8192*4] for head in [128]
+# ]
 
 def convert_value(value):
     try:
@@ -472,16 +499,21 @@ def get_params(input_str):
     matches = re.findall(pattern, input_str)
     config_dict = {key: value for key, value in matches}
 
+
     config_dict = {k: convert_value(v) for k, v in config_dict.items()}
-    config_dict["cache_seqlens"] = torch.tensor([config_dict["seqlen"] + 2 * i for i in range(config_dict["batch_size"])], dtype=torch.int32, device="cuda")
+    config_dict["seq_q"] = int(config_dict["seqlen_q"])
+    # rnd = max(random.normalvariate(config_dict["seqlen_k"], config_dict["seqlen_k"] / 2), config_dict["seq_q"])
+    config_dict["cache_seqlens"] = torch.tensor([max(random.normalvariate(config_dict["seqlen_k"], config_dict["seqlen_k"] / 2), config_dict["seq_q"]) + i for i in range(config_dict["batch_size"])], dtype=torch.int32, device="cpu")
     config_dict["dtype"] = torch.bfloat16 if config_dict["dtype"] == "bf16" else torch.half
-    print(config_dict)
+
     return config_dict
 
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--format", type=str, required=True, default="--format=flash_mla:flash_mla,batch_size:1,seqlen:200,num_heads:128,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:True,dtype:bf16",
                         help="use this option to pass fmha_params string.")
+    parser.add_argument('--backend', default="flash_mla", type=str, required=False, help='specify backend, flash_mla, flash_infer, flash_mla_triton')
+
     args = parser.parse_args()
     return args
 
@@ -490,5 +522,6 @@ if __name__ == "__main__":
     args = get_args()
 
     config = get_params(args.format)
+    config["mla"] = args.backend
     # exit(0)
-    perf = compare_a(config["mla"], config["batch_size"], 1, config["cache_seqlens"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["causal"], config["dtype"])
+    perf = compare_a(config["mla"], config["batch_size"], config["seq_q"], config["cache_seqlens"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["causal"], config["dtype"])

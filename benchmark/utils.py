@@ -32,22 +32,19 @@ def read_cycle_from_nculog(filename):
 
     with open(filename, newline='') as log_file:
         for line in log_file.read().split("\n"):
-            if re.search(kernel_pattern, line):
+            if re.search(kernel_pattern, line, re.IGNORECASE):
                 kernel_list.append(line.strip())
             if re.search(cycles_pattern, line):
                 cycles_list.append(int(line.strip().split()[-1]))
             if re.search(tc_pattern, line):
                 tc_list.append(float(line.strip().split()[-1]))
-    # print(kernel_list)
-    # print(cycles_list)
-    # print(tc_list)
+
     assert(len(kernel_list) == len(cycles_list))
     assert(len(kernel_list) == len(tc_list))
 
     op_cycles = dict()
     fwd_cycle_sum = 0
     fwd_tc_sum = 0
-
 
     for i in range(len(kernel_list)):
         op = kernel_list[i]
@@ -66,7 +63,7 @@ def read_cycle_from_nculog(filename):
         #exit(-1)
 
 
-def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False):
+def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, backend="flash_mla"):
     output_lines = list()
     headers = ["casename","cycle","tc efficiency", "cmd","detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"] 
@@ -83,8 +80,8 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False):
         metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active" if dev=="gpu" else \
                          "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active".format("fp16" if "fp16" in case else "bf16")
         cmd = '{} --clock-control none --metrics="{}"  \
-              --page=details python ./run_flash_mla.py --format={} \
-              2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, case, log_file)
+              --page=details python ./run_flash_mla.py --backend={} --format={} \
+              2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, backend, case, log_file)
         
         # print(cmd)
         # cmd = "ncu --clock-control none --metrics=sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,launch__waves_per_multiprocessor "\
@@ -101,9 +98,19 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False):
         cycle, tc, detail = read_cycle_from_nculog(log_file)
         output_lines.append([case.replace(",","_"), str(cycle), str(tc), str(cmd), str(detail)])
 
-    dirname = os.path.dirname(output_file)
-    cmd = f"mkdir -p {dirname}"
-    run_cmd(cmd)
+    # print('output file:')
+    # print(output_file)
+
+    # dirname = os.path.dirname(output_file)
+
+    # print('dirname:')
+    # print(dirname)
+
+    # cmd = f"mkdir -p {dirname}"
+    # print(cmd)
+
+    # run_cmd(cmd)
+    output_file = output_file + '_' + backend + '.csv'
     if len(fa_cases) == 1:
         with open("local.log", "w") as f:
             writer = csv.writer(f)
@@ -117,11 +124,11 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False):
                 writer.writerow(row)
             print("write result succeed")
     else:
-        if not os.path.exists(output_file):
-            with open(output_file, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-        with open(output_file, "a") as f:
+        # if not os.path.exists(output_file):
+        #     with open(output_file, "w", newline="") as f:
+        #         writer = csv.writer(f)
+        #         writer.writerow(headers)
+        with open(output_file, "w", newline="") as f:
             writer = csv.writer(f)
             for row in output_lines:
                 writer.writerow(row)

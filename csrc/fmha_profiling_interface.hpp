@@ -11,10 +11,7 @@ public:
 
 FmhaProfParam() {}
 
-void initialize_args(const std::string& op_name, bool dir) {
-
-  op_name_ = op_name;
-  op_dir_ = dir ? "Forward" : "Backward";
+void initialize_args() {
   add_argument("data_type");     // string
   add_argument("batch_size");    // int
   add_argument("num_heads");
@@ -24,15 +21,6 @@ void initialize_args(const std::string& op_name, bool dir) {
   add_argument("seqlen_q");
   add_argument("seqlen_k");
   add_argument("custom_mask");   //bool
-
-  add_argument("dropout"); //float
-  add_argument("scale");
-  add_argument("is_fixed_seqs"); //bool
-
-  // add_argument("alibi"); //bool
-  // add_argument("window_size_left");
-  // add_argument("window_size_right");
-
 }
 
 template <typename T>
@@ -41,68 +29,42 @@ void add_mha_params(const std::string& key, const T& val) {
     args_.insert(std::make_pair(key, val_to_string(val)));
   }
   args_.at(key) = val_to_string(val);
+  insertionOrder.push_back(key);
 }
 
-void set_flash_attn_params(bool dir, bool is_bf16,
+void set_flash_attn_params(bool is_bf16,
                            bool is_causal, int batch_size,
                            int num_heads, int num_heads_k,
                            int head_dim, int head_dim_value,
-                           int seqlen_q, int seqlen_k,
-                           float dropout, float scale,
-                           int window_size_left, int window_size_right,
-                           bool is_fixed_seqs, bool alibi){
+                           int seqlen_q, int seqlen_k){
 
-  const std::string op_name = "flash_attn_v2.5.7";
-  initialize_args(op_name, dir);
+  initialize_args();
   std::string data_type = is_bf16 ? "bf16" : "fp16";
 
-  if (std::abs(scale * scale * head_dim - 1) > 1e-3) {
-    // in general, scale can be get form inner computation.
-    add_mha_params("scale", scale);
-  }
-
-  add_mha_params("custom_mask", is_causal);
-  if (dropout < 1.f) {
-    add_mha_params("dropout", dropout);
-  }
-
-  add_mha_params("seqlen_q", seqlen_q);
-  add_mha_params("is_fixed_seqs", is_fixed_seqs);
-  add_mha_params("head_dim", head_dim);
-  add_mha_params("head_dim_value", head_dim_value);
-  add_mha_params("num_heads_k", num_heads_k);
-  add_mha_params("num_heads", num_heads);
   add_mha_params("batch_size", batch_size);
+  add_mha_params("seqlen_q", seqlen_q);
   add_mha_params("seqlen_k", seqlen_k);
-  add_mha_params("data_type", data_type);
-
-
-  if (is_causal) {
-    if (!(window_size_left == seqlen_k && window_size_right == 0)) {
-      add_mha_params("window_size_left", window_size_left);
-      add_mha_params("window_size_right", window_size_right);
-    }
-  } else {
-    if (!(window_size_left == -1 && window_size_right == -1)) {
-      add_mha_params("window_size_left", window_size_left);
-      add_mha_params("window_size_right", window_size_right);
-    }
-  }
-
-  if (alibi) {
-    add_mha_params("alibi", alibi);
-  }
-
+  add_mha_params("num_heads", num_heads);
+  add_mha_params("num_heads_kv", num_heads_k);
+  add_mha_params("head_dim", head_dim);
+  add_mha_params("head_dim_v", head_dim_value);
+  add_mha_params("causal", is_causal);
+  add_mha_params("dtype", data_type);
 }
 
 std::string format() {
   std::stringstream ss;
 
-  ss << "[FMHA] --format=" << op_name_ << ',' << op_dir_;
-  for(auto& iter: args_) {
-    if (iter.second != ""){
-      ss << ',' << iter.first << ':' << iter.second;
-    }
+  ss << "[MLA] --format=";
+  // for(auto& iter: args_) {
+  //   if (iter.second != ""){
+  //     ss << iter.first << ':' << iter.second << ',';
+  //   }
+  // }
+  for (auto& key : insertionOrder) {
+    ss << key << ":" << args_[key];
+    if (&key != &insertionOrder.back())
+      ss << ',';
   }
   ss << '.';
   return ss.str();
@@ -139,9 +101,8 @@ void add_argument(const std::string& name) {
 }
 
 protected:
-  std::string op_name_;
-  std::string op_dir_;
   std::unordered_map<std::string, std::string> args_;
+  std::vector<std::string> insertionOrder;
 };
 
 
@@ -187,7 +148,7 @@ public:
 private:
   ProfilingInterface() {
     // TODO: add print log
-    domain_ = nvtxDomainCreateA("fmha");
+    domain_ = nvtxDomainCreateA("mla");
     use_nvtx_ = false;
     show_params_ = false;
 
