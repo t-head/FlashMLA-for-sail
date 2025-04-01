@@ -12,6 +12,7 @@ from torch.utils.cpp_extension import (
 )
 
 DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") == "TRUE"
+CPP_INFERENCE = 'FLASH_MLA_CPP_INFER_BUILD' in os.environ.keys() and os.environ['FLASH_MLA_CPP_INFER_BUILD'] == "1"
 
 def append_nvcc_threads(nvcc_extra_args):
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
@@ -35,6 +36,8 @@ def get_features_args():
     features_args = []
     if DISABLE_FP16:
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if CPP_INFERENCE:
+        features_args.append("-DFLASH_MLA_CPP_INFER_BUILD")
     features_args.append("-DFLASH_MLA_STANDALONE_BUILD")
     features_args.append("-DUSE_TS")
 
@@ -89,7 +92,7 @@ ext_modules.append(
                     "--ptxas-options=-v,--register-usage-level=10",
                     "-mllvm",
                     "-ppu-max-vreg-count=256",
-                    "-mllvm", 
+                    "-mllvm",
                     "-ppu-sink-matrix-addr=true",
                     "-mllvm",
                     "-ppu-max-alloca-byte-size=320",

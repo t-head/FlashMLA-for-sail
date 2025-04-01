@@ -44,6 +44,11 @@ struct Flash_fwd_params {
 
     void *__restrict__ softmax_lseaccum_ptr;
     void *__restrict__ oaccum_ptr;
+
+    // For Holmes-LLM
+    int64_t *__restrict__ hllm_block_table;
+    void * workspace_ptr;
+    size_t max_workspace_size;
 };
 
 static constexpr int TileSchedulerMetaDataSize = 8;

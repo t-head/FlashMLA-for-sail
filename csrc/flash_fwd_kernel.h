@@ -53,7 +53,7 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
         typename Kernel_traits::SmemCopyAtomO,
         typename Kernel_traits::SmemCopyAtomOaccum
     >;
-    
+
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
     auto smem_tiled_copy_Oaccum = make_tiled_copy_C(SmemTiledCopyO{}, tiled_mma);
@@ -75,7 +75,7 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
     //const index_t row_offset_lseaccum = (Split ?
     //        ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q : bidh * params.b + binfo.q_offset(params.seqlen_q, 1, bidb)
     //    ) + m_block * kBlockM;
-    
+
     const index_t row_offset_o = bidb * params.o_batch_stride + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_oaccum = (((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + m_block * kBlockM) * params.d_v;
     const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
@@ -179,11 +179,14 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
 
     // We move K and V to the last block.
     const int bidb_cache = bidb;
-    const int *block_table = params.block_table + bidb * params.block_table_batch_stride;
+    const int *block_table = params.block_table != nullptr ? params.block_table + bidb * params.block_table_batch_stride : nullptr ;
+    const int64_t *hllm_block_table = params.block_table == nullptr ? params.hllm_block_table + bidb * params.block_table_batch_stride : nullptr;
     const int block_table_idx = (n_block_max - 1) * kBlockN / params.page_block_size;
     const int block_table_offset = (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
-    const index_t row_offset_k = block_table[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
-    const index_t row_offset_v = block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+    const index_t row_offset_k = block_table != nullptr
+        ? block_table[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
+        : block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+    // const index_t row_offset_v = block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
                                           + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
@@ -191,7 +194,10 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
                             make_stride(params.q_row_stride, params.q_head_stride, _1{}));
     Tensor gQ = local_tile(make_mix_tensor_like(mQ(_, bidh, _)), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
-    Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + row_offset_k),
+    Tensor gK = make_tensor(make_gmem_ptr(
+                                block_table != nullptr
+                                    ? reinterpret_cast<Element *>(params.k_ptr)
+                                    : reinterpret_cast<Element *>(hllm_block_table[block_table_idx])) + row_offset_k,
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.k_row_stride, _1{}));;
 
@@ -206,7 +212,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
 
     // double shared memory for k/v cache.
     Tensor sK_double = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutK{});
-    
+
     Tensor sVt = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVt_double = make_tensor(sK_double.data(), typename Kernel_traits::SmemLayoutVtransposed{});
 
@@ -274,7 +280,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
     flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
                                         binfo.actual_seqlen_q - m_block * kBlockM);
-    cute::cp_async_fence(); 
+    cute::cp_async_fence();
 
     auto tKgK_data = tKgK.data();
     { // use new namespace to create mix tensor with the same name
@@ -310,20 +316,20 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomK{}, tiled_mma);
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tid_thread_slice);
     auto tSsK = smem_thr_copy_K.partition_S(make_mix_tensor_like(sK));
-    
+
     auto tSsK_double = smem_thr_copy_K.partition_S(make_mix_tensor_like(sK_double));
 
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomVt{}, tiled_mma);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tid_thread_slice);
-    
+
     auto tOsVt = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt));
     auto tOsVt_double = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt_double));
 
     //////////////////////// switch to mix tensors end ////////////////////////
 
     int n_block = n_block_max - 1;
-    
-    // use kv_block_num to decide number. 
+
+    // use kv_block_num to decide number.
     int kv_store_num = 0;
     int kv_load_num = 0;
 
@@ -357,26 +363,30 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
 
         flash::cp_async_wait<0>();
         __syncthreads();
-        
+
         if (n_block > n_block_min) {
             auto tKsK_current = kv_store_num % 2 == 0 ? tKsK : tKsK_double;
             // Advance gK
-            if (block_table == nullptr) {
+            if (block_table == nullptr && hllm_block_table == nullptr) {
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
                 const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
                 const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
                 const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
                 const int block_table_offset_next =(n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
-                tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+                const index_t table_diff = block_table
+                    ? (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride
+                    : reinterpret_cast<Element *>(hllm_block_table[block_table_idx_next]) - reinterpret_cast<Element *>(hllm_block_table[block_table_idx_cur]);
+                tKgK.data() = tKgK.data() + table_diff + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
             }
+
             flash::copy</*Is_even_MN=*/true, true>(gmem_tiled_copy_K, tKgK, tKsK_current, tKcK, tKpK);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
             kv_store_num++;
         }
-        
+
 
         // determine use kv buffer 0 or 1
         auto tSsK_current = kv_load_num % 2 == 0 ? tSsK : tSsK_double;
@@ -408,7 +418,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
 #endif
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt_current, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         kv_load_num++;
-        
+
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
             --n_block;
@@ -427,14 +437,17 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
         if (n_block > n_block_min) {
             // Advance gK
             auto tKsK_current = kv_store_num % 2 == 0 ? tKsK : tKsK_double;
-            if (block_table == nullptr) {
+            if (block_table == nullptr && hllm_block_table == nullptr) {
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
                 const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
                 const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
                 const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
                 const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
-                tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+                const index_t table_diff = block_table
+                    ? (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride
+                    : reinterpret_cast<Element *>(hllm_block_table[block_table_idx_next]) - reinterpret_cast<Element *>(hllm_block_table[block_table_idx_cur]);
+                tKgK.data() = tKgK.data() + table_diff + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
             }
             flash::copy</*Is_even_MN=*/true, true>(gmem_tiled_copy_K, tKgK, tKsK_current, tKcK, tKpK);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
@@ -601,5 +614,5 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_params params) {
         compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, false>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit);
     }
 }
- 
+
 } // namespace flash
