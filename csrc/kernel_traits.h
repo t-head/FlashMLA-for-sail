@@ -23,7 +23,7 @@
 #define make_mix_tensor_like(x)  x
 #endif
 
-using namespace cute;;
+using namespace cute;
 
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t>
 struct Flash_kernel_traits {
@@ -42,11 +42,14 @@ struct Flash_kernel_traits {
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
     using MMA_Atom_Arch = std::conditional_t<
         std::is_same_v<elem_type, cutlass::half_t>,
-#ifdef USE_PPU
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
         // MMA_Atom<PPU_16x16x16_F32F16F16F32_TN>,
         // MMA_Atom<PPU_16x16x16_F32BF16BF16F32_TN>
         MMA_Atom<Acompute10000_8x16x16_F32F16F16F32_TN>,
         MMA_Atom<Acompute10000_8x16x16_F32BF16BF16F32_TN>
+#elif defined(USE_PPU) && ACOMPUTE_VERSION == 10500
+        MMA_Atom<Acompute10500_16x16x16_F32F16F16F32_TN>,
+        MMA_Atom<Acompute10500_16x16x16_F32BF16BF16F32_TN>
 #else
         MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
         MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>
@@ -63,13 +66,25 @@ struct Flash_kernel_traits {
 
 #if USE_AIU
     static constexpr int kBlockKSmem = kHeadDim_ % 64 == 0 ? 64 : 32;
+#if ACOMPUTE_VERSION == 10000
     using SmemCopyOpQ = Acompute10000_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false, 1, 2>;
+#else
+    using SmemCopyOpQ = Acompute10500_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false, 1>;
+#endif
     using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, elem_type>;
 
+#if ACOMPUTE_VERSION == 10000
     using SmemCopyOpQt = Acompute10000_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, true>;
+#else
+    using SmemCopyOpQt = Acompute10500_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, true, true, 1>;
+#endif
     using SmemCopyAtomQt = Copy_Atom<SmemCopyOpQt, elem_type>;
 
+#if ACOMPUTE_VERSION == 10000
     using SmemCopyOpK = Acompute10000_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, false, false>;
+#else
+    using SmemCopyOpK = Acompute10500_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, true, false, 1>;
+#endif
     using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, elem_type>;
 
     // using SmemCopyOpKVt = Acompute10000_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, false, true>;
@@ -118,7 +133,11 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kSwizzleV = kBlockKSmemV == 32 ? 2 : 3;
 
 #if USE_AIU
+#if ACOMPUTE_VERSION == 10000
     using SmemCopyOpVt = Acompute10000_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmemV, false, true>;
+#else
+    using SmemCopyOpVt = Acompute10500_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmemV, true, true, 1>;
+#endif
     using SmemCopyAtomVt = Copy_Atom<SmemCopyOpVt, elem_type>;
 #else
     using SmemCopyAtomVt = SmemCopyAtomTransposed;
@@ -127,7 +146,11 @@ struct Flash_fwd_kernel_traits : public Base {
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
         Tile<Int<8 * kNWarps>, _16, _16>>;
+#else
+        Tile<Int<16 * kNWarps>, _16, _16>>;
+#endif
 
 #if USE_AIU
     using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>;
@@ -217,13 +240,25 @@ struct Flash_fwd_kernel_traits : public Base {
 #if USE_AIU
     // static_assert(Block_K{} * sizeof(Element) % 32 == 0, "aiu_no_trans: block_k must be multiple of 32B");
     static constexpr int bits_per_aiu_Q = kBlockM * kBlockKSmem * sizeof(Element) * 8;
+#if ACOMPUTE_VERSION == 10000
     using Gmem_copy_struct_Q = Acompute10000_AIU_LOAD<cute::C<bits_per_aiu_Q>, Element, false>;
+#else
+    using Gmem_copy_struct_Q = Acompute10500_AIU_LOAD<cute::C<bits_per_aiu_Q>, Element, false, kBlockM, kBlockKSmem>;
+#endif
 
     static constexpr int bits_per_aiu_K = kBlockN * kBlockKSmem * sizeof(Element) * 8;
+#if ACOMPUTE_VERSION == 10000
     using Gmem_copy_struct_K = Acompute10000_AIU_LOAD<cute::C<bits_per_aiu_K>, Element, false>;
+#else
+    using Gmem_copy_struct_K = Acompute10500_AIU_LOAD<cute::C<bits_per_aiu_K>, Element, false, kBlockN, kBlockKSmem>;
+#endif
 
     static constexpr int bits_per_aiu_V = kBlockN * kBlockKSmemV * sizeof(Element) * 8;
+#if ACOMPUTE_VERSION == 10000
     using Gmem_copy_struct_V = Acompute10000_AIU_LOAD<cute::C<bits_per_aiu_V>, Element, false>;
+#else
+    using Gmem_copy_struct_V = Acompute10500_AIU_LOAD<cute::C<bits_per_aiu_V>, Element, false, kBlockN, kBlockKSmemV>;
+#endif
 
     using GmemTiledCopyQ = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, Element>{},

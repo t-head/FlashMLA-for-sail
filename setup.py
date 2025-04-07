@@ -107,6 +107,7 @@ ext_modules.append(
                     "-DUSE_PPU",
                     "-DUSE_AIU=1",
                     "-DACOMPUTE_VERSION=10000"
+                    # "-DACOMPUTE_VERSION=10500"
                 ]
                 + cc_flag
             ) + get_features_args(),

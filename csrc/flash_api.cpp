@@ -195,7 +195,11 @@ get_num_sm_parts(
 ) {
     // This should match the logic in the MLA kernel.
     //static constexpr int block_size_m = 64;
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
     const int block_size_m = num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 8 - 1) / 8 * 8: 64;
+#else
+    const int block_size_m = num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 16 - 1) / 16 * 16: 64;
+#endif
     // static set occpuancy priori knowledge.
     int occupancy = block_size_m == 8 ? 5 : block_size_m == 16 ? 4 : block_size_m == 32 ? 3 : 2;
 

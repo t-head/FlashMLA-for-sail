@@ -103,9 +103,13 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
     Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDimV>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     Tensor taccOcO = thr_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
 #ifdef USE_PPU
+#if ACOMPUTE_VERSION == 10000
     static_assert(decltype(size<0>(taccOcO))::value == 4);
     // Convert to ((2, 4), MMA_M, MMA_K) then take only the row indices.
     Tensor taccOcO_row = logical_divide(taccOcO, Shape<_4>{})(make_coord(0, _), _, 0);
+#else
+    Tensor taccOcO_row = taccOcO(make_coord(0, _, 0), _, 0);
+#endif
 #else
     static_assert(decltype(size<0>(taccOcO))::value == 4);
     // Convert to ((2, 2), MMA_M, MMA_K) then take only the row indices.
@@ -243,8 +247,12 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     //
 
 #if USE_AIU
+#if ACOMPUTE_VERSION == 10000
     int aiu_offset_q = 0;
     gmem_tiled_copy_Q.desc_ = AiuDesc{nullptr, binfo.actual_seqlen_q, params.q_row_stride, kBlockM, Kernel_traits::kBlockKSmem, aiu_offset_q};
+#else
+    gmem_tiled_copy_Q.desc_.init(nullptr, binfo.actual_seqlen_q, params.d, params.q_row_stride);
+#endif
     const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
     const int tid_thread_slice = warp_idx * 32;
 #else
@@ -305,8 +313,12 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
 #endif
 
 #if USE_AIU
+#if ACOMPUTE_VERSION == 10000
     int aiu_offset_k = 0;
     gmem_tiled_copy_K.desc_ = AiuDesc{nullptr, kBlockN, params.k_row_stride, kBlockN, Kernel_traits::kBlockKSmem, aiu_offset_k};
+#else
+    gmem_tiled_copy_K.desc_.init(nullptr, kBlockN, params.d, params.k_row_stride);
+#endif
     const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
     const int tid_thread_slice = warp_idx * 32;
 #else
@@ -348,7 +360,11 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
 
     clear(acc_o);
 
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
     flash::Softmax<size<1>(acc_o)> softmax;
+#else
+    flash::Softmax<2 * size<1>(acc_o)> softmax;
+#endif
 
     flash::Mask mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
@@ -398,7 +414,11 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
         );
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 8 + (tidx % 32) / 4, kNWarps * 8, params.ngroups
+#else
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16, params.ngroups
+#endif
         );
 
         // We have key_padding_mask so we'll need to Check_inf
@@ -406,7 +426,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
             ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
 
-#ifdef USE_PPU
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
         Tensor rP = flash::convert_acc<Element>(acc_s);
         Tensor tOrP = make_tensor(rP.data(), make_layout(get<0>(tSrQ.layout()), get<1>(acc_s.layout()), get<2>(acc_s.layout())));
 #else
@@ -466,7 +486,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
         );
 
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/false>(acc_s, acc_o, params.scale_softmax_log2);
-#ifdef USE_PPU
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
         Tensor rP = flash::convert_acc<Element>(acc_s);
         Tensor tOrP = make_tensor(rP.data(), make_layout(get<0>(tSrQ.layout()), get<1>(acc_s.layout()), get<2>(acc_s.layout())));
 #else

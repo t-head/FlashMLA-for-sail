@@ -25,7 +25,11 @@ struct Mask {
                                                const int warp_row_stride,
                                                const int ngroups) {
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10500
+        static_assert(decltype(size<0>(tensor_))::value == 8, "First dimension must be 8");
+#else
         static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
+#endif
         static constexpr bool Need_masking = Causal_mask || !Is_even_MN;
         // if (cute::thread0()) { printf("Causal_mask=%d, Is_even_MN = %d, Need_masking = %d\n", Causal_mask, Is_even_MN, Need_masking); }
 
@@ -35,7 +39,7 @@ struct Mask {
             // Do we need both row and column indices, or just column incides?
             static constexpr bool Col_idx_only = !Causal_mask;
             const int lane_id = threadIdx.x % 32;
-#ifdef USE_PPU
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
             const int col_idx_offset = col_idx_offset_ + (lane_id % 4);
 #else
             const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
@@ -43,20 +47,20 @@ struct Mask {
             if constexpr (Col_idx_only) {
                 #pragma unroll
                 for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-#ifdef USE_PPU
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
                     const int col_idx_base = col_idx_offset + nj * 16;
 #else
                     const int col_idx_base = col_idx_offset + nj * 8;
 #endif
                     #pragma unroll
                     for (int j = 0; j < size<1, 0>(tensor); ++j) {
-#ifdef USE_PPU
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
                         const int col_idx = col_idx_base + j * 4;
 #else
                         const int col_idx = col_idx_base + j;
 #endif
                         #pragma unroll
-                        for (int mi = 0; mi < size<0>(tensor); ++mi) {                           
+                        for (int mi = 0; mi < size<0>(tensor); ++mi) {
                             if constexpr (!Is_even_MN) {
                                 if (col_idx >= max_seqlen_k) { tensor(mi, make_coord(j, nj)) = -INFINITY; }
                             }
@@ -74,17 +78,17 @@ struct Mask {
 
                         #pragma unroll
                         for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-#ifdef USE_PPU
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
                             const int col_idx_base = col_idx_offset + nj * 16;
 #else
                             const int col_idx_base = col_idx_offset + nj * 8;
 #endif
                             #pragma unroll
                             for (int j = 0; j < size<1, 0>(tensor); ++j) {
-#ifdef USE_PPU
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
                                 const int col_idx = col_idx_base + j * 4;
 #else
-                                const int col_idx = col_idx_base + j;  
+                                const int col_idx = col_idx_base + j;
 #endif
                                 if constexpr (Causal_mask) {
                                     if (col_idx >= col_idx_limit_right) {
@@ -97,7 +101,6 @@ struct Mask {
                 }
             }
         }
-    
     }
 };
 

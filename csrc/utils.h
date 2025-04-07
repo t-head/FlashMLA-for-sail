@@ -20,7 +20,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
-#ifdef USE_PPU
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
 #include "acc_vreg_fraga.h"
 #endif
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -64,7 +64,7 @@ struct Allreduce {
 
 template<>
 struct Allreduce<2> {
-template<typename T, typename Operator> 
+template<typename T, typename Operator>
 static __device__ __forceinline__ T run(T x, Operator &op) {
     x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
     return x;
@@ -135,13 +135,23 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
     // acc is ppu c layout, size0 is 8, MMA_N size is A100 MMA_N/2
     // static_assert(decltype(size<0>(acc_layout))::value == 8);
     static_assert(decltype(rank(acc_layout))::value == 3);
+#if ACOMPUTE_VERSION == 10000
     auto l = logical_divide(acc_layout, Shape<_4>{}); //((2, 4), MMA_M, MMA_N)
-#else
-     static_assert(decltype(size<0>(acc_layout))::value == 4);
-     static_assert(decltype(rank(acc_layout))::value == 3);
-     auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
-#endif
     return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+#else
+    auto l = logical_divide(acc_layout, Shape<_4>{}); //((4, 2), MMA_M, MMA_N)
+    auto midl = logical_divide(l, Shape<Shape<_2>>{}); //(((2, 2), 2), MMA_M, MMA_N)
+    return make_layout(
+        make_layout(get<0, 0, 1>(midl), get<1>(midl)),
+        make_layout(get<0, 0, 0>(midl), make_layout(get<0, 1>(midl), get<2>(midl)))
+    );
+#endif
+#else
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
+    return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -150,6 +160,9 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
 // if using m16n8k16, or to (4, MMA_M, MMA_N) if using m16n8k8.
 template<typename MMA_traits, typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10500
+    return acc_layout;
+#else
     using X = Underscore;
     static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
     // static_assert(decltype(size<1, 0>(rowcol_layout))::value == 2);
@@ -162,6 +175,7 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
     return make_layout(make_layout(get<1, 0>(l), get<0, 0>(l), get<1, 1, 0>(l)),
                        get<0, 1>(l),
                        get<1, 1, 1>(l));
+#endif
 };
 
 
@@ -178,7 +192,7 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tenso
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-#ifdef USE_PPU
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
 template <typename To_type, typename Engine, typename Layout>
 inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;

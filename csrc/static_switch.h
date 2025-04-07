@@ -26,6 +26,7 @@
     }                                           \
   }()
 
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
 #define SEQLENG_SWITCH(SEQLENG, ...)   \
   [&] {                                    \
     if (SEQLENG <= 8) {                   \
@@ -42,6 +43,21 @@
       return __VA_ARGS__();               \
     }                                      \
   }()
+  #else
+  #define SEQLENG_SWITCH(SEQLENG, ...)   \
+  [&] {                                    \
+    if (SEQLENG <= 16) {            \
+      constexpr static int kBlockM = 16;  \
+      return __VA_ARGS__();                \
+    } else if (SEQLENG <= 32) {            \
+      constexpr static int kBlockM = 32;  \
+      return __VA_ARGS__();                \
+    } else {                              \
+      constexpr static int kBlockM = 64;  \
+      return __VA_ARGS__();               \
+    }                                      \
+  }()
+  #endif
 
   #define THREADS_SWITCH(BLOCKS, ...)   \
   [&] {                                    \

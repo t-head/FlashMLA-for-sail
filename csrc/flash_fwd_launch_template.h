@@ -64,6 +64,10 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
     // constexpr static int kBlockM = 64;  // Fixed for all head dimensions
     constexpr static int kBlockN = 16;
     SEQLENG_SWITCH(params.seqlen_q, [&] {
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
         run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kBlockM / 8, false, false, T, Headdim_V>>(params, stream);
+#else
+        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kBlockM / 16, false, false, T, Headdim_V>>(params, stream);
+#endif
     });
 }
