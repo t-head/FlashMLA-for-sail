@@ -145,7 +145,6 @@ mha_fwd_kvcache_mla(
             seqlen_q_ori/*seqlen_q*/, params.seqlen_k/*seqlen_k*/
         );
     }
-    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
 
     // tile_scheduler
     TORCH_CHECK(tile_scheduler_metadata.dtype() == torch::kInt32, "tile_scheduler_metadata must have dtype int32");
@@ -168,6 +167,7 @@ mha_fwd_kvcache_mla(
     //    params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
     //    head_size, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
 
+    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(head_size == 576);
     if (q_dtype == torch::kBFloat16) {
@@ -181,6 +181,8 @@ mha_fwd_kvcache_mla(
     else {
         TORCH_CHECK(false, "Unsupported tensor dtype for query");
     }
+    ppu::fmha::ProfilingInterface::Instance().instrument(false, fmha_prof_params);
+
     out = out.view({batch_size, seqlen_q_ori, ngroups, num_heads_k, head_size_v}).transpose(2, 3)
             .reshape({batch_size, seqlen_q_ori, num_heads_ori, head_size_v});
     softmax_lse = softmax_lse.view({batch_size, num_heads_k, seqlen_q_ori, ngroups}).transpose(2, 3)
