@@ -54,6 +54,18 @@ struct Flash_fwd_params {
 static constexpr int TileSchedulerMetaDataSize = 8;
 // [begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, _, _, _]
 
+static bool use_cross_cut(int num_heads_per_head_k, int batch_size) {
+    if (num_heads_per_head_k <= 16) {
+        return false;
+    } else if (num_heads_per_head_k <= 32) {
+        return batch_size >= 8;
+    } else if (num_heads_per_head_k <= 64) {
+        return batch_size >= 2;
+    } else {
+        return true;
+    }
+}
+
 template<typename T, int Headdim>
 void run_mha_fwd_splitkv_mla(Flash_fwd_params &params, cudaStream_t stream);
 struct Mla_metadata_params {

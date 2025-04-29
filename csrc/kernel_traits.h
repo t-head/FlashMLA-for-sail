@@ -25,7 +25,7 @@
 
 using namespace cute;
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t>
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool USE_MMA_M8=true, typename elem_type=cutlass::half_t>
 struct Flash_kernel_traits {
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
@@ -45,8 +45,10 @@ struct Flash_kernel_traits {
 #if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
         // MMA_Atom<PPU_16x16x16_F32F16F16F32_TN>,
         // MMA_Atom<PPU_16x16x16_F32BF16BF16F32_TN>
-        MMA_Atom<Acompute10000_8x16x16_F32F16F16F32_TN>,
-        MMA_Atom<Acompute10000_8x16x16_F32BF16BF16F32_TN>
+        // MMA_Atom<Acompute10000_8x16x16_F32F16F16F32_TN>,
+        // MMA_Atom<Acompute10000_8x16x16_F32BF16BF16F32_TN>
+        std::conditional_t<USE_MMA_M8, MMA_Atom<Acompute10000_8x16x16_F32F16F16F32_TN>,  MMA_Atom<PPU_16x16x16_F32F16F16F32_TN>>,
+        std::conditional_t<USE_MMA_M8, MMA_Atom<Acompute10000_8x16x16_F32BF16BF16F32_TN>, MMA_Atom<PPU_16x16x16_F32BF16BF16F32_TN>>
 #elif defined(USE_PPU) && ACOMPUTE_VERSION == 10500
         MMA_Atom<Acompute10500_16x16x16_F32F16F16F32_TN>,
         MMA_Atom<Acompute10500_16x16x16_F32BF16BF16F32_TN>
@@ -60,14 +62,18 @@ struct Flash_kernel_traits {
 #endif
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
-    // using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
-    using SmemCopyAtom = Copy_Atom<SM75_U32x2_LDSM_N, elem_type>;
+    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
+    // using SmemCopyAtom = Copy_Atom<SM75_U32x2_LDSM_N, elem_type>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
 
 #if USE_AIU
     static constexpr int kBlockKSmem = kHeadDim_ % 64 == 0 ? 64 : 32;
 #if ACOMPUTE_VERSION == 10000
-    using SmemCopyOpQ = Acompute10000_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false, 1, 2>;
+    using SmemCopyOpQ = std::conditional_t<
+        USE_MMA_M8,
+        Acompute10000_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false, 1, 2>,
+        Acompute10000_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false>
+    >;
 #else
     using SmemCopyOpQ = Acompute10500_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false, 1>;
 #endif
@@ -103,9 +109,11 @@ struct Flash_kernel_traits {
 };
 
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
-         int kHeadDimV_ = kHeadDim_, typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
+         int kHeadDimV_ = kHeadDim_,
+         bool CrossCut_ = false, bool USE_MMA_M8_ = true, int AtomLayoutQ_ = kNWarps_, int AtomLayoutP_ = kNWarps_,
+         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, USE_MMA_M8_, elem_type>>
 struct Flash_fwd_kernel_traits : public Base {
-    using Element = typename Base::Element; 
+    using Element = typename Base::Element;
     using ElementAccum = typename Base::ElementAccum;
     using index_t = typename Base::index_t;
     static constexpr bool Has_cp_async = Base::Has_cp_async;
@@ -115,6 +123,21 @@ struct Flash_fwd_kernel_traits : public Base {
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * 32;
+
+    /// only for CrossCut ///
+    static constexpr bool USE_MMA_M8 = USE_MMA_M8_;
+    static constexpr bool CrossCut = CrossCut_;
+    static constexpr int AtomLayoutQ = CrossCut ? AtomLayoutQ_ : kNWarps;
+    static constexpr int AtomLayoutP = CrossCut ? AtomLayoutP_ : kNWarps;
+    static constexpr bool Share_Q_K_smem = !CrossCut || Share_Q_K_smem_; // CrossCut ? Share_Q_K_smem_ : 1;
+    static constexpr bool Is_Q_in_regs = !CrossCut || Is_Q_in_regs_|| Share_Q_K_smem; // CrossCut ? Is_Q_in_regs_|| Share_Q_K_smem : 1;
+    /// end for CrossCut ///
+
+#if ACOMPUTE_VERSION == 10000
+    static constexpr int MMA_ATOM_M = USE_MMA_M8 ? 8 : 16;
+#else
+    static constexpr int MMA_ATOM_M = 16;
+#endif
 
     static constexpr int kBlockM = kBlockM_;
     static constexpr int kBlockN = kBlockN_;
@@ -139,14 +162,25 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemCopyAtomVt = SmemCopyAtomTransposed;
 #endif
 
+    /// only for CrossCut ///
+    static_assert(!CrossCut || kNWarps % AtomLayoutQ == 0, "kNWarps must be a multiple of AtomLayoutQ if CrossCut");
+    static_assert(!CrossCut || kNWarps % AtomLayoutP == 0, "kNWarps must be a multiple of AtomLayoutP if CrossCut");
+    static_assert(!CrossCut || kBlockM <= kNThreads, "kBlockM must be no larger than kNThreads if CrossCut");
+    // if kBlockM > kNThreads. softmax should be changed.
+
+
+    /// TiledMmaS only for CrossCut ///
+    using TiledMmaS = TiledMMA<
+        typename Base::MMA_Atom_Arch,
+        Layout<Shape<Int<AtomLayoutQ>, Int<kNWarps/AtomLayoutQ>, _1>>,
+        Tile<Int<MMA_ATOM_M * AtomLayoutQ>, Int<16 * kNWarps / AtomLayoutQ>, _16>>;
+
+    /// The second gemm in CrossCut; gemm in !CrossCut ///
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
-        Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-        Tile<Int<8 * kNWarps>, _16, _16>>;
-#else
-        Tile<Int<16 * kNWarps>, _16, _16>>;
-#endif
+        Layout<Shape<Int<AtomLayoutP>, Int<kNWarps/AtomLayoutP>, _1>>,
+        Tile<Int<MMA_ATOM_M * AtomLayoutP>, Int<16 * kNWarps / AtomLayoutP>, _16>>;
+
 
 #if USE_AIU
     using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>;
@@ -192,14 +226,41 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
     using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<64>, ElementAccum>;
 
+    /// only for CrossCut ///
+    static constexpr int kSwizzleP = kBlockN % 64== 0 ? 3 : 2;// optimize
+    // static constexpr int kSwizzleP = 3;
+    using SmemLayoutAtomP = decltype(
+        composition(PPU_Swizzle<kSwizzleP, 3, 3>{},
+                    Layout<Shape<Int<kBlockM>, Int<kBlockN>>,
+                           Stride<Int<kBlockN>, _1>>{}));
+    using SmemLayoutP = decltype(tile_to_shape(
+        SmemLayoutAtomP{},
+        Shape<Int<kBlockM>, Int<kBlockN>>{}));
+    using SmemCopyAtomP = std::conditional_t<
+        USE_MMA_M8,
+        Copy_Atom<DefaultCopy, elem_type>, // if m8, stack for tsm.ld.matrix
+        SmemCopyAtom
+    >;
+    using SmemCopyAtomS = Copy_Atom<DefaultCopy, elem_type>;
+    // using SmemCopyAtomS = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    /// end for CrossCut ///
+
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     // static constexpr int kSmemKVSize = (size(SmemLayoutK{}) + size(SmemLayoutV{})) * sizeof(Element);
     static constexpr int kSmemKVSize = (size(SmemLayoutK{}) * 2) * sizeof(Element);
     static constexpr int OSmemSize = size(SmemLayoutO{}) * sizeof(Element);
     static constexpr int OSmemSizeAccum = size(SmemLayoutO{}) * sizeof(ElementAccum);
 
-    static constexpr int kSmemSize = std::max(std::max(kSmemQSize, kSmemKVSize), OSmemSize);
-    static constexpr int kSmemSizeAccum = std::max(std::max(kSmemQSize, kSmemKVSize), OSmemSizeAccum);
+    static constexpr int kSmemSizeQK = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
+
+    /// only for CrossCut ///
+    static constexpr int kSmemPSize = size(SmemLayoutP{}) * (sizeof(Element)); // store & load P
+    static constexpr int kSmemSoftmax = size(kBlockM) * sizeof(ElementAccum)  // rescale o
+                                      + (kNWarps==AtomLayoutQ ? 0: size(kBlockM) * sizeof(ElementAccum) * kNWarps/AtomLayoutQ); // reduce between warps
+    static constexpr int kSmemCrossCut = CrossCut ? kSmemPSize + kSmemSoftmax : 0;
+
+    static constexpr int kSmemSize = std::max(kSmemSizeQK + kSmemCrossCut, OSmemSize);
+    static constexpr int kSmemSizeAccum = std::max(kSmemSizeQK + kSmemCrossCut, OSmemSizeAccum);
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");

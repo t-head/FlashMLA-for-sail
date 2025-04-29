@@ -12,6 +12,12 @@
 
 #include "utils.h"
 
+// #define TSM_ROW_IDX(i, offset, stride) \
+//     offset + (i / MMA_ATOM_K_M) * stride + (i % MMA_ATOM_K_M) * 8
+
+#define SFT_ROW_IDX2(i, offset, stride, MMA_ATOM_K_M) \
+    offset + (i / MMA_ATOM_K_M) * stride + i % MMA_ATOM_K_M
+
 namespace flash {
 
 using namespace cute;
@@ -183,6 +189,230 @@ struct Softmax {
         }
         return lse;
     };
+};
+
+///  reduce in warp ///
+template<int kNRows, typename Operator, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_between_2warps(Operator &op, Tensor<Engine0, Layout0> &row,
+    Tensor<Engine1, Layout1> &smem_row, const int row_idx_offset, const int warp_id_n) {
+
+    #pragma unroll
+    for (int mi = 0; mi < kNRows; ++mi) {
+        const int row_idx = row_idx_offset + mi * 8;
+        smem_row(row_idx, warp_id_n) = row(mi);
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int mi = 0; mi < kNRows; ++mi) {
+        const int row_idx = row_idx_offset + mi * 8;
+        float tsm_ni = smem_row(row_idx, warp_id_n^1);
+        row(mi) = op(row(mi), tsm_ni);
+    }
+}
+
+template<int kNRows, int WarpsK, typename Operator, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_between_warps(Operator &op, Tensor<Engine0, Layout0> &row,
+    Tensor<Engine1, Layout1> &smem_row, const int row_idx_offset,  const int warp_id_n) {
+    #pragma unroll
+    for (int mi = 0; mi < kNRows; ++mi) {
+        const int row_idx = row_idx_offset + mi * 8;
+        smem_row(row_idx, warp_id_n) = row(mi);
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int mi = 0; mi < kNRows; ++mi) {
+        const int row_idx = row_idx_offset + mi * 8;
+        #pragma unroll
+        for (int ni = 1; ni < WarpsK; ++ni) {
+            float tsm_ni = smem_row(row_idx, (ni + warp_id_n) % WarpsK);
+            row(mi) = op(row(mi), tsm_ni);
+        }
+    }
+}
+
+template<int kNRows, int WarpsK, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_sum_via_warps(Tensor<Engine0, Layout0> &row_sum,
+    Tensor<Engine1, Layout1> &smem_row_sum, const int row_idx_offset, const int warp_id_n) {
+
+    #pragma unroll
+    for (int mi = 0; mi < kNRows; ++mi) {
+        const int row_idx = row_idx_offset + mi * 8;
+        smem_row_sum(row_idx, warp_id_n) = row_sum(mi);
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int mi = 0; mi < kNRows; ++mi) {
+        const int row_idx = row_idx_offset + mi * 8;
+        #pragma unroll
+        for (int ni = 0; ni < WarpsK; ++ni) {
+            if (warp_id_n != ni) {
+                row_sum(mi) += smem_row_sum(row_idx, ni);
+            }
+        }
+    }
+}
+
+template<int kNRows, int WarpsK, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_max_between_warps(
+    Tensor<Engine0, Layout0> &row_max, Tensor<Engine1, Layout1> &smem_row_max,
+    const int row_idx_offset, const int warp_id_n) {
+    MaxOp<float> max_op;
+    if constexpr(WarpsK == 2) {
+        reduce_between_2warps<kNRows>(max_op, row_max, smem_row_max,
+            row_idx_offset, warp_id_n);
+    } else {
+        reduce_between_warps<kNRows, WarpsK>(max_op, row_max, smem_row_max,
+            row_idx_offset, warp_id_n);
+    }
+}
+
+template<int kNRows, int WarpsK, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_sum_between_warps(
+    Tensor<Engine0, Layout0> &row_max, Tensor<Engine1, Layout1> &smem_row_max,
+    const int row_idx_offset, const int warp_id_n) {
+    SumOp<float> max_op;
+    if constexpr(WarpsK == 2) {
+        reduce_between_2warps<kNRows>(max_op, row_max, smem_row_max,
+            row_idx_offset, warp_id_n);
+    } else {
+        reduce_between_warps<kNRows, WarpsK>(max_op, row_max, smem_row_max,
+            row_idx_offset, warp_id_n);
+    }
+
+}
+
+template <bool USE_MMA_8, int kBlockM, int AtomLayoutQ, int WarpsK>
+struct SoftmaxBetweenWarps {
+
+    static constexpr int MMA_ATOM_M = USE_MMA_8 ? 8 : 16;
+    static constexpr int MMA_ATOM_K_M = USE_MMA_8 ? 1 : 2;
+    static constexpr int warp_row_strideQ = MMA_ATOM_M * AtomLayoutQ;
+    static constexpr int kNRowsQ = MMA_ATOM_K_M * kBlockM / warp_row_strideQ;
+    // static constexpr int warp_row_strideP = MMA_ATOM_M * AtomLayoutP;
+    // static constexpr int kNRowsP = MMA_ATOM_K_M * kBlockM / (MMA_ATOM_M * AtomLayoutP); // check
+
+    using TensorT = decltype(make_tensor<float>(Shape<Int<kNRowsQ>>{}));
+    TensorT row_max, row_sum, lse;
+    float scale_user;
+
+    const int warp_id = threadIdx.x / 32;
+    // const int line_id = threadIdx.x % 32;
+    // const int warp_id_m = warp_id % AtomLayoutQ;
+    // const int warp_id_n = warp_id / AtomLayoutQ;
+    // const int warp_id_p = warp_id % AtomLayoutP;
+
+    const int row_idx_offsetQ = (warp_id % AtomLayoutQ) * MMA_ATOM_M + (threadIdx.x % 32 / 4) * MMA_ATOM_K_M;
+    // const int row_idx_offsetP = (warp_id % AtomLayoutP) * MMA_ATOM_M + (threadIdx.x % 32 / 4) * 2;
+    const int row_idx_offset_reduce = (warp_id % AtomLayoutQ) * (kBlockM / AtomLayoutQ) + (threadIdx.x % 32 /4);
+
+    __forceinline__ __device__ SoftmaxBetweenWarps() {};
+
+    template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1, typename Tensor2>
+    __forceinline__ __device__ void softmax_rescale_per_warp(
+        Tensor0 &acc_s, Tensor1 &smem_row_max, Tensor2 &smem_row_scale, float softmax_scale_log2) {
+        // Reshape acc_s from (MMA=8, MMA_M, MMA_N) to (nrow=MMA_M, ncol=(4, MMA_N))
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        static_assert(decltype(size<0>(scores))::value == kNRowsQ);
+        // rows of scores is (2, MMA_M), scores(make_coord(i, j), *) is row_max(i + j*2)
+
+        if (Is_first) {
+            flash::template reduce_max</*zero_init=*/true>(scores, row_max);
+            if constexpr (WarpsK > 1) {
+                flash::reduce_max_between_warps<kNRowsQ, WarpsK>(
+                    row_max, smem_row_max, row_idx_offset_reduce,
+                    warp_id / AtomLayoutQ /*warp_id_n*/);
+            }
+
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            flash::reduce_sum</*zero_init=*/true>(scores, row_sum);
+        } else {
+            Tensor scores_max_prev = make_fragment_like(row_max);
+            cute::copy(row_max, scores_max_prev); // TODO:copy smem_row_max from row_max
+            flash::template reduce_max</*zero_init=*/false>(scores, row_max);
+            if constexpr (WarpsK > 1) {
+                flash::reduce_max_between_warps<kNRowsQ, WarpsK>(
+                    row_max, smem_row_max, row_idx_offset_reduce,
+                    warp_id / AtomLayoutQ /*warp_id_n*/);
+
+            }
+            #pragma unroll
+            for (int mi = 0; mi < kNRowsQ; ++mi) {
+                float scores_max_cur = !Check_inf
+                    ? row_max(mi)
+                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                const int row_idx = SFT_ROW_IDX2(mi, row_idx_offsetQ, warp_row_strideQ, MMA_ATOM_K_M);
+
+                // if (threadIdx.x % 4 == 0)
+                smem_row_scale(row_idx) = scores_scale;
+                // temp(mi) =scores_scale;
+                row_sum(mi) *= scores_scale;
+            }
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            // We don't do the reduce across threads here since we don't need to use the row_sum.
+            // We do that reduce at the end when we need to normalize the softmax.
+            flash::reduce_sum</*zero_init=*/false>(scores, row_sum);
+        }
+    };
+
+    template<int AtomLayoutP, typename Tensor0, typename Tensor1>
+    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_o, Tensor1 &smem_row_scale) {
+        static constexpr int kNRowsP = MMA_ATOM_K_M * kBlockM / (MMA_ATOM_M * AtomLayoutP); // check
+
+        const int row_idx_offsetP = (warp_id % AtomLayoutP) * MMA_ATOM_M + (threadIdx.x % 32 / 4) * MMA_ATOM_K_M;
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRowsP);
+        // __syncthreads(); // before this func, sync is exist;
+
+        #pragma unroll
+        for (int mi = 0; mi < kNRowsP; ++mi) {
+            const int row_idx = SFT_ROW_IDX2(mi, row_idx_offsetP, MMA_ATOM_M * AtomLayoutP, MMA_ATOM_K_M);
+            // float scores_scale = temp(mi % kNRowsQ);
+
+            float scores_scale = smem_row_scale(row_idx);
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+                acc_o_rowcol(mi, ni) *= scores_scale;
+            }
+        }
+
+    };
+
+  template<bool Split, typename Tensor0, typename Tensor1>
+    __forceinline__ __device__ void normalize_softmax_lse_per_warp(
+        Tensor0 &smem_row_sum, Tensor1 &smem_row_scale, float softmax_scale) {
+
+        SumOp<float> sum_op;
+        quad_allreduce_(row_sum, row_sum, sum_op);
+        if constexpr (WarpsK > 1) {
+            // flash::reduce_sum_between_warps<kNRowsQ, WarpsK>(
+            //     row_sum, smem_row_sum, row_idx_offset_reduce, warp_id / AtomLayoutQ /*warp_id_n*/);
+            flash::reduce_sum_via_warps<kNRowsQ, WarpsK>(
+                row_sum, smem_row_sum, row_idx_offset_reduce,
+                warp_id / AtomLayoutQ /*warp_id_n*/);
+        }
+        #pragma unroll
+        for (int mi = 0; mi < kNRowsQ; ++mi) {
+            float sum = row_sum(mi);
+            float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
+            lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * softmax_scale + __logf(sum);
+            // float scale = inv_sum ;
+            const int row_idx = SFT_ROW_IDX2(mi, row_idx_offsetQ, warp_row_strideQ, MMA_ATOM_K_M);
+            // if (threadIdx.x % 4 == 0)
+            smem_row_scale(row_idx) = inv_sum;
+            // temp(mi) = inv_sum;
+        }
+        };
+
+
+    template<bool Is_dropout=false, bool Split=false, typename Tensor0>
+    __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout=1.0) {
+        return lse;
+    };
+
 };
 
 }  // namespace flash

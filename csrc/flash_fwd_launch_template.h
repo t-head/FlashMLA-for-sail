@@ -10,14 +10,14 @@
 #include "flash.h"
 #include "flash_fwd_kernel.h"
 
-template<typename Kernel_traits>
+template<typename Kernel_traits, bool CrossCut = false>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     //FLASH_ASSERT(params.page_block_size == Kernel_traits::kBlockN);
     //constexpr size_t smem_size = Kernel_traits::kSmemSize;
     constexpr size_t smem_size = Kernel_traits::kSmemSizeAccum;
     const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal>;
+        auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal, CrossCut>;
         //CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         if (smem_size >= 48 * 1024) {
             C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -41,6 +41,9 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 printf("blockM:%d, blockN:%d, threads:%d, params.num_splits:%d, block_size:%d\n",
                         Kernel_traits::kBlockM, Kernel_traits::kBlockN, Kernel_traits::kNThreads, params.num_splits, params.page_block_size);
                 printf("Is_causal:%d, ngroups:%d\n", Is_causal, params.ngroups);
+                printf("CrossCut:%d, USE_MMA_M8:%d\n", Kernel_traits::CrossCut, Kernel_traits::USE_MMA_M8);
+                printf("kNWarps:%d, AtomLayoutQ:%d, AtomLayoutP:%d\n", Kernel_traits::kNWarps, Kernel_traits::AtomLayoutQ, Kernel_traits::AtomLayoutP);
+                printf("Is_Q_in_regs:%d, Share_Q_K_smem:%d\n", Kernel_traits::Is_Q_in_regs, Kernel_traits::Share_Q_K_smem);
                 printf("seq[%d, %d], grid_n[%d, %d, %d]\n",
                         params.seqlen_q, params.seqlen_k, num_m_block, params.h, params.num_sm_parts);
                 printf("verg:%d, stack:%d, sm:%d, occpuancy:%0.3f\n", int(attr.numRegs), int(attr.localSizeBytes), sm_count,
@@ -62,6 +65,48 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, int Headdim, int Headdim_V>
 void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     // constexpr static int kBlockM = 64;  // Fixed for all head dimensions
+
+    /// seqlen_q = 128 use CrossCut method
+#if ACOMPUTE_VERSION==10000
+    bool cross_cut = use_cross_cut(params.seqlen_q, params.b);
+    if (cross_cut) {
+        // support seqlen_q > 16.
+        constexpr static int kBlockN= 32;
+        if (params.seqlen_q <= 32) {
+            constexpr static int kBlockM = 32;
+            constexpr bool USE_MMA_M8 = 1;
+            constexpr int kNwarps = 8;
+            constexpr int AtomLayoutQ = 4;
+            constexpr int AtomLayoutP = 1;
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                >, 1/*CrossCut*/>(params, stream);
+        } else if (params.seqlen_q <= 64) {
+            constexpr static int kBlockM = 64;
+            constexpr bool USE_MMA_M8 = 1;
+            constexpr int kNwarps = 8;
+            constexpr int AtomLayoutQ = 8;
+            constexpr int AtomLayoutP = 1;
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                >, 1/*CrossCut*/>(params, stream);
+        } else if (params.seqlen_q > 64) {
+            constexpr static int kBlockM = 128;
+            constexpr bool USE_MMA_M8 = 0;
+            constexpr int kNwarps = 16;
+            constexpr int AtomLayoutQ = 8;
+            constexpr int AtomLayoutP = 2;
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                >, 1/*CrossCut*/>(params, stream);
+        }
+        return;
+    }
+
+#endif
     constexpr static int kBlockN = 16;
     SEQLENG_SWITCH(params.seqlen_q, [&] {
 #if defined(USE_PPU) && ACOMPUTE_VERSION == 10000

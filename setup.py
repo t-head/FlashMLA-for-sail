@@ -66,7 +66,7 @@ cc_flag.append("arch=compute_80,code=sm_80")
 
 
 
-cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
+cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations", "-DACOMPUTE_VERSION=10000"]
 
 ext_modules = []
 ext_modules.append(

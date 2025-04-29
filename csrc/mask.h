@@ -28,7 +28,7 @@ struct Mask {
 #if defined(USE_PPU) && ACOMPUTE_VERSION == 10500
         static_assert(decltype(size<0>(tensor_))::value == 8, "First dimension must be 8");
 #else
-        static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
+        // static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
 #endif
         static constexpr bool Need_masking = Causal_mask || !Is_even_MN;
         // if (cute::thread0()) { printf("Causal_mask=%d, Is_even_MN = %d, Need_masking = %d\n", Causal_mask, Is_even_MN, Need_masking); }

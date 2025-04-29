@@ -198,13 +198,13 @@ get_num_sm_parts(
     // This should match the logic in the MLA kernel.
     //static constexpr int block_size_m = 64;
 #if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-    const int block_size_m = num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 8 - 1) / 8 * 8: 64;
+    const int block_size_m = num_heads_per_head_k > 64 ? 128 // CrossCut
+        : (num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 8 - 1) / 8 * 8: 64);
 #else
     const int block_size_m = num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 16 - 1) / 16 * 16: 64;
 #endif
     // static set occpuancy priori knowledge.
-    int occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : 2;
-
+    int occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : block_size_m == 64 ? 2 : 1;
     auto dprops = at::cuda::getCurrentDeviceProperties();
     int sm_count = dprops->multiProcessorCount;
     if (std::string(dprops->name).find("810E") != std::string::npos) {
@@ -235,7 +235,12 @@ get_mla_metadata(
     int num_sm_parts = get_num_sm_parts(num_heads_per_head_k, num_heads_k);
 
     //static constexpr int block_size_n = 64;
+
+#if ACOMPUTE_VERSION == 10000
+    int block_size_n = use_cross_cut(num_heads_per_head_k, batch_size) ? 32 : 16;
+#else
     static constexpr int block_size_n = 16;
+#endif
     static constexpr int fixed_overhead_num_blocks = 5;
 
     auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
@@ -306,7 +311,11 @@ get_mla_metadata_with_workspace(
     int num_sm_parts = get_num_sm_parts(num_heads_per_head_k, num_heads_k);
 
     //static constexpr int block_size_n = 64;
+#if ACOMPUTE_VERSION == 10000
+    int block_size_n = use_cross_cut(num_heads_per_head_k, batch_size) ? 32 : 16;
+#else
     static constexpr int block_size_n = 16;
+#endif
     static constexpr int fixed_overhead_num_blocks = 5;
 
     constexpr size_t size_per_elemnet = sizeof(int32_t);
