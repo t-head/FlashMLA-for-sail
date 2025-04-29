@@ -502,6 +502,8 @@ def get_params(input_str):
 
     config_dict = {k: convert_value(v) for k, v in config_dict.items()}
     config_dict["seq_q"] = int(config_dict["seqlen_q"])
+    torch.manual_seed(0)
+    random.seed(0)
     # rnd = max(random.normalvariate(config_dict["seqlen_k"], config_dict["seqlen_k"] / 2), config_dict["seq_q"])
     config_dict["cache_seqlens"] = torch.tensor([max(random.normalvariate(config_dict["seqlen_k"], config_dict["seqlen_k"] / 2), config_dict["seq_q"]) + i for i in range(config_dict["batch_size"])], dtype=torch.int32, device="cpu")
     config_dict["dtype"] = torch.bfloat16 if config_dict["dtype"] == "bf16" else torch.half
