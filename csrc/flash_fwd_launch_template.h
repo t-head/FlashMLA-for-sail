@@ -67,8 +67,8 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
     // constexpr static int kBlockM = 64;  // Fixed for all head dimensions
 
     /// seqlen_q = 128 use CrossCut method
-#if ACOMPUTE_VERSION==10000
     bool cross_cut = use_cross_cut(params.seqlen_q, params.b);
+#if ACOMPUTE_VERSION==10000
     if (cross_cut) {
         // support seqlen_q > 16.
         constexpr static int kBlockN= 32;
@@ -105,14 +105,54 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
         }
         return;
     }
-
-#endif
-    constexpr static int kBlockN = 16;
-    SEQLENG_SWITCH(params.seqlen_q, [&] {
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kBlockM / 8, false, false, T, Headdim_V>>(params, stream);
 #else
-        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kBlockM / 16, false, false, T, Headdim_V>>(params, stream);
+    if (cross_cut) {
+        // support seqlen_q > 16.
+        constexpr static int kBlockN = 32;
+        constexpr bool USE_MMA_M8 = 0;
+        if (params.seqlen_q <= 32) {
+            constexpr static int kBlockM = 32;
+            constexpr int kNwarps = 4;
+            constexpr int AtomLayoutQ = 2;
+            constexpr int AtomLayoutP = 1;
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                >, 1/*CrossCut*/>(params, stream);
+        } else if (params.seqlen_q <= 64) {
+            constexpr static int kBlockM = 64;
+            constexpr int kNwarps = 8;
+            constexpr int AtomLayoutQ = 4;
+            constexpr int AtomLayoutP = 1;
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                >, 1/*CrossCut*/>(params, stream);
+        } else if (params.seqlen_q > 64) {
+            constexpr static int kBlockM = 128;
+            constexpr int kNwarps = 16;
+            constexpr int AtomLayoutQ = 8;
+            constexpr int AtomLayoutP = 2;
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                >, 1/*CrossCut*/>(params, stream);
+        }
+        return;
+    }
 #endif
+
+    constexpr static int kBlockN = 16;
+#if ACOMPUTE_VERSION==10000
+    constexpr bool USE_MMA_M8 = 1;
+#else
+    constexpr bool USE_MMA_M8 = 0;
+#endif
+    SEQLENG_SWITCH(params.seqlen_q, [&] {
+        constexpr int kNwarps = USE_MMA_M8 ? kBlockM / 8 : kBlockM / 16;
+        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+            Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
+            T, Headdim_V, 0/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/>>(params, stream);
+
     });
 }

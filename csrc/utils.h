@@ -160,7 +160,7 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
 // if using m16n8k16, or to (4, MMA_M, MMA_N) if using m16n8k8.
 template<typename MMA_traits, typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10500
+#if ACOMPUTE_VERSION == 10500
     return acc_layout;
 #else
     using X = Underscore;
@@ -219,10 +219,37 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
                             Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
                             Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
 
+    CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
+    CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
 // support AIU on PPU
 #if USE_AIU
     if constexpr (is_mix_iterator<typename Engine0::iterator>::value) {
         const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
+#if 0 // ACOMPUTE_VERSION > 10000
+        // it is slower.
+        if constexpr (!Is_even_MN) {
+            tiled_copy.desc_.dim_h = max_MN;
+        }
+
+        if (blockDim.x / 32 <= 1) {
+            if (warp_idx == 0) {
+                cute::copy(tiled_copy, S, D);
+            }
+        } else {
+            if (warp_idx == 0) {
+                #pragma unroll
+                for (int k = 0; k < (size<2>(S)); ++k) {
+                    cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
+                }
+            } else if (warp_idx == 1) {
+                #pragma unroll
+                for (int k = (size<2>(S)/2); k < size<2>(S); ++k) {
+                    cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
+                }
+            }
+        }
+
+#else
         if (warp_idx == 0) {
             if constexpr (!Is_even_MN) {
                 tiled_copy.desc_.dim_h = max_MN;
@@ -230,12 +257,11 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 
             cute::copy(tiled_copy, S, D);
         }
+#endif
         return;
     }
 #endif
 
-    CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
-    CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
     CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K

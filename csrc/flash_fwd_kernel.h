@@ -172,6 +172,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
     constexpr int kNWarps = Kernel_traits::kNWarps;
+    constexpr int MMA_ATOM_M = Kernel_traits::USE_MMA_M8 ? 8 : 16;
+    constexpr int MMA_ATOM_K_M = Kernel_traits::USE_MMA_M8 ? 1 : 2;
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("Is_even_MN = %d, is_cumulativ = %d, seqlen_k_cache = %d, actual_seqlen_k = %d\n", Is_even_MN, params.is_seqlens_k_cumulative, binfo.seqlen_k_cache, binfo.actual_seqlen_k); }
@@ -223,7 +225,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
-    Tensor sK = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutK{});
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), typename Kernel_traits::SmemLayoutK{});
 
     //use k/v shared
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutV{});
@@ -304,15 +306,19 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
     flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
                                         binfo.actual_seqlen_q - m_block * kBlockM);
-    cute::cp_async_fence();
+    if (Kernel_traits::Is_Q_in_regs) {
+        cute::cp_async_fence();
+    }
 
     // load Q from tsm to verg and keep use.
-    flash::cp_async_wait<0>();
-    __syncthreads();
-    Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
-    CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
-    cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
-    __syncthreads();
+    if (Kernel_traits::Share_Q_K_smem) {
+        flash::cp_async_wait<0>();
+        __syncthreads();
+        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
+        cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+        __syncthreads();
+    }
 
     auto tKgK_data = tKgK.data();
     { // use new namespace to create mix tensor with the same name
@@ -373,14 +379,17 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     kv_store_num++;
     cute::cp_async_fence();
 
+    if (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
+        flash::cp_async_wait<1>();
+        __syncthreads();
+        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
+        cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+    }
+
     clear(acc_o);
 
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-    flash::Softmax<size<1>(acc_o)> softmax;
-#else
-    flash::Softmax<2 * size<1>(acc_o)> softmax;
-#endif
-
+    flash::Softmax<MMA_ATOM_K_M * size<1>(acc_o)> softmax;
     flash::Mask mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
     constexpr int n_masking_steps = (!Is_causal)
@@ -423,17 +432,13 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
         auto tSsK_current = kv_load_num % 2 == 0 ? tSsK : tSsK_double;
         auto tOsVt_current = kv_load_num % 2 == 0 ? tOsVt : tOsVt_double;
 
-        flash::gemm<true>(
+        flash::gemm<Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 8 + (tidx % 32) / 4, kNWarps * 8, params.ngroups
-#else
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16, params.ngroups
-#endif
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * MMA_ATOM_M + (tidx % 32) / 4, kNWarps * MMA_ATOM_M, params.ngroups
         );
 
         // We have key_padding_mask so we'll need to Check_inf
@@ -495,7 +500,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
         auto tSsK_current = kv_load_num % 2 == 0 ? tSsK : tSsK_double;
         auto tOsVt_current = kv_load_num % 2 == 0 ? tOsVt : tOsVt_double;
 
-        flash::gemm<true>(
+        flash::gemm<Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
@@ -842,8 +847,6 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
             m_block * kBlockM + (tidx / 32) % AtomLayoutQ * MMA_ATOM_M + (tidx % 32) / 4,
             AtomLayoutQ * MMA_ATOM_M, params.ngroups
         );
-
-        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         masking_step == 0
             ? softmax.template softmax_rescale_per_warp</*Is_first=*/true,  /*Check_inf=*/Is_causal || !Is_even_MN>(acc_s, smem_row_via_warp, smem_row_scale, params.scale_softmax_log2)

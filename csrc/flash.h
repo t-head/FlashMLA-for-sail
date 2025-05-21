@@ -55,6 +55,7 @@ static constexpr int TileSchedulerMetaDataSize = 8;
 // [begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, _, _, _]
 
 static bool use_cross_cut(int num_heads_per_head_k, int batch_size) {
+#if ACOMPUTE_VERSION == 10000
     if (num_heads_per_head_k <= 16) {
         return false;
     } else if (num_heads_per_head_k <= 32) {
@@ -64,6 +65,9 @@ static bool use_cross_cut(int num_heads_per_head_k, int batch_size) {
     } else {
         return true;
     }
+#else
+    return true;
+#endif
 }
 
 template<typename T, int Headdim>
