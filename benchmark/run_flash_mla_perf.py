@@ -22,6 +22,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', default="output", type=str, required=False, help='the output storing cycles of FA cases')
     parser.add_argument('--local', default=False, action="store_true", required=False, help='specify if run local')
     parser.add_argument('--backend', default="flash_mla", type=str, required=False, help='specify backend, all, flash_mla, flash_infer, flash_mla_triton')
+    parser.add_argument('--mode', default="metrics", type=str, choices=['metrics', 'full'], required=False, help='specify if run full ncu')
 
     args = parser.parse_args()
     fa_cases = list()
@@ -41,6 +42,6 @@ if __name__ == '__main__':
 
     if args.backend == "all":
         for backend in ['flash_mla', 'flash_infer', 'flash_mla_triton'] :
-            run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, backend)
+            run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, backend, args.mode)
     else:
-        run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend)
+        run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend, args.mode)

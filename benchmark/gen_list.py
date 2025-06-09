@@ -4,8 +4,8 @@ def generate_orthogonal_test_list(output_file):
     """
     # Define parameter ranges
     batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
-    seqlen_ks = [200, 400, 1024, 1680, 2560, 3560, 4096, 4960, 5500, 6120, 6600, 7120, 8192]
-    num_heads = [8, 16, 32, 64, 128]
+    seqlen_ks = [200, 400, 1024, 1680, 2560, 3560, 4096, 4960, 5500, 6120, 6600, 7120, 8192] # [4096, 6144, 8192] 
+    num_heads = [8, 16, 32, 64, 128] # [32, 48, 64]
 
     # Fixed parameters
     seqlen_q = 1
@@ -30,7 +30,7 @@ def generate_orthogonal_test_list(output_file):
                         f"head_dim:{head_dim},"
                         f"head_dim_v:{head_dim_v},"
                         f"causal:{causal},"
-                        f"dtype:{dtype}"
+                        f"dtype:{dtype},block_size:64"
                     )
                     line = f"[MLA] --format={params_str}\n"
                     f.write(line)
@@ -40,7 +40,7 @@ def generate_orthogonal_test_list(output_file):
 
 if __name__ == "__main__":
     # Specify output file name
-    output_filename = "test.list"
+    output_filename = "test2.list"
 
     # Call the function to generate the orthogonal test case file
     generate_orthogonal_test_list(output_filename)

@@ -180,6 +180,7 @@ def _mla_attn_kernel(
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    offs_d_ckv_i64 = offs_d_ckv.cast(tl.int64)
 
     for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -189,7 +190,9 @@ def _mla_attn_kernel(
             other=0,
         )
         kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
-        offs_k_c = kv_loc[None, :] * stride_kv_c_bs + offs_d_ckv[:, None]
+        kv_loc_i64 = kv_loc.cast(tl.int64)
+        stride_kv_c_bs_i64 = stride_kv_c_bs.cast(tl.int64)
+        offs_k_c = kv_loc_i64[None, :] * stride_kv_c_bs_i64 + offs_d_ckv_i64[:, None]
         k_c = tl.load(Kv_c_cache + offs_k_c, mask=offs_n[None, :] < split_kv_end, other=0.0)
 
         qk = tl.dot(q_nope, k_c.to(q_nope.dtype))
