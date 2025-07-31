@@ -3,6 +3,7 @@
  ******************************************************************************/
 
 #pragma once
+#include <ATen/cuda/CUDAContext.h>
 
 struct Flash_fwd_params {
     using index_t = int64_t;
@@ -55,19 +56,25 @@ static constexpr int TileSchedulerMetaDataSize = 8;
 // [begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, _, _, _]
 
 static bool use_cross_cut(int num_heads_per_head_k, int batch_size) {
-#if ACOMPUTE_VERSION == 10000
-    if (num_heads_per_head_k <= 16) {
-        return false;
-    } else if (num_heads_per_head_k <= 32) {
-        return batch_size >= 8;
-    } else if (num_heads_per_head_k <= 64) {
-        return batch_size >= 2;
+// #if ACOMPUTE_VERSION == 10000
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    bool is_sm89_or_newer = (dprops->major > 8) || (dprops->major == 8 && dprops->minor >= 9);
+
+    if (!is_sm89_or_newer) {
+        if (num_heads_per_head_k <= 16) {
+            return false;
+        } else if (num_heads_per_head_k <= 32) {
+            return batch_size >= 8;
+        } else if (num_heads_per_head_k <= 64) {
+            return batch_size >= 2;
+        } else {
+            return true;
+        }
+// #else
     } else {
         return true;
     }
-#else
-    return true;
-#endif
+// #endif
 }
 
 template<typename T, int Headdim>

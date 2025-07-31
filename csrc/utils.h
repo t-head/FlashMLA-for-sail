@@ -15,12 +15,14 @@
 #endif
 
 #include <cute/tensor.hpp>
+#include <ATen/cuda/CUDAContext.h>
 
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
+// #if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
+#if defined(USE_PPU)
 #include "acc_vreg_fraga.h"
 #endif
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -192,7 +194,8 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tenso
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
+// #if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
+#if defined USE_PPU
 template <typename To_type, typename Engine, typename Layout>
 inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;

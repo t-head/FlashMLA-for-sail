@@ -8,6 +8,7 @@
 #include <cutlass/fast_math.h>
 #include <cutlass/numeric_types.h>
 #include <limits>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "hardware_info.h"
 #include "flash.h"
@@ -223,16 +224,21 @@ get_num_sm_parts(
     auto dprops = at::cuda::getCurrentDeviceProperties();
     int sm_count = dprops->multiProcessorCount;
     // static set occpuancy priori knowledge.
-#if ACOMPUTE_VERSION == 10000
-    int occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : block_size_m == 64 ? 2 : 1;
-    if (std::string(dprops->name).find("810E") != std::string::npos) {
-        sm_count = 20;
+    int occupancy;
+    bool is_sm89_or_newer = (dprops->major > 8) || (dprops->major == 8 && dprops->minor >= 9);
+// #if ACOMPUTE_VERSION == 10000
+    if (!is_sm89_or_newer) {
+        occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : block_size_m == 64 ? 2 : 1;
+        if (std::string(dprops->name).find("810E") != std::string::npos) {
+            sm_count = 20;
+        } else {
+            occupancy = 1;
+        }
     } else {
-        occupancy = 1;
+// #else
+        occupancy = block_size_m <= 32 ? 2 : 1;
     }
-#else
-    int occupancy = block_size_m <= 32 ? 2 : 1;
-#endif
+// #endif
     int num_sm_parts = (occupancy * sm_count) / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
 
     return num_sm_parts;

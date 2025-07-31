@@ -23,6 +23,7 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
   CUTLASS_DEVICE
     result_type convert(source_type const &src_const) {
       result_type result;
+#if ACOMPUTE_VERSION == 10000
       source_type src;
       // copy src to src_copy
       src = src_const;
@@ -115,6 +116,10 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
 #else
     return result;
 #endif
+#else
+    assert("not support for PPU 1.5\n");
+    return result;
+#endif
 }
 
 
@@ -132,6 +137,7 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
   CUTLASS_DEVICE
     result_type convert(source_type const &src_const) {
       result_type result;
+#if ACOMPUTE_VERSION == 10000
       source_type src;
       // copy src to src_copy
       src = src_const;
@@ -147,7 +153,7 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
         float res = __shfl_xor_sync(0xFFFFFFFF, data, 1, 4);
         if (lane_id & 0x1) {
           src[i] = res;
-        } else { 
+        } else {
           src[i + 1] = res;
         }
         double* tmp = reinterpret_cast<double*>(src.data() + i);
@@ -225,6 +231,10 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
 #else
       return result;
 #endif
+#else
+      assert("not support for PPU 1.5\n");
+      return result;
+#endif
 }
 
   CUTLASS_DEVICE
@@ -241,6 +251,7 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
   CUTLASS_DEVICE
     result_type convert(source_type const &src_const) {
       result_type result;
+#if ACOMPUTE_VERSION == 10000
       source_type src;
       // copy src to src_copy
       src = src_const;
@@ -337,6 +348,10 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
 #else
       return result;
 #endif
+#else
+      assert("not support for PPU 1.5\n");
+      return result;
+#endif
 }
 
   CUTLASS_DEVICE
@@ -358,6 +373,7 @@ template <typename T, int N> struct NumericArrayConverterPPU<T, float, N> {
     using scalar_source_type = typename source_type::Element;
 
     result_type result;
+#if ACOMPUTE_VERSION == 10000
     // if (N % CONVERTER_BASE_UNIT_32 == 0) {
     //   constexpr int VEC_WIDTH = CONVERTER_BASE_UNIT_32;
 
@@ -405,6 +421,10 @@ template <typename T, int N> struct NumericArrayConverterPPU<T, float, N> {
     // }
 
     return result;
+#else
+    assert("not support for PPU 1.5\n");
+    return result;
+#endif
   }
   CUTLASS_DEVICE
   bool is_source_needed() { return false; }

@@ -113,9 +113,9 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kNThreads = kNWarps * 32;
 
     /// only for CrossCut ///
-#if ACOMPUTE_VERSION > 10000
-    static_assert(USE_MMA_M8_ == false, "Not support for mma.m8!");
-#endif
+// #if ACOMPUTE_VERSION > 10000
+//     static_assert(USE_MMA_M8_ == false, "Not support for mma.m8!");
+// #endif
 
     static constexpr bool USE_MMA_M8 = USE_MMA_M8_;
     static constexpr bool CrossCut = CrossCut_;

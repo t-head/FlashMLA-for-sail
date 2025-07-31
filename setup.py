@@ -14,11 +14,6 @@ from torch.utils.cpp_extension import (
 DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") == "TRUE"
 CPP_INFERENCE = 'FLASH_MLA_CPP_INFER_BUILD' in os.environ.keys() and os.environ['FLASH_MLA_CPP_INFER_BUILD'] == "1"
 
-ACOMPUTE_VERSION = os.getenv("ACOMPUTE_VERSION", "10000")
-if ACOMPUTE_VERSION not in ["10000", "10500"]:
-    raise ValueError("Unsupported ACOMPUTE_VERSION: {}".format(ACOMPUTE_VERSION))
-
-
 def append_nvcc_threads(nvcc_extra_args):
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return nvcc_extra_args + ["--threads", nvcc_threads]
@@ -69,9 +64,7 @@ cc_flag = []
 cc_flag.append("-gencode")
 cc_flag.append("arch=compute_80,code=sm_80")
 
-
-
-cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations", "-DACOMPUTE_VERSION=" + ACOMPUTE_VERSION]
+cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
 ext_modules = []
 ext_modules.append(
@@ -110,8 +103,7 @@ ext_modules.append(
                     "-mllvm",
                     "-ppu-alloca-half-ldst-simplify=true",
                     "-DUSE_PPU",
-                    "-DUSE_AIU=1",
-                    "-DACOMPUTE_VERSION=" + ACOMPUTE_VERSION
+                    "-DUSE_AIU=1"
                 ]
                 + cc_flag
             ) + get_features_args(),

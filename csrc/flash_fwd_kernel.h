@@ -1073,12 +1073,20 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_params params) {
         if (batch_id > begin_idx) {
             __syncthreads();  // Barrier between two tiles.
         }
-
-         if constexpr (CrossCut) {
-            compute_attn_cross_cut_splitkv<Kernel_traits, Is_causal, false>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit);
-         } else {
-            compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, false>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit);
-         }
+#if ACOMPUTE_VERSION != 10000
+    if constexpr (!Kernel_traits::USE_MMA_M8)
+#endif
+    {
+        if constexpr (CrossCut) {
+            compute_attn_cross_cut_splitkv<Kernel_traits, Is_causal, false>(
+                params, batch_id, bidh, m_block, n_split_idx, seqlen_k,
+                n_block_min, n_block_max, NoSplit);
+        } else {
+            compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, false>(
+                params, batch_id, bidh, m_block, n_split_idx, seqlen_k,
+                n_block_min, n_block_max, NoSplit);
+        }
+    }
     }
 }
 
