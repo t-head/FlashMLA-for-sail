@@ -11,6 +11,7 @@ import argparse
 # pip install flashinfer-python
 from flash_mla import get_mla_metadata, flash_mla_with_kvcache
 import flashinfer
+import json
 
 device_name = torch.cuda.get_device_name()
 USE_PPU = (device_name.lower().find("ppu") != -1)
@@ -436,6 +437,7 @@ FUNC_TABLE = {
 
 def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
     print(f"{target}: {b=}, {s_q=}, mean_seqlens={cache_seqlens.float().mean()}, {h_q=}, {h_kv=}, {d=}, {dv=}, {causal=}, {dtype=}")
+
     torch.set_default_dtype(dtype)
     device = torch.device("cuda:0")
     torch.set_default_device(device)
@@ -445,7 +447,6 @@ def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
     assert target in FUNC_TABLE
     target_func = FUNC_TABLE[target]
 
-    # print(cache_seqlens)
     total_seqlens = cache_seqlens.sum().item()
     mean_seqlens = cache_seqlens.float().mean().int().item()
     max_seqlen = cache_seqlens.max().item()
@@ -495,17 +496,24 @@ def convert_value(value):
         
 def get_params(input_str):
     input_str = re.sub(r'^.*?format=', '', input_str)
-    pattern = r'(\w+):([^,]+)'
+    pattern = r'(\w+):(\[.*?\]|[^,]+?)(?=,\w+:|$|,)'
     matches = re.findall(pattern, input_str)
     config_dict = {key: value for key, value in matches}
-
 
     config_dict = {k: convert_value(v) for k, v in config_dict.items()}
     config_dict["seq_q"] = int(config_dict["seqlen_q"])
     torch.manual_seed(0)
     random.seed(0)
     # rnd = max(random.normalvariate(config_dict["seqlen_k"], config_dict["seqlen_k"] / 2), config_dict["seq_q"])
-    config_dict["cache_seqlens"] = torch.tensor([max(random.normalvariate(config_dict["seqlen_k"], config_dict["seqlen_k"] / 2), config_dict["seq_q"]) + i for i in range(config_dict["batch_size"])], dtype=torch.int32, device="cpu")
+
+    if type(config_dict["seqlen_k"]) is int:
+        # varlen
+        config_dict["cache_seqlens"] = torch.tensor([max(random.normalvariate(config_dict["seqlen_k"], config_dict["seqlen_k"] / 2), config_dict["seq_q"]) + i for i in range(config_dict["batch_size"])], dtype=torch.int32, device="cpu")
+        # fixlen
+        #config_dict["cache_seqlens"] = torch.full((config_dict["batch_size"],), config_dict["seqlen_k"], dtype=torch.int32, device="cpu")
+    else:
+        config_dict["cache_seqlens"] = torch.tensor(json.loads(config_dict["seqlen_k"]), dtype=torch.int32, device="cpu")
+
     config_dict["dtype"] = torch.bfloat16 if config_dict["dtype"] == "bf16" else torch.half
 
     return config_dict

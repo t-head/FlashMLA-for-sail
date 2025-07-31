@@ -134,16 +134,37 @@ mha_fwd_kvcache_mla(
     params.page_block_size = page_block_size;
     //params.seqlen_k = seqlen_k;
 
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
     // export PPU_LIB_SHOW_PARAMS=1
     ppu::fmha::FmhaProfParam fmha_prof_params;
     if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
-        fmha_prof_params.set_flash_attn_params(
-            q_dtype == torch::kFloat16/*data_type*/,
-            params.is_causal/*custom_mask*/, params.b/*batch_size*/,
-            num_heads_ori/*num_heads*/, num_heads_k/*num_heads_k*/,
-            params.d/*head_dim*/, params.d_v/*head_dim_value*/,
-            seqlen_q_ori/*seqlen_q*/, params.seqlen_k/*seqlen_k*/
-        );
+        // check if cuda graph captured
+        cudaStreamCaptureStatus captureStatus;
+        cudaStreamIsCapturing(stream, &captureStatus);
+        if (captureStatus != cudaStreamCaptureStatusNone) {
+            printf("dump info not supported in cuda graph mode\n");
+        } else {
+
+            int* tmp = new int[params.b];
+            cudaMemcpyAsync(tmp, params.cu_seqlens_k, sizeof(int) * params.b, cudaMemcpyDeviceToHost, stream);
+            std::ostringstream oss;
+            oss << "[";
+            for (int i = 0; i < int(params.b); ++i) {
+                oss << tmp[i];
+                if (i < int(params.b) - 1) oss << ",";
+            }
+            oss << "]";
+            free(tmp);
+            // printf("oss:%s\n", oss.str().c_str());
+
+            fmha_prof_params.set_flash_attn_params(
+                q_dtype == torch::kFloat16/*data_type*/,
+                params.is_causal/*custom_mask*/, params.b/*batch_size*/,
+                num_heads_ori/*num_heads*/, num_heads_k/*num_heads_k*/,
+                params.d/*head_dim*/, params.d_v/*head_dim_value*/,
+                seqlen_q_ori/*seqlen_q*/, oss.str()/*seqlen_kv*/
+            );
+        }
     }
 
     // tile_scheduler
@@ -168,7 +189,6 @@ mha_fwd_kvcache_mla(
     //    head_size, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
 
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(head_size == 576);
     if (q_dtype == torch::kBFloat16) {
         run_mha_fwd_splithd_splitkv_dispatch<cutlass::bfloat16_t, 576, 512>(params, stream);
@@ -480,18 +500,38 @@ mha_fwd_kvcache_mla_with_workspace(
     params.workspace_ptr = workspace_ptr;
     params.max_workspace_size = max_workspace_size;
 
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
     // export PPU_LIB_SHOW_PARAMS=1
     ppu::fmha::FmhaProfParam fmha_prof_params;
     if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
-        fmha_prof_params.set_flash_attn_params(
-            q_dtype == torch::kFloat16/*data_type*/,
-            params.is_causal/*custom_mask*/, params.b/*batch_size*/,
-            num_heads_ori/*num_heads*/, num_heads_k/*num_heads_k*/,
-            params.d/*head_dim*/, params.d_v/*head_dim_value*/,
-            seqlen_q_ori/*seqlen_q*/, params.seqlen_k/*seqlen_k*/
-        );
+        // check if cuda graph captured
+        cudaStreamCaptureStatus captureStatus;
+        cudaStreamIsCapturing(stream, &captureStatus);
+        if (captureStatus != cudaStreamCaptureStatusNone) {
+            printf("dump info not supported in cuda graph mode\n");
+        } else {
+
+            int* tmp = new int[params.b];
+            cudaMemcpyAsync(tmp, params.cu_seqlens_k, sizeof(int) * params.b, cudaMemcpyDeviceToHost, stream);
+            std::ostringstream oss;
+            oss << "[";
+            for (int i = 0; i < int(params.b); ++i) {
+                oss << tmp[i];
+                if (i < int(params.b) - 1) oss << ",";
+            }
+            oss << "]";
+            free(tmp);
+            // printf("oss:%s\n", oss.str().c_str());
+
+            fmha_prof_params.set_flash_attn_params(
+                q_dtype == torch::kFloat16/*data_type*/,
+                params.is_causal/*custom_mask*/, params.b/*batch_size*/,
+                num_heads_ori/*num_heads*/, num_heads_k/*num_heads_k*/,
+                params.d/*head_dim*/, params.d_v/*head_dim_value*/,
+                seqlen_q_ori/*seqlen_q*/, oss.str()/*seqlen_kv*/
+            );
+        }
     }
-    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
 
     // tile_scheduler
     TORCH_CHECK(tile_scheduler_metadata.dtype() == torch::kInt32, "tile_scheduler_metadata must have dtype int32");
@@ -524,7 +564,6 @@ mha_fwd_kvcache_mla_with_workspace(
     //    params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
     //    head_size, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
 
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(head_size == 576);
     if (q_dtype == torch::kBFloat16) {
         run_mha_fwd_splithd_splitkv_dispatch<cutlass::bfloat16_t, 576, 512>(params, stream);

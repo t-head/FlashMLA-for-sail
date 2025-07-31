@@ -36,7 +36,7 @@ void set_flash_attn_params(bool is_bf16,
                            bool is_causal, int batch_size,
                            int num_heads, int num_heads_k,
                            int head_dim, int head_dim_value,
-                           int seqlen_q, int seqlen_k){
+                           int seqlen_q, std::string seqlen_k){
 
   initialize_args();
   std::string data_type = is_bf16 ? "bf16" : "fp16";
@@ -62,9 +62,9 @@ std::string format() {
   //   }
   // }
   for (auto& key : insertionOrder) {
-    ss << key << ":" << args_[key];
-    if (&key != &insertionOrder.back())
-      ss << ',';
+      ss << key << ":" << args_[key];
+      if (&key != &insertionOrder.back())
+        ss << ',';
   }
   ss << '.';
   return ss.str();
