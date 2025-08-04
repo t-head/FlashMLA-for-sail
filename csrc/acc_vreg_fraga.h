@@ -34,27 +34,27 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
 
       int lane_id = get_lane_id();
       CUTLASS_PRAGMA_UNROLL
-	for (int i = 0; i < src.size(); i += 2) {
-	  float data = lane_id & 0x1 ? src[i] : src[i + 1];
-	  float res = __shfl_xor_sync(0xFFFFFFFF, data, 1, 4);
-	  if (lane_id & 0x1) {
-	    src[i] = res;
-	  } else {
-	    src[i + 1] = res;
-	  }
-	  double* tmp = reinterpret_cast<double*>(src.data() + i);
-	  double d = __shfl_xor_sync(0xffffffff, tmp[0], 3, 4);
-	  // double d = __shfl_xor_sync(0x66666666, tmp[0], 3, 4);
-	  if (lane_id % 4 == 1 || lane_id % 4 == 2) {
-	    tmp[0] = d;
-	  }
-	}
+      for (int i = 0; i < src.size(); i += 2) {
+        float data = lane_id & 0x1 ? src[i] : src[i + 1];
+        float res = __shfl_xor_sync(0xFFFFFFFF, data, 1, 4);
+        if (lane_id & 0x1) {
+          src[i] = res;
+        } else {
+          src[i + 1] = res;
+        }
+        double* tmp = reinterpret_cast<double*>(src.data() + i);
+        double d = __shfl_xor_sync(0xffffffff, tmp[0], 3, 4);
+        // double d = __shfl_xor_sync(0x66666666, tmp[0], 3, 4);
+        if (lane_id % 4 == 1 || lane_id % 4 == 2) {
+          tmp[0] = d;
+        }
+      }
 #endif
       // convert and pack to fp16
       CUTLASS_PRAGMA_UNROLL
-	for (int i = 0; i < src.size(); i++) {
-	  result[i] = (T)src[i];
-	}
+      for (int i = 0; i < src.size(); i++) {
+        result[i] = (T)src[i];
+      }
 #ifdef SHFL_V1
       result_type final_result;
       // create weight matrix
@@ -83,42 +83,42 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
       uint32_t zero_accum[4] = {0};
       // do matmul
 
-  CUTLASS_PRAGMA_UNROLL
-  for (int i = 0; i < src.size(); i += 8) {
-	  float* d = reinterpret_cast<float*>(final_result.data() + i);
-	  float* a = reinterpret_cast<float*>(result.data() + i);
-	  float* b = reinterpret_cast<float*>(&weight[0]);
-	  float* c = reinterpret_cast<float*>(&zero_accum[0]);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < src.size(); i += 8) {
+        float* d = reinterpret_cast<float*>(final_result.data() + i);
+        float* a = reinterpret_cast<float*>(result.data() + i);
+        float* b = reinterpret_cast<float*>(&weight[0]);
+        float* c = reinterpret_cast<float*>(&zero_accum[0]);
 
-    if (std::is_same<cutlass::half_t, T>::value) {
-        asm volatile(
-          "ppu.mma.sync.aligned.m16n16k16.row.col.f16.f16.f16.f16  {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9,%10,%11},"
-          "{%12,%13,%14,%15};\n"
-          : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-          : "f"(a[0]), "f"(a[1]), "f"(a[2]), "f"(a[3]),
-          "f"(b[0]), "f"(b[1]), "f"(b[2]), "f"(b[3]),
-          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
-        );
-      } else if(std::is_same<cutlass::bfloat16_t, T>::value) {
-        asm volatile(
-          "ppu.mma.sync.aligned.m16n16k16.row.col.bf16.bf16.bf16.bf16  {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9,%10,%11},"
-          "{%12,%13,%14,%15};\n"
-          : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-          : "f"(a[0]), "f"(a[1]), "f"(a[2]), "f"(a[3]),
-          "f"(b[0]), "f"(b[1]), "f"(b[2]), "f"(b[3]),
-          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
+        if (std::is_same<cutlass::half_t, T>::value) {
+          asm volatile(
+            "ppu.mma.sync.aligned.m16n16k16.row.col.f16.f16.f16.f16  {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9,%10,%11},"
+            "{%12,%13,%14,%15};\n"
+            : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+            : "f"(a[0]), "f"(a[1]), "f"(a[2]), "f"(a[3]),
+            "f"(b[0]), "f"(b[1]), "f"(b[2]), "f"(b[3]),
+            "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
           );
-      } else {
-        assert("not support layout convert type\n");
+        } else if(std::is_same<cutlass::bfloat16_t, T>::value) {
+          asm volatile(
+            "ppu.mma.sync.aligned.m16n16k16.row.col.bf16.bf16.bf16.bf16  {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9,%10,%11},"
+            "{%12,%13,%14,%15};\n"
+            : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+            : "f"(a[0]), "f"(a[1]), "f"(a[2]), "f"(a[3]),
+            "f"(b[0]), "f"(b[1]), "f"(b[2]), "f"(b[3]),
+            "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
+            );
+        } else {
+          assert("not support layout convert type\n");
+        }
       }
-    }
-    return final_result;
+      return final_result;
 #else
-    return result;
+      return result;
 #endif
 #else
-    assert("not support for PPU 1.5\n");
-    return result;
+      assert("not support for PPU 1.5\n");
+      return result;
 #endif
 }
 
@@ -401,18 +401,18 @@ template <typename T, int N> struct NumericArrayConverterPPU<T, float, N> {
     //     result_ptr[i] = convert_vector_.convert(source_ptr[i]);
     //   }
     // } else {
-      constexpr int VEC_WIDTH = CONVERTER_BASE_UNIT_4;
+    constexpr int VEC_WIDTH = CONVERTER_BASE_UNIT_4;
 
-      NumericArrayConverterPPU<scalar_result_type, scalar_source_type, VEC_WIDTH> convert_vector_;
-      using vec_result = cutlass::Array<scalar_result_type, VEC_WIDTH>;
-      using vec_source = cutlass::Array<scalar_source_type, VEC_WIDTH>;
-      vec_result *result_ptr = reinterpret_cast<vec_result *>(&result);
-      vec_source const *source_ptr = reinterpret_cast<vec_source const *>(&source);
+    NumericArrayConverterPPU<scalar_result_type, scalar_source_type, VEC_WIDTH> convert_vector_;
+    using vec_result = cutlass::Array<scalar_result_type, VEC_WIDTH>;
+    using vec_source = cutlass::Array<scalar_source_type, VEC_WIDTH>;
+    vec_result *result_ptr = reinterpret_cast<vec_result *>(&result);
+    vec_source const *source_ptr = reinterpret_cast<vec_source const *>(&source);
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < N / VEC_WIDTH; ++i) {
-        result_ptr[i] = convert_vector_.convert(source_ptr[i]);
-      }
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N / VEC_WIDTH; ++i) {
+      result_ptr[i] = convert_vector_.convert(source_ptr[i]);
+    }
 
       // if (threadIdx.x == 0) {
       //   for (int i = 0; i < VEC_WIDTH; i++)
