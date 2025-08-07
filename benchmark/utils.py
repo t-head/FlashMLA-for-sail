@@ -2,8 +2,9 @@ import os
 import csv
 import subprocess
 import re
+import time
 
-def run_cmd(cmd: str, timeout=1200, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
+def run_cmd(cmd: str, timeout=3600, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
     print(f"Run command: {cmd}, timeout: {timeout}")
     ret = subprocess.run(args=cmd, timeout=timeout, shell=True, stdout=stdout, stderr=stderr, encoding="utf-8")
     if stdout:
@@ -15,6 +16,31 @@ def run_cmd(cmd: str, timeout=1200, stdout=subprocess.PIPE, stderr=subprocess.PI
         print(f"Run command succeed!")
     return ret
 
+def str_to_list(s, type_func=int):
+    """Convert a comma-separated string to a list of a specified type."""
+    return [type_func(i.strip()) for i in s.split(',')]
+
+def split_list_into_groups(lst, num):
+    group_size = len(lst) // num
+    remainder = len(lst) % num
+    start = 0
+    groups = []
+    for i in range(num):
+        groups.append([])
+    for i in range(len(lst)):
+        group_idx = i % num
+        groups[group_idx].append(lst[i])
+    return groups
+
+def worker(gpu_id, fa_cases, output, device, is_local, backend, mode):
+    # 设置当前进程可见的 GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    print(f"Process {os.getpid()} is running on GPU {gpu_id}")
+    if backend == "all":
+        for _backend in ['flash_mla', 'flash_infer', 'flash_mla_triton']:
+            run_fa_cycle_on_device(fa_cases, output, device, is_local, _backend, mode)
+    else:
+        run_fa_cycle_on_device(fa_cases, output, device, is_local, backend, mode)
 
 # devices = {
 #     "name": ["cycle", "tensor core efficiency", "waves"],
@@ -85,9 +111,11 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, ba
     headers = ["casename","cycle","tc efficiency", "hbm efficiency", "cmd", "detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"] 
     # output_lines.append(new_row)
-
+    if not os.path.exists("./logs"):
+        os.makedirs("./logs")
     for case in fa_cases:
-        log_file = "./gpu_cycles_single_case.log"
+        timestamp = str(round(time.time() * 1000))
+        log_file = f"./logs/gpu_cycles_single_case_{timestamp}.log"
         cmd = "rm -f "+ log_file
         run_cmd(cmd)
         # gpu
@@ -104,33 +132,22 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, ba
                 --page=details python ./run_flash_mla.py --backend={} --format="{}" \
                 2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, backend, case, log_file)
         
-        # print(cmd)
-        # cmd = "ncu --clock-control none --metrics=sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,launch__waves_per_multiprocessor "\
-        #      "--page=details python ./run_flash_attn.py --format="  case \
-        #      " 2>&1 | tee -a "  log_file
+        ret = run_cmd(cmd)
 
-        # ppu:
-        # cmd = "acu --metrics=ce__cycles_active.max --page=details "\
-        #      "python ./run_flash_attn.py --format="  case \
-        #      " 2>&1 | tee -a "  log_file
+        if mode != "full":
+            if ret.returncode == 0:
+                cycle, tc, hbm, detail = read_cycle_from_nculog(log_file)
+                row = [case.replace(",","_"), str(cycle), str(tc), str(hbm), str(cmd), str(detail)]
+                output_lines.append(row)
+                with open(f"{output_file}_{backend}.csv", "a") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(row)
+                    print("write result succeed")
+            else:
+                print("ERROR: failed to run cmd, please check!!")
+                if len(fa_case) == 1:
+                    exit(-1) # only one case, fail and exit
 
-        run_cmd(cmd)
-
-        cycle, tc, hbm, detail = read_cycle_from_nculog(log_file)
-        output_lines.append([case.replace(",","_"), str(cycle), str(tc), str(hbm), str(cmd), str(detail)])
-
-    # print('output file:')
-    # print(output_file)
-
-    # dirname = os.path.dirname(output_file)
-
-    # print('dirname:')
-    # print(dirname)
-
-    # cmd = f"mkdir -p {dirname}"
-    # print(cmd)
-
-    # run_cmd(cmd)
     output_file = output_file + '_' + backend + '.csv'
     if len(fa_cases) == 1:
         with open("local.log", "w") as f:
@@ -140,16 +157,6 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, ba
             print("write result to local.log succeed")
     if run_local:
         with open(output_file, "w") as f:
-            writer = csv.writer(f)
-            for row in output_lines:
-                writer.writerow(row)
-            print("write result succeed")
-    else:
-        # if not os.path.exists(output_file):
-        #     with open(output_file, "w", newline="") as f:
-        #         writer = csv.writer(f)
-        #         writer.writerow(headers)
-        with open(output_file, "w", newline="") as f:
             writer = csv.writer(f)
             for row in output_lines:
                 writer.writerow(row)

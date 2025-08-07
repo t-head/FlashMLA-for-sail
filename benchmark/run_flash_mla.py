@@ -4,18 +4,24 @@ import random
 import re
 
 import torch
-import triton
-import triton.language as tl
+try:
+    import flashinfer
+except ImportError:
+    print("Import flashinfer failed, please install if need!")
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    print("Import triton failed, please install if need!")
 import argparse
 
 # pip install flashinfer-python
 from flash_mla import get_mla_metadata, flash_mla_with_kvcache
-import flashinfer
 import json
 
 device_name = torch.cuda.get_device_name()
-USE_PPU = (device_name.lower().find("ppu") != -1)
-if not any(k in device_name.lower() for k in ['ppu','nvidia']):
+USE_PPU = (device_name.lower().find("ppu") != -1) or (device_name.lower().find("zw") != -1)
+if not any(k in device_name.lower() for k in ['ppu','zw','nvidia']):
     print("Warning: Unrecognized device name: "+ device_name)
 
 FLASHINFER_BACKEND = "fa2" if USE_PPU else "fa3"

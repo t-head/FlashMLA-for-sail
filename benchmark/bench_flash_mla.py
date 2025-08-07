@@ -3,13 +3,19 @@ import math
 import random
 
 import torch
-import triton
-import triton.language as tl
 import argparse
 
 # pip install flashinfer-python
 from flash_mla import get_mla_metadata, flash_mla_with_kvcache
-import flashinfer
+try:
+    import flashinfer
+except ImportError:
+    print("Import flashinfer failed, please install if need!")
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    print("Import triton failed, please install if need!")
 
 def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
     query = query.float()

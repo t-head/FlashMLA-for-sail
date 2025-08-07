@@ -1,11 +1,12 @@
 import argparse
 import os
 import torch
-from utils import run_fa_cycle_on_device
+from utils import run_fa_cycle_on_device, str_to_list, worker, split_list_into_groups
+import multiprocessing as mp
 
 device_name = torch.cuda.get_device_name()
-USE_PPU = (device_name.lower().find("ppu") != -1)
-if not any(k in device_name.lower() for k in ['ppu','nvidia']):
+USE_PPU = (device_name.lower().find("ppu") != -1) or (device_name.lower().find("zw") != -1)
+if not any(k in device_name.lower() for k in ['ppu', 'zw','nvidia']):
     print("Warning: Unrecognized device name: "+ device_name)
 
 if USE_PPU:
@@ -23,6 +24,7 @@ if __name__ == '__main__':
     parser.add_argument('--local', default=False, action="store_true", required=False, help='specify if run local')
     parser.add_argument('--backend', default="flash_mla", type=str, required=False, help='specify backend, all, flash_mla, flash_infer, flash_mla_triton')
     parser.add_argument('--mode', default="metrics", type=str, choices=['metrics', 'full'], required=False, help='specify if run full ncu')
+    parser.add_argument('--device', default=None, type=str, required=False, help='specify which device to run. 0 means gpu0. 0,3 means gpu0,1,2,3')
 
     args = parser.parse_args()
     fa_cases = list()
@@ -39,9 +41,24 @@ if __name__ == '__main__':
     else:
         print("Must give a string a format or a caselist file!")
         exit(-1)
-
-    if args.backend == "all":
-        for backend in ['flash_mla', 'flash_infer', 'flash_mla_triton'] :
-            run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, backend, args.mode)
+    if args.device == None:
+        if args.backend == "all":
+            for backend in ['flash_mla', 'flash_infer', 'flash_mla_triton'] :
+                run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, backend, args.mode)
+        else:
+            run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend, args.mode)
     else:
-        run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend, args.mode)
+        devices = str_to_list(args.device)
+        if len(devices) == 1 or len(devices) > 2:
+            num_gpus = devices
+        elif len(devices) == 2:
+            num_gpus = [i for i in range(devices[0], devices[1] + 1)]
+        else:
+            num_gpus = [0]
+        processes = []
+        fa_cases_groups = split_list_into_groups(fa_cases, len(num_gpus))
+        for i in range(len(num_gpus)):
+            # 创建子进程并传递 GPU ID, 在worker中循环 backend的取值
+            p = mp.Process(target=worker, args=(num_gpus[i], fa_cases_groups[i], args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend, args.mode))
+            p.start()
+            processes.append(p)
