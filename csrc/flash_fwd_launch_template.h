@@ -75,9 +75,10 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
     if (!is_sm89_or_newer) {
         if (cross_cut) {
             // support seqlen_q > 16.
-            constexpr static int kBlockN= 32;
+            // constexpr static int kBlockN= 32;
             if (params.seqlen_q <= 32) {
                 constexpr static int kBlockM = 32;
+                constexpr static int kBlockN= 32;
                 constexpr bool USE_MMA_M8 = 1;
                 constexpr int kNwarps = 8;
                 constexpr int AtomLayoutQ = 4;
@@ -88,9 +89,10 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
                     >, 1/*CrossCut*/>(params, stream);
             } else if (params.seqlen_q <= 64) {
                 constexpr static int kBlockM = 64;
-                constexpr bool USE_MMA_M8 = 1;
-                constexpr int kNwarps = 8;
-                constexpr int AtomLayoutQ = 8;
+                constexpr static int kBlockN= 64;
+                constexpr bool USE_MMA_M8 = 0;
+                constexpr int kNwarps = 16;
+                constexpr int AtomLayoutQ = 4;
                 constexpr int AtomLayoutP = 1;
                 run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
                     Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
@@ -98,10 +100,11 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
                     >, 1/*CrossCut*/>(params, stream);
             } else if (params.seqlen_q > 64) {
                 constexpr static int kBlockM = 128;
+                constexpr static int kBlockN= 32;
                 constexpr bool USE_MMA_M8 = 0;
                 constexpr int kNwarps = 16;
                 constexpr int AtomLayoutQ = 8;
-                constexpr int AtomLayoutP = 2;
+                constexpr int AtomLayoutP = 4;
                 run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
                     Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
                     Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP

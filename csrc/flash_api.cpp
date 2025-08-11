@@ -211,6 +211,15 @@ mha_fwd_kvcache_mla(
     return {out, softmax_lse};
 }
 
+int gcd(int a, int b) {
+    while (b != 0) {
+        int temp = b;
+        b = a % b;
+        a = temp;
+    }
+    return a;
+}
+
 int
 get_num_sm_parts(
     const int num_heads_per_head_k,
@@ -228,7 +237,7 @@ get_num_sm_parts(
     bool is_sm89_or_newer = (dprops->major > 8) || (dprops->major == 8 && dprops->minor >= 9);
 // #if ACOMPUTE_VERSION == 10000
     if (!is_sm89_or_newer) {
-        occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : block_size_m == 64 ? 2 : 1;
+        occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : 1;
         if (std::string(dprops->name).find("810E") != std::string::npos) {
             sm_count = 20;
         } else {
@@ -239,8 +248,9 @@ get_num_sm_parts(
         occupancy = block_size_m <= 32 ? 2 : 1;
     }
 // #endif
-    int num_sm_parts = (occupancy * sm_count) / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
 
+    // int num_sm_parts = (occupancy * sm_count) / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
+    int num_sm_parts = (occupancy * sm_count) / gcd(cutlass::ceil_div(num_heads_per_head_k, block_size_m) * num_heads_k, occupancy * sm_count);
     return num_sm_parts;
 }
 
@@ -262,8 +272,8 @@ get_mla_metadata(
 
     //static constexpr int block_size_n = 64;
 
-
-    int block_size_n = use_cross_cut(num_heads_per_head_k, batch_size) ? 32 : 16;
+    int block_size_n = use_cross_cut(num_heads_per_head_k, batch_size)
+        ? num_heads_per_head_k > 32 && num_heads_per_head_k <= 64 ? 64 : 32 : 16;
     static constexpr int fixed_overhead_num_blocks = 5;
 
     auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
