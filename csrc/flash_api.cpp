@@ -240,8 +240,6 @@ get_num_sm_parts(
         occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : 1;
         if (std::string(dprops->name).find("810E") != std::string::npos) {
             sm_count = 20;
-        } else {
-            occupancy = 1;
         }
     } else {
 // #else
@@ -251,6 +249,8 @@ get_num_sm_parts(
 
     // int num_sm_parts = (occupancy * sm_count) / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
     int num_sm_parts = (occupancy * sm_count) / gcd(cutlass::ceil_div(num_heads_per_head_k, block_size_m) * num_heads_k, occupancy * sm_count);
+    // make sure num_sm_parts <= 320 && can be divided by sm_count
+    num_sm_parts = num_sm_parts <= 320 ? num_sm_parts : ((320 / sm_count) * sm_count);
     return num_sm_parts;
 }
 
