@@ -103,7 +103,8 @@ ext_modules.append(
                     "-mllvm",
                     "-ppu-alloca-half-ldst-simplify=true",
                     "-DUSE_PPU",
-                    "-DUSE_AIU=1"
+                    "-DUSE_AIU=1",
+                    "-DACOMPUTE_VERSION=10000"
                 ]
                 + cc_flag
             ) + get_features_args(),
