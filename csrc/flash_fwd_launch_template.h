@@ -9,6 +9,10 @@
 #include "hardware_info.h"
 #include "flash.h"
 #include "flash_fwd_kernel.h"
+#ifdef __HGGCCC__
+#include "cuda_ad.h"
+#include "utils.h"
+#endif
 
 template<typename Kernel_traits, bool CrossCut = false>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
@@ -50,14 +54,44 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                         float(num_m_block * params.h * params.num_sm_parts) / float(sm_count * ctas_per_sm));
             }
         }
+#ifdef __HGGCCC__
+        const void *flash_func = reinterpret_cast<const void*>(kernel);
+        CUfunction func = static_cast<CUfunction>(NULL);
+        cudaGetFuncBySymbol(reinterpret_cast<cudaFunction_t*>(&func), flash_func);
+
+        void* kernel_args[] = {&params};
+        CUlaunchAttributeAD LaunchAttr = {CUAD_LAUNCH_ATTRIBUTE_IGNORE}; //HGAD_LAUNCH_ATTRIBUTE_SCHED_PREFERENCE
+        CUlaunchConfigAD LaunchCfg = {num_m_block, params.h, params.num_sm_parts, Kernel_traits::kNThreads, 1, 1, smem_size, stream, &LaunchAttr, 0};
+        // LaunchAttr.value.schedPreference.blocksPerMultiprocessor = 1;//schedule.bits.tb_per_cu;
+        // LaunchAttr.value.schedPreference.gridStepX = 2;
+        // LaunchAttr.value.schedPreference.gridStepY = 2;
+        // LaunchAttr.value.schedPreference.flags = 2;
+        CUDA_DRIVER_CHECK(cuLaunchKernelExAD(&LaunchCfg, func, kernel_args, nullptr));
+#else
         kernel<<<dim3(num_m_block, params.h, params.num_sm_parts), Kernel_traits::kNThreads, smem_size, stream>>>(params);
+#endif
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 
     dim3 grid_combine(params.b * params.h * params.seqlen_q);
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, kMaxSplits, [&] {
         auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel<Kernel_traits, kMaxSplits>;
+#ifdef __HGGCCC__
+        const void *flash_func = reinterpret_cast<const void*>(combine_kernel);
+        CUfunction func = static_cast<CUfunction>(NULL);
+        cudaGetFuncBySymbol(reinterpret_cast<cudaFunction_t*>(&func), flash_func);
+
+        void* kernel_args[] = {&params};
+        CUlaunchAttributeAD LaunchAttr = {CUAD_LAUNCH_ATTRIBUTE_IGNORE}; //HGAD_LAUNCH_ATTRIBUTE_SCHED_PREFERENCE
+        CUlaunchConfigAD LaunchCfg = {grid_combine.x, grid_combine.y, grid_combine.z, 128, 1, 1, 0, stream, &LaunchAttr, 0};
+        // LaunchAttr.value.schedPreference.blocksPerMultiprocessor = 1;//schedule.bits.tb_per_cu;
+        // LaunchAttr.value.schedPreference.gridStepX = 2;
+        // LaunchAttr.value.schedPreference.gridStepY = 2;
+        // LaunchAttr.value.schedPreference.flags = 2;
+        CUDA_DRIVER_CHECK(cuLaunchKernelExAD(&LaunchCfg, func, kernel_args, nullptr));
+#else
         combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
+#endif
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 }

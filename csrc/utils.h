@@ -31,6 +31,19 @@ namespace flash {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#define CUDA_DRIVER_CHECK(expr)                             \
+    CUresult _r = (expr);                                   \
+    if (_r != CUDA_SUCCESS) {                               \
+        const char* _name = nullptr;                        \
+        const char* _str = nullptr;                         \
+        cuGetErrorName(_r, &_name);                         \
+        cuGetErrorString(_r, &_str);                        \
+        TORCH_CHECK(false, "CUDA driver error ",            \
+        (_name ? _name : "?"), ": ", (_str ? _str : "?"));  \
+    }                                                       \
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template<typename T>
 struct MaxOp {
 __device__ __forceinline__ T operator()(T const & x, T const & y) { return x > y ? x : y; }
