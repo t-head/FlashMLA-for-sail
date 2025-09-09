@@ -55,12 +55,14 @@ struct Flash_fwd_params {
 static constexpr int TileSchedulerMetaDataSize = 8;
 // [begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, _, _, _]
 
+static bool is_sm89_or_newer(){
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    return (dprops->major > 8) || (dprops->major == 8 && dprops->minor >= 9);
+}
+
 static bool use_cross_cut(int num_heads_per_head_k, int batch_size) {
 // #if ACOMPUTE_VERSION == 10000
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm89_or_newer = (dprops->major > 8) || (dprops->major == 8 && dprops->minor >= 9);
-
-    if (!is_sm89_or_newer) {
+    if (!is_sm89_or_newer()) {
         if (num_heads_per_head_k <= 16) {
             return false;
         } else if (num_heads_per_head_k <= 32) {

@@ -227,23 +227,23 @@ get_num_sm_parts(
 ) {
     // This should match the logic in the MLA kernel.
     //static constexpr int block_size_m = 64;
-    const int block_size_m = num_heads_per_head_k > 64 ? 128 // CrossCut
-        : (num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 16 - 1) / 16 * 16: 64);
+    int block_size_m;
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     int sm_count = dprops->multiProcessorCount;
     // static set occpuancy priori knowledge.
     int occupancy;
-    bool is_sm89_or_newer = (dprops->major > 8) || (dprops->major == 8 && dprops->minor >= 9);
-// #if ACOMPUTE_VERSION == 10000
-    if (!is_sm89_or_newer) {
+    // #if ACOMPUTE_VERSION == 10000
+    if (!is_sm89_or_newer()) {
+        block_size_m = num_heads_per_head_k > 64 ? 128 : (num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 16 - 1) / 16 * 16: 64);
         occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : 1;
         if (std::string(dprops->name).find("810E") != std::string::npos) {
             sm_count = 20;
         }
     } else {
-// #else
-        occupancy = block_size_m <= 32 ? 2 : 1;
+        // btv105 only use cross_cut method.
+        block_size_m = num_heads_per_head_k <= 16 ? 16 : (num_heads_per_head_k <= 32 ? 32 : 64);
+        occupancy = 1;
     }
 // #endif
 
@@ -271,9 +271,14 @@ get_mla_metadata(
     int num_sm_parts = get_num_sm_parts(num_heads_per_head_k, num_heads_k);
 
     //static constexpr int block_size_n = 64;
-
-    int block_size_n = use_cross_cut(num_heads_per_head_k, batch_size)
-        ? num_heads_per_head_k > 32 && num_heads_per_head_k <= 64 ? 64 : 32 : 16;
+    int block_size_n;
+    if (!is_sm89_or_newer()) {
+        block_size_n = use_cross_cut(num_heads_per_head_k, batch_size)
+            ? num_heads_per_head_k > 32 && num_heads_per_head_k <= 64 ? 64 : 32 : 16;
+    } else {
+        // btv105 only use cross_cut method.
+        block_size_n = 64;
+    }
     static constexpr int fixed_overhead_num_blocks = 5;
 
     auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
@@ -343,8 +348,16 @@ get_mla_metadata_with_workspace(
 
     int num_sm_parts = get_num_sm_parts(num_heads_per_head_k, num_heads_k);
 
-    //static constexpr int block_size_n = 64;
-    int block_size_n = use_cross_cut(num_heads_per_head_k, batch_size) ? 32 : 16;
+    // static constexpr int block_size_n = 64;
+    int block_size_n;
+    if (!is_sm89_or_newer()) {
+        block_size_n = use_cross_cut(num_heads_per_head_k, batch_size)
+            ? num_heads_per_head_k > 32 && num_heads_per_head_k <= 64 ? 64 : 32 : 16;
+    } else {
+        // btv105 only use cross_cut method.
+        block_size_n = 64;
+    }
+
     static constexpr int fixed_overhead_num_blocks = 5;
 
     constexpr size_t size_per_elemnet = sizeof(int32_t);
