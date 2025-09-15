@@ -104,8 +104,8 @@ ext_modules.append(
                     "-ppu-alloca-half-ldst-simplify=true",
                     "-mllvm",
                     "-ppu-force-warpage=true",
-                    # "-mllvm",
-                    # "-ppu-force-vregrr=true",
+                    "-mllvm",
+                    "-ppu-force-vregrr=true",
                     "-DUSE_PPU",
                     "-DUSE_AIU=1",
                     "-DACOMPUTE_VERSION=10000"
