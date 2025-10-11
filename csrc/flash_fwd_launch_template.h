@@ -118,6 +118,17 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
                     Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
                     Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
                     >, 1/*CrossCut*/>(params, stream);
+            } else if (params.seqlen_q <= 48) {
+                constexpr static int kBlockM = 48;
+                constexpr static int kBlockN= 64;
+                constexpr bool USE_MMA_M8 = 0;
+                constexpr int kNwarps = 12;
+                constexpr int AtomLayoutQ = 3;
+                constexpr int AtomLayoutP = 3;
+                run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                    Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                    Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                    >, 1/*CrossCut*/>(params, stream);
             } else if (params.seqlen_q <= 64) {
                 constexpr static int kBlockM = 64;
                 constexpr static int kBlockN= 64;
