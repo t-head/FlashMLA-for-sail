@@ -326,10 +326,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     //////////////////////// switch to mix tensors start ////////////////////////
 
     typename Kernel_traits::GmemTiledCopyK gmem_tiled_copy_K;
-    typename Kernel_traits::GmemTiledCopyV gmem_tiled_copy_V;
-
     auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(tidx);
-    auto gmem_thr_copy_V = gmem_tiled_copy_V.get_thread_slice(tidx);
 
     Tensor tKgK = gmem_thr_copy_K.partition_S(make_mix_tensor_like(gK));  // (KCPY, KCPY_N, KCPY_K)
     Tensor tKsK = gmem_thr_copy_K.partition_D(sK);

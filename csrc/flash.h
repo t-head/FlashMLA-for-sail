@@ -52,6 +52,27 @@ struct Flash_fwd_params {
     size_t max_workspace_size;
 };
 
+struct SparsePrefillParams {
+    int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
+    float sm_scale, sm_scale_div_log2;
+
+    // Input tensors
+    void *__restrict__ q;    // [s_q, h_q, d_qk]
+    void *__restrict__ kv;   // [s_kv, h_kv, d_qk]
+    int* __restrict__ indices;   // [s_q, h_kv, topk]
+
+    int stride_q_s_q; int stride_q_h_q;
+    int stride_kv_s_kv; int stride_kv_h_kv;
+    int stride_indices_s_q; int stride_indices_h_kv;
+
+    // Output tensors
+    void *__restrict__ out;   // [s_q, h_q, d_v]
+    void* __restrict__ max_logits; // [s_q, h_q]
+    void* __restrict__ lse; // [s_q, h_q]
+
+    cudaStream_t stream;
+};
+
 static constexpr int TileSchedulerMetaDataSize = 8;
 // [begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, _, _, _]
 
@@ -111,3 +132,5 @@ void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);
     } while(0)
 
 template<typename T, int Headdim, int Headdim_V> void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
+
+template<typename T> void run_sparse_prefill_fwd_dispatch(const SparsePrefillParams &params);

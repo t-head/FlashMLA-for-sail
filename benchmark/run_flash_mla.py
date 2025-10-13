@@ -16,7 +16,7 @@ except ImportError:
 import argparse
 
 # pip install flashinfer-python
-from flash_mla import get_mla_metadata, flash_mla_with_kvcache
+from flash_mla import get_mla_metadata, flash_mla_with_kvcache, flash_mla_sparse_fwd
 import json
 
 device_name = torch.cuda.get_device_name()
@@ -98,7 +98,7 @@ def run_flash_mla(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q,
 
 @torch.inference_mode()
 def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
-    
+
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
 
@@ -108,7 +108,7 @@ def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_
     assert d > dv, "mla with rope dim should be larger than no rope dim"
     q_nope, q_pe = q[..., :dv].contiguous(), q[..., dv:].contiguous()
     blocked_k_nope, blocked_k_pe = blocked_k[..., :dv].contiguous(), blocked_k[..., dv:].contiguous()
-        
+
     kv_indptr = [0]
     kv_indices = []
     for i in range(b):
@@ -119,7 +119,7 @@ def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_
         kv_indptr.append(kv_indptr[-1] + num_blocks)
     for seq_len in cache_seqlens[1:]:
         kv_indptr.append((seq_len + block_size - 1) // block_size + kv_indptr[-1])
-        
+
     q_indptr = torch.arange(0, b + 1, device='cpu').int() * s_q
     kv_indptr = torch.tensor(kv_indptr, dtype=torch.int32)
     kv_indices = torch.tensor(kv_indices, dtype=torch.int32)
@@ -201,7 +201,7 @@ def _mla_attn_kernel(
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-    offs_d_ckv_i64 = offs_d_ckv.cast(tl.int64)    
+    offs_d_ckv_i64 = offs_d_ckv.cast(tl.int64)
 
     for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -286,7 +286,7 @@ def _mla_attn(
         attn_logits.stride(1),
         attn_logits.stride(2),
         BLOCK_H=BLOCK_H,
-        BLOCK_N=BLOCK_N, 
+        BLOCK_N=BLOCK_N,
         NUM_KV_SPLITS=num_kv_splits,
         PAGE_SIZE=page_size,
         HEAD_DIM_CKV=head_dim_ckv,
@@ -336,7 +336,7 @@ def _mla_softmax_reducev_kernel(
 
             e_sum = e_sum * old_scale + exp_logic
             e_max = n_e_max
-    
+
     tl.store(
         O + cur_batch * stride_o_b + cur_head * stride_o_h + offs_d_ckv,
         acc / e_sum,
@@ -398,11 +398,11 @@ def mla_decode_triton(
         b_seq_len,
         num_kv_splits,
     )
-    
+
 
 @torch.inference_mode()
 def run_flash_mla_triton(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
-    
+
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
 
@@ -425,7 +425,7 @@ def run_flash_mla_triton(q, block_table, blocked_k, max_seqlen_pad, block_size, 
         num_kv_splits = 32
         o = torch.empty([b * s_q, h_q, dv])
         attn_logits = torch.empty([b * s_q, h_q, num_kv_splits, dv + 1])
-        mla_decode_triton(q_nope.view(-1, h_q, dv).to('cuda'), 
+        mla_decode_triton(q_nope.view(-1, h_q, dv).to('cuda'),
                         q_pe.view(-1, h_q, d-dv).to('cuda'),
                         blocked_k_nope.view(-1, dv).to('cuda'),
                         blocked_k_pe.view(-1, d-dv).to('cuda'), o.to('cuda'),
@@ -471,7 +471,7 @@ def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype, _b
     # block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
     blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device='cpu')
     # blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
-    
+
     out_b, lse_b = target_func(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype)
 
     # FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
@@ -480,6 +480,35 @@ def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype, _b
     # return bytes / 10 ** 6 / perf_b
     return 1
 
+def run_dsa(s_q, s_kv, h_q, h_kv, d, dv, topk, dtype):
+    print(f"flash_mla_sparse: {s_q=}, {s_kv=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {topk=}, {dtype=}")
+    torch.set_default_dtype(torch.bfloat16)
+    device = torch.device("cuda:0")
+    torch.set_default_device(device)
+    torch.cuda.set_device(device)
+    torch.manual_seed(0)
+    random.seed(0)
+
+    q = torch.randn((s_q, h_q, d), device='cpu')
+    kv = torch.randn((s_kv, h_kv, d), device='cpu')
+    indices = torch.full((s_q, h_kv, topk), s_kv, dtype=torch.int32, device='cpu')
+    for s in range(s_q):
+        for h in range(h_kv):
+            # NOTE We use the following method to generate indices so that most indices lies within [s_kv-20000, s_kv), which is more realistic for sparse attention
+            near_mask = torch.randint(0, 32, (min(topk, s_kv),)) < 31
+            cur_indices = torch.randperm(s_kv)[:topk]
+            cur_indices[near_mask] = torch.randint(max(0, s_kv - 20000), s_kv - 1, (near_mask.sum().item(),))
+            if len(cur_indices) < topk:
+                cur_indices = torch.cat([cur_indices, torch.full((topk - len(cur_indices),), 2147480000)])
+            cur_indices = cur_indices[torch.randperm(topk)]
+            indices[s, h] = cur_indices
+
+
+    sm_scale = 1 / math.sqrt(d)
+    out, max_logits, lse = flash_mla_sparse_fwd(q.to('cuda'), kv.to('cuda'), indices.to('cuda'), sm_scale=sm_scale)
+
+
+    return 1
 
 available_targets = [
     "flash_mla",
@@ -502,7 +531,7 @@ def convert_value(value):
             return False
         # 其他情况保持字符串
         return value
-        
+
 def get_params(input_str):
     input_str = re.sub(r'^.*?format=', '', input_str)
     pattern = r'(\w+):(\[.*?\]|[^,]+?)(?=,\w+:|$|,)'
@@ -510,6 +539,12 @@ def get_params(input_str):
     config_dict = {key: value for key, value in matches}
 
     config_dict = {k: convert_value(v) for k, v in config_dict.items()}
+
+    if "is_sparse_attn" not in config_dict:
+        config_dict["is_sparse_attn"] = 0
+    if config_dict["is_sparse_attn"]:
+        return config_dict
+
     config_dict["seq_q"] = int(config_dict["seqlen_q"])
     torch.manual_seed(0)
     random.seed(0)
@@ -536,13 +571,19 @@ def get_args():
     args = parser.parse_args()
     return args
 
-    
+
 if __name__ == "__main__":
     args = get_args()
 
     config = get_params(args.format)
-    config["mla"] = args.backend
-    if "block_size" not in config.keys():
-        config["block_size"] = 64
-    # exit(0)
-    perf = compare_a(config["mla"], config["batch_size"], config["seq_q"], config["cache_seqlens"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["causal"], config["dtype"], config["block_size"])
+
+    if config["is_sparse_attn"]:
+         assert args.backend=="flash_mla", "DSA perf only support flash_mla"
+         perf = run_dsa(config["seqlen_q"], config["seqlen_k"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["topk"], config["dtype"])
+
+    else:
+        config["mla"] = args.backend
+        if "block_size" not in config.keys():
+            config["block_size"] = 64
+        # exit(0)
+        perf = compare_a(config["mla"], config["batch_size"], config["seq_q"], config["cache_seqlens"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["causal"], config["dtype"], config["block_size"])

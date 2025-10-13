@@ -77,7 +77,7 @@
     } else if (NUM_SPLITS <= 320) {                  \
       constexpr static int NAME = 320;               \
       return __VA_ARGS__();                          \
-    }else {                                         \
+    } else {                                         \
       FLASH_ASSERT(false);                           \
     }                                                \
   }()

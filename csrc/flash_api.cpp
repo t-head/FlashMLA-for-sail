@@ -611,6 +611,101 @@ mha_fwd_kvcache_mla_with_workspace(
     return 0;
 }
 
+inline int int64_stride_to_int(int64_t orig_stride) {
+    if (orig_stride > std::numeric_limits<int>::max()) {
+        TORCH_CHECK(false, "[Sparse TopK Attention] Stride exceeds int32 limit: ", orig_stride);
+    }
+    return static_cast<int>(orig_stride);
+}
+
+std::vector<at::Tensor> sparse_prefill_fwd(
+    const at::Tensor &q,           // seqlen_q x num_heads x head_size
+    const at::Tensor &kv,          // seqlen_k x num_heads_k x head_size
+    const at::Tensor &indices,     // seqlen_q x num_heads_k x top_k
+    float sm_scale,
+    int d_v
+) {
+
+    at::cuda::CUDAGuard device_guard{q.device()};
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x = cc_major == 8 && cc_minor >= 0;
+    TORCH_CHECK(is_sm8x, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM8x architectures");
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(kv);
+    CHECK_DEVICE(indices);
+
+    TORCH_CHECK(q.dtype() == torch::kBFloat16);
+    TORCH_CHECK(kv.dtype() == torch::kBFloat16);
+    TORCH_CHECK(indices.dtype() == torch::kInt32);
+
+    int s_q = q.size(0);
+    int s_kv = kv.size(0);
+    int h_q = q.size(1);
+    int h_kv = kv.size(1);
+    int d_qk = q.size(2);
+    int topk = indices.size(2);
+
+    CHECK_SHAPE(q, s_q, h_q, d_qk);
+    CHECK_SHAPE(kv, s_kv, h_kv, d_qk);
+    CHECK_SHAPE(indices, s_q, h_kv, topk);
+
+    TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(kv.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(indices.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+
+    // at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto opts = q.options();
+    at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
+    CHECK_CONTIGUOUS(out);
+
+    at::Tensor buf_attn_score, max_logits, lse, p_sum;
+    max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    CHECK_CONTIGUOUS(max_logits);
+    CHECK_CONTIGUOUS(lse);
+
+    SparsePrefillParams params = {
+        s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
+        sm_scale, sm_scale * 1.44269504f,
+
+        (void*)q.data_ptr(),
+        (void*)kv.data_ptr(),
+        (int*)indices.data_ptr(),
+
+        int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
+        int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
+        int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
+
+        (void*)out.data_ptr(),
+        (void*)max_logits.data_ptr(),
+        (void*)lse.data_ptr(),
+
+        at::cuda::getCurrentCUDAStream().stream()
+    };
+    //TODO:   // export PPU_LIB_SHOW_PARAMS=1
+    ppu::fmha::FmhaProfParam fmha_prof_params;
+    if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
+        // check if cuda graph captured
+        cudaStreamCaptureStatus captureStatus;
+        cudaStreamIsCapturing(params.stream, &captureStatus);
+        if (captureStatus != cudaStreamCaptureStatusNone) {
+            printf("dump info not supported in cuda graph mode\n");
+        } else {
+            fmha_prof_params.set_flash_attn_sparse_params(
+                q.dtype() == torch::kBFloat16/*data_type*/,
+                params.h_q/*num_heads*/, params.h_kv/*num_heads_k*/,
+                params.d_qk/*head_dim*/, params.d_v/*head_dim_value*/,
+                params.s_q/*seqlen_q*/, params.s_kv/*seqlen_k*/, params.topk
+            );
+        }
+    }
+    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
+    run_sparse_prefill_fwd_dispatch<cutlass::bfloat16_t>(params);
+    ppu::fmha::ProfilingInterface::Instance().instrument(false, fmha_prof_params);
+
+    return {out, max_logits, lse};
+}
+
 #ifndef FLASH_MLA_CPP_INFER_BUILD
 
 #ifdef FLASH_MLA_STANDALONE_BUILD
@@ -620,6 +715,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
     m.def("get_mla_metadata", &get_mla_metadata);
     m.def("fwd_kvcache_mla", &mha_fwd_kvcache_mla);
+    m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
 }
 
 #else
@@ -633,6 +729,9 @@ TORCH_LIBRARY(_flashmla_C, m) {
 
     m.def("fwd_kvcache_mla", make_pytorch_shim(&mha_fwd_kvcache_mla));
     m.impl("fwd_kvcache_mla", torch::kCUDA, make_pytorch_shim(&mha_fwd_kvcache_mla));
+
+    m.def("sparse_prefill_fwd", make_pytorch_shim(&sparse_prefill_fwd));
+    m.impl("sparse_prefill_fwd", torch::kCUDA, make_pytorch_shim(&sparse_prefill_fwd));
 }
 
 PyMODINIT_FUNC PyInit__flashmla_C() {

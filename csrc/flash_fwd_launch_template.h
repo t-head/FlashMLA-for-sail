@@ -9,6 +9,7 @@
 #include "hardware_info.h"
 #include "flash.h"
 #include "flash_fwd_kernel.h"
+#include "flash_sparse_fwd_kernel.h"
 #ifdef __HGGCCC__
 #include "cuda_ad.h"
 #include "utils.h"
@@ -171,3 +172,52 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
 
 }
 
+////
+template<typename Kernel_traits>
+void run_flash_sparse_prefill_fwd(const SparsePrefillParams &params) {
+    // TODO.
+    constexpr size_t smem_size = Kernel_traits::kSmemSize + Kernel_traits::kBlockN * 2 * sizeof(bool);
+    const int num_m_block = params.s_q*cute::ceil_div(params.h_q, Kernel_traits::kBlockM);
+
+        auto kernel = &flash::flash_sparse_fwd_kernel<Kernel_traits>;
+        //CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        if (smem_size >= 48 * 1024) {
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        }
+#if 0 //def __HGGCCC__
+       //TODO
+        const void *flash_func = reinterpret_cast<const void*>(kernel);
+        CUfunction func = static_cast<CUfunction>(NULL);
+        cudaGetFuncBySymbol(reinterpret_cast<cudaFunction_t*>(&func), flash_func);
+
+        void* kernel_args[] = {&params};
+        CUlaunchAttributeAD LaunchAttr = {CUAD_LAUNCH_ATTRIBUTE_IGNORE}; //HGAD_LAUNCH_ATTRIBUTE_SCHED_PREFERENCE
+        CUlaunchConfigAD LaunchCfg = {num_m_block, 1, 1, Kernel_traits::kNThreads, 1, 1, smem_size, params.stream, &LaunchAttr, 0};
+        CUDA_DRIVER_CHECK(cuLaunchKernelExAD(&LaunchCfg, func, kernel_args, nullptr));
+#else
+        kernel<<<dim3(num_m_block, 1, 1), Kernel_traits::kNThreads, smem_size, params.stream>>>(params);
+#endif
+    CHECK_CUDA_KERNEL_LAUNCH();
+
+}
+
+template<typename T>
+void run_sparse_prefill_fwd_dispatch(const SparsePrefillParams& params) {
+    constexpr int B_H = 64; // kBlockM
+    constexpr int B_TOPK = 64;    // kBlockM
+    // constexpr int NUM_THREADS = 128*4; // 16*32
+    // static constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits)
+
+    FLASH_ASSERT(params.h_kv == 1);
+    FLASH_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
+    FLASH_ASSERT(params.topk > 0);
+    FLASH_ASSERT(params.h_q % B_H == 0);
+    run_flash_sparse_prefill_fwd<Flash_fwd_kernel_traits<
+        576/*Headdim*/, 64/*kBlockM*/, 64/*kBlockN*/, 16/*kNwarps*/,
+        0/*Is_Q_in_regs*/, 0/*Share_Q_K_smem*/, T, 512/*Headdim_V*/,
+        1/*CrossCut*/, 0/*USE_MMA_M8*/, 4/*AtomLayoutQ*/, 1/*AtomLayoutP*/
+        >>(params);
+
+
+}

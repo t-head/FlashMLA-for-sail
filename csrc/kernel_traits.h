@@ -164,7 +164,6 @@ struct Flash_fwd_kernel_traits : public Base {
         Layout<Shape<Int<AtomLayoutP>, Int<kNWarps/AtomLayoutP>, _1>>,
         Tile<Int<MMA_ATOM_M * AtomLayoutP>, Int<16 * kNWarps / AtomLayoutP>, _16>>;
 
-
 #if USE_AIU
     using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>;
     using SmemLayoutAtomV = Layout<Shape<_8, Int<kBlockKSmemV>>, Stride<Int<kBlockKSmemV>, _1>>;
@@ -242,8 +241,8 @@ struct Flash_fwd_kernel_traits : public Base {
 
     /// only for CrossCut ///
     static constexpr int kSmemPSize = size(SmemLayoutP{}) * (sizeof(Element)); // store & load P
-    static constexpr int kSmemSoftmax = size(kBlockM) * sizeof(ElementAccum)  // rescale o
-                                      + (kNWarps==AtomLayoutQ ? 0: size(kBlockM) * sizeof(ElementAccum) * kNWarps/AtomLayoutQ); // reduce between warps
+    static constexpr int kSmemSoftmax = kBlockM * sizeof(ElementAccum)  // rescale o
+                                      + (kNWarps==AtomLayoutQ ? 0: kBlockM * sizeof(ElementAccum) * kNWarps/AtomLayoutQ); // reduce between warps
     static constexpr int kSmemCrossCut = CrossCut ? kSmemPSize + kSmemSoftmax : 0;
 
     static constexpr int kSmemSize = std::max(kSmemSizeQK + kSmemCrossCut, OSmemSize);

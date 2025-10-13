@@ -296,7 +296,7 @@ struct SoftmaxBetweenWarps {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRowsQ>>{}));
     TensorT row_max, row_sum, lse;
-    float scale_user;
+    // float scale_user;
 
     const int warp_id = threadIdx.x / 32;
     // const int line_id = threadIdx.x % 32;
