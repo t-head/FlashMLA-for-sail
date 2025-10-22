@@ -9,18 +9,24 @@ def get_mla_metadata(
     cache_seqlens: torch.Tensor,
     num_heads_per_head_k: int,
     num_heads_k: int,
+    num_heads_q: Optional[int] = None,
+    is_fp8_kvcache: bool = False,
+    topk: Optional[int] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
         cache_seqlens: (batch_size), dtype torch.int32.
-        num_heads_per_head_k: Equals to seq_len_q * num_heads_q // num_heads_k.
+        num_heads_per_head_k: Equals to num_q_tokens_per_q_seq * num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
+        num_heads_q: The number of q heads. This argument is optional when sparse attention is not enabled
+        is_fp8_kvcache: Whether the k_cache and v_cache are in fp8 format.
+        topk: If not None, sparse attention will be enabled, and only tokens in the `indices` array passed to `flash_mla_with_kvcache_sm90` will be attended to.
 
     Returns:
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
         num_splits: (batch_size + 1), dtype torch.int32.
     """
-    return flash_mla_cuda.get_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k)
+    return flash_mla_cuda.get_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k, num_heads_q, is_fp8_kvcache, topk)
 
 
 def flash_mla_with_kvcache(
@@ -33,6 +39,8 @@ def flash_mla_with_kvcache(
     num_splits: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    is_fp8_kvcache: bool = False,
+    indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -45,6 +53,8 @@ def flash_mla_with_kvcache(
         num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
         softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
         causal: bool. Whether to apply causal attention mask.
+        is_fp8_kvcache: bool. Whether the k_cache and v_cache are in fp8 format.
+        indices: (batch_size, seq_len_q, topk), torch.int32. If not None, sparse attention will be enabled, and only tokens in the `indices` array will be attended to. Invalid indices should be set to -1 or numbers >= total_seq_len_kv.
 
     Returns:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -52,10 +62,12 @@ def flash_mla_with_kvcache(
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+    if indices is not None:
+        assert causal == False, "causal must be `false` if sparse attention is enabled."
     out, softmax_lse = flash_mla_cuda.fwd_kvcache_mla(
         q,
         k_cache,
-        None,
+        None, # v_cache
         head_dim_v,
         cache_seqlens,
         block_table,
@@ -63,6 +75,8 @@ def flash_mla_with_kvcache(
         causal,
         tile_scheduler_metadata,
         num_splits,
+        is_fp8_kvcache,
+        indices
     )
     return out, softmax_lse
 

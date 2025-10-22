@@ -15,6 +15,44 @@
 #include "utils.h"
 #endif
 
+template<typename Kernel_traits>
+void printf_show_log(const void* kernel, Flash_fwd_params &params, const size_t smem_size,
+                     bool is_causal, bool is_sparse = false, bool is_fp8 = false) {
+    char *pEnv_params = std::getenv("show_log");
+    const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        int value = std::stoi(std::string(pEnv_params));
+        if (value > 0) {
+            int ctas_per_sm;
+            cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
+            if (is_sparse) {
+                printf("[run_flash_sparse_decode_fwd_]: FP8 KVCache:%d\n", is_fp8);
+            } else {
+                printf("[run_flash_splitkv_fwd_]:\n");
+            }
+            printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
+
+            cudaFuncAttributes attr;
+            cudaFuncGetAttributes(&attr, kernel);
+            auto dprops = at::cuda::getCurrentDeviceProperties();
+            int sm_count = dprops->multiProcessorCount == 64 ? 20 : dprops->multiProcessorCount;
+
+            printf("blockM:%d, blockN:%d, threads:%d, params.num_splits:%d, block_size:%d\n",
+                    Kernel_traits::kBlockM, Kernel_traits::kBlockN, Kernel_traits::kNThreads, params.num_splits, params.page_block_size);
+            printf("Is_causal:%d, ngroups:%d\n", is_causal, params.ngroups);
+            printf("CrossCut:%d, USE_MMA_M8:%d\n", Kernel_traits::CrossCut, Kernel_traits::USE_MMA_M8);
+            printf("kNWarps:%d, AtomLayoutQ:%d, AtomLayoutP:%d\n", Kernel_traits::kNWarps, Kernel_traits::AtomLayoutQ, Kernel_traits::AtomLayoutP);
+            printf("Is_Q_in_regs:%d, Share_Q_K_smem:%d\n", Kernel_traits::Is_Q_in_regs, Kernel_traits::Share_Q_K_smem);
+            printf("seq[%d, %d], grid_n[%d, %d, %d]\n",
+                    params.seqlen_q, params.seqlen_k, num_m_block, params.h, params.num_sm_parts);
+            printf("verg:%d, stack:%d, sm:%d, occpuancy:%0.3f\n", int(attr.numRegs), int(attr.localSizeBytes), sm_count,
+                    float(num_m_block * params.h * params.num_sm_parts) / float(sm_count * ctas_per_sm));
+        }
+    }
+
+}
+
 template<typename Kernel_traits, bool CrossCut = false>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     //FLASH_ASSERT(params.page_block_size == Kernel_traits::kBlockN);
@@ -28,33 +66,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             C10_CUDA_CHECK(cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
-        char *pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int value = std::stoi(std::string(pEnv_params));
-            if (value > 0) {
-                int ctas_per_sm;
-                cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                    &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
-                printf("[run_flash_splitkv_fwd_]:\n");
-                printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
-
-                cudaFuncAttributes attr;
-                cudaFuncGetAttributes(&attr, kernel);
-                auto dprops = at::cuda::getCurrentDeviceProperties();
-
-                int sm_count = dprops->multiProcessorCount == 64 ? 20 : dprops->multiProcessorCount;
-                printf("blockM:%d, blockN:%d, threads:%d, params.num_splits:%d, block_size:%d\n",
-                        Kernel_traits::kBlockM, Kernel_traits::kBlockN, Kernel_traits::kNThreads, params.num_splits, params.page_block_size);
-                printf("Is_causal:%d, ngroups:%d\n", Is_causal, params.ngroups);
-                printf("CrossCut:%d, USE_MMA_M8:%d\n", Kernel_traits::CrossCut, Kernel_traits::USE_MMA_M8);
-                printf("kNWarps:%d, AtomLayoutQ:%d, AtomLayoutP:%d\n", Kernel_traits::kNWarps, Kernel_traits::AtomLayoutQ, Kernel_traits::AtomLayoutP);
-                printf("Is_Q_in_regs:%d, Share_Q_K_smem:%d\n", Kernel_traits::Is_Q_in_regs, Kernel_traits::Share_Q_K_smem);
-                printf("seq[%d, %d], grid_n[%d, %d, %d]\n",
-                        params.seqlen_q, params.seqlen_k, num_m_block, params.h, params.num_sm_parts);
-                printf("verg:%d, stack:%d, sm:%d, occpuancy:%0.3f\n", int(attr.numRegs), int(attr.localSizeBytes), sm_count,
-                        float(num_m_block * params.h * params.num_sm_parts) / float(sm_count * ctas_per_sm));
-            }
-        }
+        printf_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size, Is_causal);
 #ifdef __HGGCCC__
         const void *flash_func = reinterpret_cast<const void*>(kernel);
         CUfunction func = static_cast<CUfunction>(NULL);
@@ -185,12 +197,12 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
 
 ////
 template<typename Kernel_traits>
-void run_flash_sparse_prefill_fwd(const SparsePrefillParams &params) {
+void run_flash_sparse_prefill_fwd(SparsePrefillParams &params) {
     // TODO.
     constexpr size_t smem_size = Kernel_traits::kSmemSize + Kernel_traits::kBlockN * 2 * sizeof(bool);
     const int num_m_block = params.s_q*cute::ceil_div(params.h_q, Kernel_traits::kBlockM);
 
-        auto kernel = &flash::flash_sparse_fwd_kernel<Kernel_traits>;
+        auto kernel = &flash::flash_sparse_prefill_fwd_kernel<Kernel_traits>;
         //CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         if (smem_size >= 48 * 1024) {
             C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -214,7 +226,7 @@ void run_flash_sparse_prefill_fwd(const SparsePrefillParams &params) {
 }
 
 template<typename T>
-void run_sparse_prefill_fwd_dispatch(const SparsePrefillParams& params) {
+void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
     constexpr int B_H = 64; // kBlockM
     constexpr int B_TOPK = 64;    // kBlockM
     // constexpr int NUM_THREADS = 128*4; // 16*32
@@ -229,6 +241,74 @@ void run_sparse_prefill_fwd_dispatch(const SparsePrefillParams& params) {
         0/*Is_Q_in_regs*/, 0/*Share_Q_K_smem*/, T, 512/*Headdim_V*/,
         1/*CrossCut*/, 0/*USE_MMA_M8*/, 4/*AtomLayoutQ*/, 1/*AtomLayoutP*/
         >>(params);
+}
 
+////
+template<typename Kernel_traits, bool IsFP8>
+void run_flash_sparse_decode_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+    // TODO.
+    constexpr size_t smem_size = Kernel_traits::kSmemSizeAccum + Kernel_traits::kBlockN * 2 * sizeof(bool);
+    FLASH_ASSERT(params.ngroups % Kernel_traits::kBlockM == 0);
+    const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
 
+        auto kernel = &flash::flash_sparse_decode_fwd_kernel<Kernel_traits, IsFP8>;
+        printf_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size, false, true, IsFP8);
+        //CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        if (smem_size >= 48 * 1024) {
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        }
+#ifdef __HGGCCC__
+       //TODO
+        const void *flash_func = reinterpret_cast<const void*>(kernel);
+        CUfunction func = static_cast<CUfunction>(NULL);
+        cudaGetFuncBySymbol(reinterpret_cast<cudaFunction_t*>(&func), flash_func);
+
+        void* kernel_args[] = {&params};
+        CUlaunchAttributeAD LaunchAttr = {CUAD_LAUNCH_ATTRIBUTE_IGNORE}; //HGAD_LAUNCH_ATTRIBUTE_SCHED_PREFERENCE
+        CUlaunchConfigAD LaunchCfg = {num_m_block, params.h,
+        params.num_sm_parts, Kernel_traits::kNThreads, 1, 1, smem_size, stream, &LaunchAttr, 0};
+        CUDA_DRIVER_CHECK(cuLaunchKernelExAD(&LaunchCfg, func, kernel_args, nullptr));
+#else
+        kernel<<<dim3(num_m_block, params.h, params.num_sm_parts), Kernel_traits::kNThreads, smem_size, stream>>>(params);
+#endif
+    CHECK_CUDA_KERNEL_LAUNCH();
+
+    dim3 grid_combine(params.b * params.h * params.seqlen_q);
+    MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, kMaxSplits, [&] {
+        auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel<Kernel_traits, kMaxSplits>;
+#ifdef __HGGCCC__
+        const void *flash_func = reinterpret_cast<const void*>(combine_kernel);
+        CUfunction func = static_cast<CUfunction>(NULL);
+        cudaGetFuncBySymbol(reinterpret_cast<cudaFunction_t*>(&func), flash_func);
+
+        void* kernel_args[] = {&params};
+        CUlaunchAttributeAD LaunchAttr = {CUAD_LAUNCH_ATTRIBUTE_IGNORE}; //HGAD_LAUNCH_ATTRIBUTE_SCHED_PREFERENCE
+        CUlaunchConfigAD LaunchCfg = {grid_combine.x, grid_combine.y, grid_combine.z, 128, 1, 1, 0, stream, &LaunchAttr, 0};
+        // LaunchAttr.value.schedPreference.blocksPerMultiprocessor = 1;//schedule.bits.tb_per_cu;
+        // LaunchAttr.value.schedPreference.gridStepX = 2;
+        // LaunchAttr.value.schedPreference.gridStepY = 2;
+        // LaunchAttr.value.schedPreference.flags = 2;
+        CUDA_DRIVER_CHECK(cuLaunchKernelExAD(&LaunchCfg, func, kernel_args, nullptr));
+#else
+        combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
+#endif
+    });
+    CHECK_CUDA_KERNEL_LAUNCH();
+
+}
+
+template<typename T, bool IsFP8>
+void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, cudaStream_t stream) {
+    constexpr int TOPK_BLOCK_SIZE = 64;    // kBlockN
+    // constexpr int NUM_THREADS = 128*4; // 16*32
+    // static constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits)
+    FLASH_ASSERT(params.h == 1);
+    FLASH_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
+
+    run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
+        576/*Headdim*/, 64/*kBlockM*/, 64/*kBlockN*/, 16/*kNwarps*/,
+        0/*Is_Q_in_regs*/, 0/*Share_Q_K_smem*/, T, 512/*Headdim_V*/,
+        1/*CrossCut*/, 0/*USE_MMA_M8*/, 4/*AtomLayoutQ*/, 1/*AtomLayoutP*/
+        >, IsFP8>(params, stream);
 }

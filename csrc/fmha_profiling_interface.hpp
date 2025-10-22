@@ -21,8 +21,9 @@ void initialize_args() {
   add_argument("seqlen_q");
   add_argument("seqlen_k");
   add_argument("custom_mask");   //bool
-  add_argument("is_sparse_attn");
-  add_argument("topk");
+  // add_argument("sparse");
+  // add_argument("topk");
+  // add_argument("is_fp8");
 }
 
 template <typename T>
@@ -38,10 +39,17 @@ void set_flash_attn_params(bool is_bf16,
                            bool is_causal, int batch_size,
                            int num_heads, int num_heads_k,
                            int head_dim, int head_dim_value,
-                           int seqlen_q, std::string seqlen_k){
+                           int seqlen_q, std::string seqlen_k,
+                           int topk = -1, bool is_fp8 = false){
 
   initialize_args();
   std::string data_type = is_bf16 ? "bf16" : "fp16";
+  if (topk > -1) {
+    std::string sparse_type = "decode";
+    add_mha_params("sparse", sparse_type);
+    add_mha_params("is_fp8", is_fp8);
+    add_mha_params("topk", topk);
+  }
 
   add_mha_params("batch_size", batch_size);
   add_mha_params("seqlen_q", seqlen_q);
@@ -54,7 +62,7 @@ void set_flash_attn_params(bool is_bf16,
   add_mha_params("dtype", data_type);
 }
 
-void set_flash_attn_sparse_params(bool is_bf16,
+void set_flash_attn_sparse_prefill_params(bool is_bf16,
                                   // bool is_causal, int batch_size,
                                   int num_heads, int num_heads_k,
                                   int head_dim, int head_dim_value,
@@ -64,14 +72,15 @@ void set_flash_attn_sparse_params(bool is_bf16,
   std::string data_type = is_bf16 ? "bf16" : "fp16";
 
   // add_mha_params("batch_size", batch_size);
-  add_mha_params("is_sparse_attn", true);
+  std::string sparse_type = "prefill";
+  add_mha_params("sparse", sparse_type);
+  add_mha_params("topk", topk);
   add_mha_params("seqlen_q", seqlen_q);
   add_mha_params("seqlen_k", seqlen_k);
   add_mha_params("num_heads", num_heads);
   add_mha_params("num_heads_kv", num_heads_k);
   add_mha_params("head_dim", head_dim);
   add_mha_params("head_dim_v", head_dim_value);
-  add_mha_params("topk", topk);
   // add_mha_params("causal", is_causal);
   add_mha_params("dtype", data_type);
 }

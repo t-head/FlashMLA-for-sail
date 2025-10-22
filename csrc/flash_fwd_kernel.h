@@ -154,8 +154,8 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
 
 template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, typename Params>
 __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block,
-                                                               const int n_split_idx, const int seqlen_k, const int n_block_min, int n_block_max,
-                                                               const bool NoSplit) {
+                                                               const int n_split_idx, const bool have_zero_seqlen_k,
+                                                               const int n_block_min, int n_block_max, const bool NoSplit) {
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -192,7 +192,9 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     //         blockIdx.x, n_block_max, n_block_min, binfo.actual_seqlen_k, kBlockN, n_blocks_per_split, num_n_splits);
     // }
 
-    // never has n_block_min >= n_block_max in tile scheduler mode
+    // [deprecated] never has n_block_min >= n_block_max in tile scheduler mode
+    // if have_zero_seqlen_k, n_block_max = n_block_min = 0
+    if (have_zero_seqlen_k) n_block_max = max(1, n_block_max);
     assert(n_block_min < n_block_max);
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
@@ -371,6 +373,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     int kv_load_num = 0;
 
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+    if (!have_zero_seqlen_k)
     flash::copy<Is_even_MN, true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
     kv_store_num++;
@@ -429,6 +432,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
         auto tSsK_current = kv_load_num % 2 == 0 ? tSsK : tSsK_double;
         auto tOsVt_current = kv_load_num % 2 == 0 ? tOsVt : tOsVt_double;
 
+        if (!have_zero_seqlen_k)
         flash::gemm<Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -453,6 +457,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 #endif
+        if (!have_zero_seqlen_k)
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt_current, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         kv_load_num++;
 
@@ -528,8 +533,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
 
 template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, typename Params>
 __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &params, const int bidb, const int bidh, const int m_block,
-                                                               const int n_split_idx, const int seqlen_k, const int n_block_min, int n_block_max,
-                                                               const bool NoSplit) {
+                                                               const int n_split_idx, const bool have_zero_seqlen_k,
+                                                               const int n_block_min, int n_block_max,  const bool NoSplit) {
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -562,7 +567,9 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q / params.ngroups, kBlockN));
     }
 
-    // never has n_block_min >= n_block_max in tile scheduler mode
+    // [deprecated] never has n_block_min >= n_block_max in tile scheduler mode
+    // if have_zero_seqlen_k, n_block_max = n_block_min = 0
+    if (have_zero_seqlen_k) n_block_max = max(1, n_block_max);
     assert(n_block_min < n_block_max);
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
@@ -615,7 +622,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     Tensor smem_row_scale = make_tensor(make_smem_ptr(reinterpret_cast<float *>((sP.data() + size(sP)).get())),
         Shape<Int<kBlockM>>{}, Stride<_1>{});
 
-    Tensor smem_row_via_warp = make_tensor(smem_row_scale.data() + ((kNWarps==AtomLayoutQ) ? 0: size(smem_row_scale)),
+    Tensor smem_row_via_warp = make_tensor(smem_row_scale.data() + size(smem_row_scale),
         Shape<Int<kBlockM>, Int<kNWarps/AtomLayoutQ>>{}, Stride<Int<kNWarps/AtomLayoutQ>, _1>{});
 
     typename Kernel_traits::GmemTiledCopyQ gmem_tiled_copy_Q;
@@ -768,6 +775,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     int kv_load_num = 0;
 
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+    if (!have_zero_seqlen_k)
     flash::copy<Is_even_MN, true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
     kv_store_num++;
@@ -826,6 +834,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         auto tSsK_current = kv_load_num % 2 == 0 ? tSsK : tSsK_double;
         auto tOsVt_current = kv_load_num % 2 == 0 ? tOsVt : tOsVt_double;
 
+        if (!have_zero_seqlen_k)
         flash::gemm<Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -858,6 +867,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         if (masking_step > 0) {
             softmax.template softmax_rescale_o<AtomLayoutP>(acc_o, smem_row_scale);
         }
+        if (!have_zero_seqlen_k)
         flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_current, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
             smem_thr_copy_P, smem_thr_copy_V);
 
@@ -1076,11 +1086,11 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_params params) {
     {
         if constexpr (CrossCut) {
             compute_attn_cross_cut_splitkv<Kernel_traits, Is_causal, false>(
-                params, batch_id, bidh, m_block, n_split_idx, seqlen_k,
+                params, batch_id, bidh, m_block, n_split_idx, seqlen_k == 0,
                 n_block_min, n_block_max, NoSplit);
         } else {
             compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, false>(
-                params, batch_id, bidh, m_block, n_split_idx, seqlen_k,
+                params, batch_id, bidh, m_block, n_split_idx, seqlen_k == 0,
                 n_block_min, n_block_max, NoSplit);
         }
     }

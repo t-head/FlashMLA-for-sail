@@ -13,48 +13,18 @@
 #include "kernel_traits.h"
 #include "utils.h"
 #include "softmax.h"
+#include "mask.h"
+#include "dequant.h"
+#include "flash_fwd_kernel.h"
 
 #include <cute/util/debug.hpp>
 
 namespace flash {
 using namespace cute;
 
-template <typename Tensor0, typename Tensor1>
-__forceinline__ __device__ void apply_mask(Tensor0 &tensor_, Tensor1 &smem_valid_indices,  const int col_base, const int buffer) {
-    Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
-    const int lane_id = threadIdx.x % 32;
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-    const int col_idx_offset = col_base + (lane_id % 4);
-#else
-    const int col_idx_offset = col_base + (lane_id % 4) * 2;
-#endif
-
-    #pragma unroll
-    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-        const int col_idx_base = col_idx_offset + nj * 16;
-#else
-        const int col_idx_base = col_idx_offset + nj * 8;
-#endif
-        #pragma unroll
-        for (int j = 0; j < size<1, 0>(tensor); ++j) {
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-            const int col_idx = col_idx_base + j * 4;
-#else
-            const int col_idx = col_idx_base + j;
-#endif
-            bool is_vaild = smem_valid_indices(buffer, col_idx);
-            #pragma unroll
-            for (int mi = 0; mi < size<0>(tensor); ++mi) {
-                    if (!is_vaild) { tensor(mi, make_coord(j, nj)) = -INFINITY; }
-            }
-        }
-    }
-}
-
 template<typename Kernel_traits, bool Is_causal = false, bool CrossCut = true>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
-flash_sparse_fwd_kernel(__grid_constant__ const SparsePrefillParams params) {
+flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams params) {
 
     static_assert(CrossCut);
     using Element = typename Kernel_traits::Element;
@@ -247,7 +217,6 @@ flash_sparse_fwd_kernel(__grid_constant__ const SparsePrefillParams params) {
     flash::copy<false/*Is_even_MN*/, false>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK,
                                             params.topk - n_block * kBlockN);
     kv_store_num++;
-
     cute::cp_async_fence();
 
     if (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
@@ -298,7 +267,7 @@ flash_sparse_fwd_kernel(__grid_constant__ const SparsePrefillParams params) {
         );
 
         constexpr int MMA_N_S = kBlockN / decltype(typename Kernel_traits::TiledMmaS{}.template tile_size_mnk<1>())::value;
-        apply_mask(acc_s, smem_valid_indices, (tidx / 32 / AtomLayoutQ) * MMA_N_S * 16, kv_load_num % 2);
+        flash::apply_indices_mask(acc_s, smem_valid_indices, (tidx / 32 / AtomLayoutQ) * MMA_N_S * 16, kv_load_num % 2);
 
         n_block == 0
             ? softmax.template softmax_rescale_per_warp</*Is_first=*/true,  /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.sm_scale_div_log2)
@@ -392,6 +361,313 @@ flash_sparse_fwd_kernel(__grid_constant__ const SparsePrefillParams params) {
         gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, params.h_q - m_block * kBlockM
     );
 
+}
+
+template<typename Kernel_traits, bool IsFP8, typename Params>
+__forceinline__ __device__ void compute_attn_sparse_splitkv(const Params &params, const int bidb, const int bidh,
+                                                            const int m_block, const int n_split_idx,
+                                                            const int n_block_min, int n_block_max,
+                                                            const bool NoSplit) {
+
+    using Element = typename Kernel_traits::Element;
+    using ElementAccum = typename Kernel_traits::ElementAccum;
+    using index_t = typename Kernel_traits::index_t;
+
+    constexpr int kBlockM = Kernel_traits::kBlockM;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
+    constexpr int kNWarps = Kernel_traits::kNWarps;
+    constexpr int AtomLayoutQ = Kernel_traits::AtomLayoutQ;
+    constexpr int AtomLayoutP = Kernel_traits::AtomLayoutP;
+    constexpr bool USE_MMA_M8 = Kernel_traits::USE_MMA_M8;
+    constexpr int MMA_ATOM_M = USE_MMA_M8 ? 8 : 16;
+
+    // Shared memory.
+    extern __shared__ char smem_[];
+
+    // The thread index.
+    const int tidx = threadIdx.x;
+    const int h_k_idx = m_block % (params.ngroups/kBlockM); // s_q = s_q_ori * h_q
+    const int s_q_idx = m_block / (params.ngroups/kBlockM);
+    using KVCacheGmem = std::conditional_t<
+        IsFP8,
+        KVCacheGmemFP8<kBlockN, Kernel_traits::kNThreads>,
+        KVCacheGmemBf16<kBlockN, Kernel_traits::kNThreads>
+    >;
+
+    using ElementKVCache = typename KVCacheGmem::ElementKVCache;
+    using SmemLayoutKNoAiu = typename KVCacheGmem::SmemLayoutK;
+    using SmemLayoutVtransposedNoAiu = typename KVCacheGmem::SmemLayoutVtransposed;
+
+    if (m_block * kBlockM >= params.seqlen_q) return;
+    // never has n_block_min >= n_block_max in tile scheduler mode
+    assert(n_block_min < n_block_max);
+
+    // We iterate over the blocks in reverse order. This is because the last block is the only one
+    // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
+    // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
+    const int row_offset_q = (bidb * params.q_batch_stride + bidh * params.q_head_stride) + m_block * (kBlockM * params.q_row_stride);
+    Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
+                            Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                            make_stride(params.q_row_stride, _1{}));
+
+    // Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKVCache *>(params.k_ptr)),
+    //                         Shape<Int<kBlockN>, Int<kHeadDim>>{},
+    //                         make_stride(params.k_row_stride, _1{}));;
+
+    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename Kernel_traits::SmemLayoutQ{});
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), SmemLayoutKNoAiu{});
+    Tensor sVt = make_tensor(sK.data(), SmemLayoutVtransposedNoAiu{});
+    Tensor sVtNoSwizzle = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+
+    // double shared memory for k/v cache.
+    Tensor sK_double = make_tensor(sK.data() + size(sK), SmemLayoutKNoAiu{});
+    Tensor sVt_double = make_tensor(sK_double.data(), SmemLayoutVtransposedNoAiu{});
+
+    Tensor sP = make_tensor(sK_double.data() + size(sK_double), typename Kernel_traits::SmemLayoutP{});
+
+    Tensor smem_row_scale = make_tensor(make_smem_ptr(reinterpret_cast<float *>((sP.data() + size(sP)).get())),
+        Shape<Int<kBlockM>>{}, Stride<_1>{});
+    Tensor smem_row_via_warp = make_tensor(smem_row_scale.data() + size(smem_row_scale),
+        Shape<Int<kBlockM>, Int<kNWarps/AtomLayoutQ>>{}, Stride<Int<kNWarps/AtomLayoutQ>, _1>{});
+    Tensor smem_valid_indices = make_tensor(make_smem_ptr(
+        reinterpret_cast<bool*>((smem_row_via_warp.data() + ((kNWarps==AtomLayoutQ) ? 0: size(smem_row_via_warp))).get())),
+        Shape<_2, Int<kBlockM>>{}, Stride<Int<kBlockM>, _1>{});
+
+    typename Kernel_traits::GmemTiledCopyQ gmem_tiled_copy_Q;
+
+    auto gmem_thr_copy_Q = gmem_tiled_copy_Q.get_thread_slice(tidx);
+
+    Tensor tQgQ = gmem_thr_copy_Q.partition_S(make_mix_tensor_like(gQ));
+    Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
+
+    typename Kernel_traits::TiledMmaS tiled_mma_s;
+    auto thr_mma_s = tiled_mma_s.get_thread_slice(tidx);
+    Tensor tSrQ  = thr_mma_s.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
+    Tensor tSrK  = thr_mma_s.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
+
+    typename Kernel_traits::TiledMma tiled_mma_o;
+    auto thr_mma_o = tiled_mma_o.get_thread_slice(tidx);
+    Tensor tOrP  = thr_mma_o.partition_fragment_A(sP);                           // (MMA,MMA_M,MMA_N)
+    Tensor tOrVt  = thr_mma_o.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
+
+    // Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDimV>>{});  // MMA, MMA_M, MMA_K
+    Tensor acc_o = partition_fragment_C(tiled_mma_o, Shape<Int<kBlockM>, Int<kHeadDimV>>{});  // MMA, MMA_M, MMA_K
+
+    //
+    // Copy Atom retiling
+    //
+
+#if USE_AIU
+#if ACOMPUTE_VERSION == 10000
+    gmem_tiled_copy_Q.desc_ = AiuDesc{nullptr, kBlockM, params.q_row_stride, kBlockM, Kernel_traits::kBlockKSmem, 0};
+#else
+    gmem_tiled_copy_Q.desc_.init(nullptr, kBlockM, params.d, params.q_row_stride);
+#endif
+    const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
+    const int tid_thread_slice = warp_idx * 32;
+#else
+    const int tid_thread_slice = tidx;
+#endif
+
+    // auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    // auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
+    // Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+
+    auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtomQ{}, tiled_mma_s);
+    auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tid_thread_slice);
+    Tensor tSsQ = smem_thr_copy_Q.partition_S(make_mix_tensor_like(sQ));
+
+    // PREDICATES
+    //
+    // Construct identity layout for sQ and sK
+    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    // Repeat the partitioning with identity layouts
+    Tensor tQcQ = gmem_thr_copy_Q.partition_S(cQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+    // Allocate predicate tensors for k
+    Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
+
+    flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
+                            params.seqlen_q - m_block * kBlockM);
+
+    if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
+
+    if (Kernel_traits::Share_Q_K_smem) {
+        flash::cp_async_wait<0>();
+        __syncthreads();
+        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
+        cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+        __syncthreads();
+    }
+
+    auto smem_tiled_copy_S = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
+    auto smem_thr_copy_S = smem_tiled_copy_S.get_thread_slice(tidx);
+    Tensor tSsS = smem_thr_copy_S.partition_D(sP);
+
+    auto smem_tiled_copy_P = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtomP{}, tiled_mma_o);
+    auto smem_thr_copy_P = smem_tiled_copy_P.get_thread_slice(tidx);
+    Tensor tOsP = smem_thr_copy_P.partition_S(sP);
+
+    // KV not use AIU copy
+    auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_s);
+    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
+    auto tSsK = smem_thr_copy_K.partition_S(sK);
+    auto tSsK_double = smem_thr_copy_K.partition_S(sK_double);
+
+    auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma_o);
+    auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
+    auto tOsVt = smem_thr_copy_V.partition_S(sVt);
+    auto tOsVt_double = smem_thr_copy_V.partition_S(sVt_double);
+
+
+    int n_block = n_block_min;
+    // use kv_block_num to decide number.
+    int kv_store_num = 0;
+    int kv_load_num = 0;
+
+    int* gIndices = params.indices_ptr + bidb * params.indices_batch_stride + s_q_idx * params.indices_row_stride; // (topk) : (1)
+    ElementKVCache *gK_base = reinterpret_cast<ElementKVCache *>(params.k_ptr)
+          + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+    KVCacheGmem kvload_gmem(tidx, gIndices, gK_base, params.page_block_size,
+        params.k_batch_stride, params.k_row_stride);
+
+    kvload_gmem.template load_from_gmem(n_block, kv_store_num, smem_valid_indices, sK);
+    // if constexpr (IsFP8) {
+    //     kvload_gmem.template load_from_gmem(n_block, kv_store_num, smem_valid_indices, sK);
+    // } else {
+    //     kvload_gmem.template load_from_gmem(n_block, kv_store_num, smem_valid_indices, sK);
+    // }
+    kv_store_num++;
+    cute::cp_async_fence();
+
+
+    if (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
+        flash::cp_async_wait<1>();
+        __syncthreads();
+        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
+        cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+    }
+
+    clear(acc_o);
+
+    flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, kNWarps/AtomLayoutQ> softmax;
+
+    // #pragma unroll
+    for (; n_block < n_block_max; ++n_block) {
+        Tensor acc_s = partition_fragment_C(tiled_mma_s, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+        clear(acc_s);
+
+        flash::cp_async_wait<0>();
+        __syncthreads();
+
+        if (n_block < n_block_max -1) { // doble buffer for next part
+            auto sK_current = kv_store_num % 2 == 0 ? sK : sK_double;
+            kvload_gmem.template load_from_gmem(n_block+1, kv_store_num, smem_valid_indices, sK_current);
+            // if constexpr(IsFP8) {
+            //     kvload_gmem.template load_from_gmem(n_block+1, kv_store_num, smem_valid_indices, sK_current);
+            // } else {
+            //     kvload_gmem.template load_from_gmem(n_block+1, kv_store_num, smem_valid_indices, sK_current);
+            // }
+            cute::cp_async_fence();
+            kv_store_num++;
+        }
+
+        // determine use kv buffer 0 or 1
+        auto tSsK_current = kv_load_num % 2 == 0 ? tSsK : tSsK_double;
+        auto tOsVt_current = kv_load_num % 2 == 0 ? tOsVt : tOsVt_double;
+
+        flash::gemm<Kernel_traits::Is_Q_in_regs>(
+            acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
+            smem_thr_copy_Q, smem_thr_copy_K
+        );
+    // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z ==0) {
+    //     printf("smem_valid_indices, blockIdx.x:%d, blockIdx.z:%d, bidb:%d, n_block:%d, s_q_idx:%d, h_k_idx: %d, kv_load_num:%d\n",
+    //     bidb, blockIdx.x, blockIdx.z, n_block, s_q_idx, h_k_idx, kv_load_num);
+    //     print_tensor(smem_valid_indices);
+    //     printf("\n");
+    // }
+        constexpr int MMA_N_S = kBlockN / decltype(typename Kernel_traits::TiledMmaS{}.template tile_size_mnk<1>())::value;
+        flash::apply_indices_mask(acc_s, smem_valid_indices, (tidx / 32 / AtomLayoutQ) * MMA_N_S * 16, kv_load_num % 2);
+
+        n_block == n_block_min
+            ? softmax.template softmax_rescale_per_warp</*Is_first=*/true,  /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.scale_softmax_log2)
+            : softmax.template softmax_rescale_per_warp</*Is_first=*/false, /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.scale_softmax_log2);
+
+        Tensor rS = flash::convert_type<Element>(acc_s);
+        Tensor tSaS = smem_thr_copy_S.retile_S(rS);     // ((Atom,AtomNum), MMA_N, MMA_N)
+
+        cute::copy(smem_tiled_copy_S, tSaS, tSsS);
+        __syncthreads();
+
+        if (n_block > n_block_min) {
+            softmax.template softmax_rescale_o<AtomLayoutP>(acc_o, smem_row_scale);
+        }
+        flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_current, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
+            smem_thr_copy_P, smem_thr_copy_V);
+        kv_load_num++;
+    }
+
+    if (NoSplit) {
+        softmax.template normalize_softmax_lse_per_warp<false>(smem_row_via_warp, smem_row_scale, params.scale_softmax);
+    } else {
+        softmax.template normalize_softmax_lse_per_warp<true>(smem_row_via_warp, smem_row_scale, params.scale_softmax);
+    }
+
+    __syncthreads();
+
+    softmax.template softmax_rescale_o<AtomLayoutP>(acc_o, smem_row_scale);
+    // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z ==0) {
+    //     printf("acc_o:");print_tensor(acc_o);printf("\n");
+    // }
+
+    // Epilogue
+    if (NoSplit) {
+        flash::store<Kernel_traits, false, true>(params, bidb, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+    } else {
+        flash::store<Kernel_traits, true, true>(params, bidb, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+    }
+}
+
+template<typename Kernel_traits, bool IsFP8 = false>
+__global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
+flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    const int m_block = blockIdx.x;
+    const int bidh = blockIdx.y;
+    const int partition_idx = blockIdx.z;
+
+    static_assert(Kernel_traits::CrossCut);
+    static_assert(!Kernel_traits::USE_MMA_M8);
+
+    //extern __shared__ char shared_memory[];
+    //auto &shared_storage = *reinterpret_cast<SharedStorage *>(shared_memory);
+
+    int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr + partition_idx * TileSchedulerMetaDataSize;
+    int4 tile_scheduler_metadata = __ldg(reinterpret_cast<int4 *>(tile_scheduler_metadata_ptr));
+    int begin_idx = tile_scheduler_metadata.x;
+    int begin_seqlen = tile_scheduler_metadata.y; // sched_begin_block_idx*kBlockN
+    int end_idx = tile_scheduler_metadata.z;
+    int end_seqlen = tile_scheduler_metadata.w;
+    if (begin_idx >= params.b) return;
+    int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
+
+#pragma unroll 1
+    for (int batch_id = begin_idx; batch_id <= end_idx; ++batch_id) {
+        const int n_split_idx = batch_id == begin_idx ? begin_n_split_idx : 0;
+        const int seqlen_k = params.topk;
+        const int n_block_min = batch_id == begin_idx ? begin_seqlen / kBlockN : 0;
+        int n_block_max = batch_id == end_idx ? cute::ceil_div(end_seqlen, kBlockN) : cute::ceil_div(seqlen_k, kBlockN);
+        const bool NoSplit = n_block_min == 0 && n_block_max == cute::ceil_div(seqlen_k, kBlockN);
+        if (batch_id > begin_idx) {
+            __syncthreads();  // Barrier between two tiles.
+        }
+        compute_attn_sparse_splitkv<Kernel_traits, IsFP8>(
+            params, batch_id, bidh, m_block, n_split_idx, n_block_min, n_block_max, NoSplit);
+
+    }
 }
 
 } // namespace flash

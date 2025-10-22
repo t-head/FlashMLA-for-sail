@@ -483,9 +483,9 @@ def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype, _b
 def run_dsa(s_q, s_kv, h_q, h_kv, d, dv, topk, dtype):
     print(f"flash_mla_sparse: {s_q=}, {s_kv=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {topk=}, {dtype=}")
     torch.set_default_dtype(torch.bfloat16)
-    device = torch.device("cuda:0")
-    torch.set_default_device(device)
-    torch.cuda.set_device(device)
+
+    device = torch.device("cpu")
+    torch.set_default_device(torch.device("cpu"))
     torch.manual_seed(0)
     random.seed(0)
 
@@ -505,6 +505,9 @@ def run_dsa(s_q, s_kv, h_q, h_kv, d, dv, topk, dtype):
 
 
     sm_scale = 1 / math.sqrt(d)
+    device = torch.device("cuda:0")
+    torch.set_default_device(device)
+    torch.cuda.set_device(device)
     out, max_logits, lse = flash_mla_sparse_fwd(q.to('cuda'), kv.to('cuda'), indices.to('cuda'), sm_scale=sm_scale)
 
 
@@ -540,9 +543,9 @@ def get_params(input_str):
 
     config_dict = {k: convert_value(v) for k, v in config_dict.items()}
 
-    if "is_sparse_attn" not in config_dict:
-        config_dict["is_sparse_attn"] = 0
-    if config_dict["is_sparse_attn"]:
+    if "sparse" not in config_dict:
+        config_dict["sparse"] = None
+    if config_dict["sparse"] == "prefill":
         return config_dict
 
     config_dict["seq_q"] = int(config_dict["seqlen_q"])
@@ -577,7 +580,7 @@ if __name__ == "__main__":
 
     config = get_params(args.format)
 
-    if config["is_sparse_attn"]:
+    if config["sparse"] == "prefill":
          assert args.backend=="flash_mla", "DSA perf only support flash_mla"
          perf = run_dsa(config["seqlen_q"], config["seqlen_k"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["topk"], config["dtype"])
 

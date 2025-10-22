@@ -19,6 +19,7 @@ struct Flash_fwd_params {
     void *__restrict__ v_ptr;
     void *__restrict__ o_ptr;
     void *__restrict__ softmax_lse_ptr;
+    int *__restrict__ indices_ptr;
 
     index_t q_batch_stride;
     index_t k_batch_stride;
@@ -32,6 +33,8 @@ struct Flash_fwd_params {
     index_t k_head_stride;
     index_t v_head_stride;
     index_t o_head_stride;
+    index_t indices_batch_stride;
+    index_t indices_row_stride;
 
     int *__restrict__ block_table;
     index_t block_table_batch_stride;
@@ -42,6 +45,7 @@ struct Flash_fwd_params {
     int *__restrict__ num_splits_ptr;
     int num_splits;  // For split-KV version
     int seqlen_k; // real kvsize.
+    int topk;
 
     void *__restrict__ softmax_lseaccum_ptr;
     void *__restrict__ oaccum_ptr;
@@ -110,6 +114,7 @@ struct Mla_metadata_params {
     int block_size_n;
     int fixed_overhead_num_blocks;
     int num_sm_parts;
+    int topk;
 };
 void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);
 
@@ -133,4 +138,6 @@ void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim, int Headdim_V> void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
 
-template<typename T> void run_sparse_prefill_fwd_dispatch(const SparsePrefillParams &params);
+template<typename T> void run_sparse_prefill_fwd_dispatch(SparsePrefillParams &params);
+
+template<typename T, bool IsFP8> void run_sparse_decode_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream);

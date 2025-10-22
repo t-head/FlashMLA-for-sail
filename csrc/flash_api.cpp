@@ -31,8 +31,12 @@ mha_fwd_kvcache_mla(
     const float softmax_scale,
     bool is_causal,
     const at::Tensor &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
-    const at::Tensor &num_splits                 // batch_size + 1
+    const at::Tensor &num_splits,                 // batch_size + 1
+    const bool &is_fp8,
+    const std::optional<at::Tensor> &indices     // None, or batch_size x seqlen_q x topk
 ) {
+    bool is_sparse_attn = indices.has_value();
+    int topk = is_sparse_attn ? indices->size(-1) : -1;
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
@@ -44,9 +48,13 @@ mha_fwd_kvcache_mla(
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
-    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
 
+    if (!is_fp8) {
+        TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
+        TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
+    } else {
+        TORCH_CHECK(kcache.dtype() == torch::kFloat8_e4m3fn || kcache.dtype() == torch::kInt8 || kcache.dtype() == torch::kUInt8, "key must have dtype fp8_e4m3fn or int8 or uint8");
+    }
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -83,7 +91,14 @@ mha_fwd_kvcache_mla(
 
     int head_size_k = head_size;
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
-    CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_k);
+    if (!is_fp8) {
+        CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_k);
+    } else {
+        int bytes_per_token = 512 + 64*2 + (512/128)*4;
+        CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, bytes_per_token);
+        TORCH_CHECK(num_heads_k == 1, "Currently the number of k heads must be 1 when is_fp8_kvcache is True");
+        TORCH_CHECK(kcache.stride(1) == bytes_per_token, "The whole block must be contiguous when is_fp8_cache is True");
+    }
     if (vcache_.has_value()) { CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_v); }
     CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
 
@@ -91,6 +106,11 @@ mha_fwd_kvcache_mla(
     CHECK_DEVICE(seqlens_k);
     CHECK_CONTIGUOUS(seqlens_k);
     CHECK_SHAPE(seqlens_k, batch_size);
+
+    if (is_sparse_attn) CHECK_DEVICE(indices.value());
+    if (is_sparse_attn) CHECK_SHAPE(indices.value(), batch_size, seqlen_q_ori, topk);
+    TORCH_CHECK(!is_sparse_attn || indices->dtype() == torch::kInt32, "indices must have dtype int32");
+    TORCH_CHECK(!is_sparse_attn || indices->stride(-1) == 1, "indices must have contiguous last dimension");
 
     auto opts = q.options();
     at::Tensor out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts);
@@ -106,6 +126,7 @@ mha_fwd_kvcache_mla(
     params.h_h_k_ratio = num_heads / num_heads_k;
     params.ngroups = ngroups;
     params.is_causal = is_causal;
+    params.topk = topk;
 
     params.d = head_size;
     params.d_v = head_size_v;
@@ -117,6 +138,7 @@ mha_fwd_kvcache_mla(
     params.v_ptr = vcache.data_ptr();
     params.o_ptr = out.data_ptr();
     params.softmax_lse_ptr = softmax_lse.data_ptr();
+    params.indices_ptr = is_sparse_attn ? indices->data_ptr<int>() : nullptr;
     // All stride are in elements, not bytes.
     params.q_batch_stride = q.stride(0);
     params.k_batch_stride = kcache.stride(0);
@@ -133,6 +155,8 @@ mha_fwd_kvcache_mla(
     params.block_table = block_table.data_ptr<int>();
     params.block_table_batch_stride = block_table.stride(0);
     params.page_block_size = page_block_size;
+    params.indices_batch_stride = is_sparse_attn ? indices->stride(0) : 0;
+    params.indices_row_stride = is_sparse_attn ? indices->stride(1) : 0;
     //params.seqlen_k = seqlen_k;
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -163,7 +187,8 @@ mha_fwd_kvcache_mla(
                 params.is_causal/*custom_mask*/, params.b/*batch_size*/,
                 num_heads_ori/*num_heads*/, num_heads_k/*num_heads_k*/,
                 params.d/*head_dim*/, params.d_v/*head_dim_value*/,
-                seqlen_q_ori/*seqlen_q*/, oss.str()/*seqlen_kv*/
+                seqlen_q_ori/*seqlen_q*/, oss.str()/*seqlen_kv*/,
+                topk, is_fp8
             );
         }
     }
@@ -191,7 +216,20 @@ mha_fwd_kvcache_mla(
 
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
     TORCH_CHECK(head_size == 576);
-    if (q_dtype == torch::kBFloat16) {
+
+    if (is_sparse_attn) {
+            TORCH_CHECK(q_dtype == torch::kBFloat16, "Sparse FP8 MLA only supports BFloat16 on SM8X");
+        if (is_fp8) {
+            // TORCH_CHECK(false, "Only FP8 kvcahe is supported for sparse MLA on SM90"); // TODO
+            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true>(params, stream);
+        } else {
+            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, false>(params, stream);
+        }
+    }
+    else if (is_fp8) {
+        TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM8X");
+    }
+    else if (q_dtype == torch::kBFloat16) {
         run_mha_fwd_splithd_splitkv_dispatch<cutlass::bfloat16_t, 576, 512>(params, stream);
     }
     #ifndef FLASH_MLA_DISABLE_FP16
@@ -258,8 +296,12 @@ std::vector<at::Tensor>
 get_mla_metadata(
     at::Tensor &seqlens_k,
     const int num_heads_per_head_k,
-    const int num_heads_k
+    const int num_heads_k,
+    const std::optional<int> num_heads_q_,
+    const bool is_fp8_kvcache,
+    const std::optional<int> topk
 ) {
+    bool is_sparse_attn = topk.has_value();
     CHECK_DEVICE(seqlens_k);
     TORCH_CHECK(seqlens_k.is_contiguous());
     TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
@@ -268,13 +310,25 @@ get_mla_metadata(
     int *seqlens_k_ptr = seqlens_k.data_ptr<int>();
     auto options = seqlens_k.options();
 
-    int num_sm_parts = get_num_sm_parts(num_heads_per_head_k, num_heads_k);
+    int num_tokens_per_head_k = num_heads_per_head_k;
+    if (is_sparse_attn) {
+        TORCH_CHECK(num_heads_q_.has_value(), "num_heads_q must be provided when topk is provided");
+        int num_heads_q = num_heads_q_.value();
+        TORCH_CHECK(num_heads_q % num_heads_k == 0);
+        num_tokens_per_head_k = num_heads_q / num_heads_k;
+        // int seqlen_q_ori = num_heads_per_head_k * num_heads_k / num_heads_q;
+        // batch_size_per_head_k = seqlen_q_ori * batch_size;
+    }
+
+    int num_sm_parts = get_num_sm_parts(num_tokens_per_head_k, num_heads_k);
 
     //static constexpr int block_size_n = 64;
     int block_size_n;
-    if (!is_sm89_or_newer()) {
-        block_size_n = use_cross_cut(num_heads_per_head_k, batch_size)
-            ? num_heads_per_head_k > 32 && num_heads_per_head_k <= 64 ? 64 : 32 : 16;
+    if (is_sparse_attn) {
+        block_size_n = 64;
+    } else if (!is_sm89_or_newer()) {
+        block_size_n = use_cross_cut(num_tokens_per_head_k, batch_size)
+                     ? (num_tokens_per_head_k > 32 && num_tokens_per_head_k <= 64 ? 64 : 32) : 16;
     } else {
         // btv105 only use cross_cut method.
         block_size_n = 64;
@@ -296,6 +350,7 @@ get_mla_metadata(
     params.block_size_n = block_size_n;
     params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
     params.num_sm_parts = num_sm_parts;
+    params.topk = is_sparse_attn ? topk.value() : -1;
     get_mla_metadata_func(params, stream);
 
     return {tile_scheduler_metadata, num_splits};
@@ -387,6 +442,7 @@ get_mla_metadata_with_workspace(
     params.block_size_n = block_size_n;
     params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
     params.num_sm_parts = num_sm_parts;
+    params.topk = -1;
     get_mla_metadata_func(params, stream);
 
     return {tile_scheduler_metadata, num_splits};
@@ -691,7 +747,7 @@ std::vector<at::Tensor> sparse_prefill_fwd(
         if (captureStatus != cudaStreamCaptureStatusNone) {
             printf("dump info not supported in cuda graph mode\n");
         } else {
-            fmha_prof_params.set_flash_attn_sparse_params(
+            fmha_prof_params.set_flash_attn_sparse_prefill_params(
                 q.dtype() == torch::kBFloat16/*data_type*/,
                 params.h_q/*num_heads*/, params.h_kv/*num_heads_k*/,
                 params.d_qk/*head_dim*/, params.d_v/*head_dim_value*/,

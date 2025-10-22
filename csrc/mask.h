@@ -104,4 +104,37 @@ struct Mask {
     }
 };
 
+template <typename Tensor0, typename Tensor1>
+__forceinline__ __device__ void apply_indices_mask(Tensor0 &tensor_, Tensor1 &smem_valid_indices,  const int col_base, const int buffer) {
+    Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
+    const int lane_id = threadIdx.x % 32;
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
+    const int col_idx_offset = col_base + (lane_id % 4);
+#else
+    const int col_idx_offset = col_base + (lane_id % 4) * 2;
+#endif
+
+    #pragma unroll
+    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
+        const int col_idx_base = col_idx_offset + nj * 16;
+#else
+        const int col_idx_base = col_idx_offset + nj * 8;
+#endif
+        #pragma unroll
+        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
+            const int col_idx = col_idx_base + j * 4;
+#else
+            const int col_idx = col_idx_base + j;
+#endif
+            bool is_vaild = smem_valid_indices(buffer, col_idx);
+            #pragma unroll
+            for (int mi = 0; mi < size<0>(tensor); ++mi) {
+                    if (!is_vaild) { tensor(mi, make_coord(j, nj)) = -INFINITY; }
+            }
+        }
+    }
+}
+
 } // namespace flash

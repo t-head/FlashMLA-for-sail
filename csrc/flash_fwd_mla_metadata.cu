@@ -8,7 +8,7 @@
 
 static constexpr int MaxBatchSize = 4096;
 
-__global__ void __launch_bounds__(256, 1, 1)
+__global__ void __launch_bounds__(32, 1, 1)
 get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
     int *seqlens_k_ptr = params.seqlens_k_ptr;
     int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr;
@@ -18,12 +18,17 @@ get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
     int fixed_overhead_num_blocks = params.fixed_overhead_num_blocks;
     int num_sm_parts = params.num_sm_parts;
 
-    __shared__ int num_blocks_shared[MaxBatchSize];
-    __shared__ int num_splits_shared[MaxBatchSize];
+    extern __shared__ int shared_mem[];
+    int* num_blocks_shared = shared_mem; // [batch_size]
+    int* num_splits_shared = shared_mem + batch_size; // [batch_size+1]
+    int* seqlens_k_shared = shared_mem + batch_size*2+1; // [batch_size]
 
     int total_num_blocks = 0;
     for (int i = threadIdx.x; i < batch_size; i += 32) {
-        int num_blocks = cutlass::ceil_div(seqlens_k_ptr[i], block_size_n);
+        int cur_s_k = params.topk == -1 ? __ldg(seqlens_k_ptr + i) : params.topk;
+        // NOTE if seqlens_k is 0, the sequence will have 1 block. We will correct this later in this kernel.
+        seqlens_k_shared[i] = cur_s_k;
+        int num_blocks = cutlass::ceil_div(max(1, cur_s_k), block_size_n);
         total_num_blocks += num_blocks + fixed_overhead_num_blocks;
         num_blocks_shared[i] = num_blocks;
     }
@@ -63,7 +68,7 @@ get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
                 }
             }
             tile_scheduler_metadata0[2] = now_block > 0 ? now_idx : now_idx - 1;
-            tile_scheduler_metadata0[3] = now_block > 0 ? now_block * block_size_n : seqlens_k_ptr[now_idx - 1];
+            tile_scheduler_metadata0[3] = now_block > 0 ? now_block * block_size_n : seqlens_k_shared[now_idx - 1];
             *reinterpret_cast<int4 *>(tile_scheduler_metadata_ptr + i * TileSchedulerMetaDataSize) = *reinterpret_cast<int4 *>(tile_scheduler_metadata0);
             tile_scheduler_metadata_ptr[i * TileSchedulerMetaDataSize + 4] = tile_scheduler_metadata1;
         }
@@ -78,6 +83,8 @@ get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
 
 void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream) {
     FLASH_ASSERT(params.batch_size < MaxBatchSize);
-    get_mla_metadata_kernel<<<1, 32, 0, stream>>>(params);
+    int smem_size = sizeof(int) * (params.batch_size*3+1);
+    CHECK_CUDA(cudaFuncSetAttribute(get_mla_metadata_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    get_mla_metadata_kernel<<<1, 32, smem_size, stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
 }

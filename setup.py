@@ -72,7 +72,7 @@ ext_modules.append(
     CUDAExtension(
         name="flash_mla_cuda",
         sources=get_sources(),
-        libraries=['cuda'], 
+        libraries=['cuda'],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
             "nvcc": append_nvcc_threads(
