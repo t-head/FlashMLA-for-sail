@@ -12,6 +12,7 @@ from torch.utils.cpp_extension import (
 )
 
 DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") == "TRUE"
+ENABLE_C_DECODE_SPARSE = os.getenv("FLASHMLA_C_ENABLE_DECODE_SPARSE", "TRUE") == "TRUE"
 CPP_INFERENCE = 'FLASH_MLA_CPP_INFER_BUILD' in os.environ.keys() and os.environ['FLASH_MLA_CPP_INFER_BUILD'] == "1"
 
 def append_nvcc_threads(nvcc_extra_args):
@@ -37,6 +38,8 @@ def get_features_args():
     features_args = []
     if DISABLE_FP16:
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if ENABLE_C_DECODE_SPARSE:
+        features_args.append("-DFLASHMLA_C_ENABLE_DECODE_SPARSE")
     if CPP_INFERENCE:
         features_args.append("-DFLASH_MLA_CPP_INFER_BUILD")
     features_args.append("-DFLASH_MLA_STANDALONE_BUILD")

@@ -31,10 +31,17 @@ mha_fwd_kvcache_mla(
     const float softmax_scale,
     bool is_causal,
     const at::Tensor &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
-    const at::Tensor &num_splits,                 // batch_size + 1
+    const at::Tensor &num_splits                 // batch_size + 1
+#ifdef FLASHMLA_C_ENABLE_DECODE_SPARSE
+    ,
     const bool &is_fp8,
     const std::optional<at::Tensor> &indices     // None, or batch_size x seqlen_q x topk
+#endif
 ) {
+#ifndef FLASHMLA_C_ENABLE_DECODE_SPARSE
+    bool is_fp8 = false;
+    const std::optional<at::Tensor> indices = std::nullopt;
+#endif
     bool is_sparse_attn = indices.has_value();
     int topk = is_sparse_attn ? indices->size(-1) : -1;
     // Otherwise the kernel will be launched from cuda:0 device
@@ -296,11 +303,19 @@ std::vector<at::Tensor>
 get_mla_metadata(
     at::Tensor &seqlens_k,
     const int num_heads_per_head_k,
-    const int num_heads_k,
+    const int num_heads_k
+#ifdef FLASHMLA_C_ENABLE_DECODE_SPARSE
+    ,
     const std::optional<int> num_heads_q_,
     const bool is_fp8_kvcache,
     const std::optional<int> topk
+#endif
 ) {
+#ifndef FLASHMLA_C_ENABLE_DECODE_SPARSE
+    const std::optional<int> num_heads_q_ = std::nullopt;
+    bool is_fp8_kvcache = false;
+    const std::optional<int> topk = std::nullopt;
+#endif
     bool is_sparse_attn = topk.has_value();
     CHECK_DEVICE(seqlens_k);
     TORCH_CHECK(seqlens_k.is_contiguous());
@@ -313,6 +328,7 @@ get_mla_metadata(
     int num_tokens_per_head_k = num_heads_per_head_k;
     if (is_sparse_attn) {
         TORCH_CHECK(num_heads_q_.has_value(), "num_heads_q must be provided when topk is provided");
+        // TORCH_CHECK(is_fp8_kvcache, "Sparse BF16 MLA is not supported on SM90");
         int num_heads_q = num_heads_q_.value();
         TORCH_CHECK(num_heads_q % num_heads_k == 0);
         num_tokens_per_head_k = num_heads_q / num_heads_k;
