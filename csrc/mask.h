@@ -105,30 +105,33 @@ struct Mask {
 };
 
 template <typename Tensor0, typename Tensor1>
-__forceinline__ __device__ void apply_indices_mask(Tensor0 &tensor_, Tensor1 &smem_valid_indices,  const int col_base, const int buffer) {
+__forceinline__ __device__ void apply_indices_mask(Tensor0 &tensor_, Tensor1 &smem_valid_indices,  const int warpN_idx, const int buffer) {
     Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
     const int lane_id = threadIdx.x % 32;
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-    const int col_idx_offset = col_base + (lane_id % 4);
-#else
-    const int col_idx_offset = col_base + (lane_id % 4) * 2;
-#endif
-
+    // const int col_base = warpN_idx * 4;
+    // const int col_base_offset = col_base + (lane_id % 4) * 16;
     #pragma unroll
     for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-        const int col_idx_base = col_idx_offset + nj * 16;
-#else
-        const int col_idx_base = col_idx_offset + nj * 8;
-#endif
+        // const int col_nj = col_base_offset +  nj * 4;
         #pragma unroll
         for (int j = 0; j < size<1, 0>(tensor); ++j) {
-#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000
-            const int col_idx = col_idx_base + j * 4;
+#if ACOMPUTE_VERSION ==10000
+            const int load_col_idx = warpN_idx * 16 + (lane_id % 4) + nj * 16 + j * 4;
+            // ==> (warp_idx / AtomLayoutQ) * MMA_N_S * 16  + nj * 16 + (lane_id % 4) + j * 4
+            // const int col_x = warpN_idx + nj;
+            // const int col_y = j
+            // const int col_z = lane_id % 4
+            // (col_x, col_y, col_z) -> (col_z, col_x, col_y) = (warpN_idx + nj, j, lane_id % 4)
+            // const int col_in_indices = col_nj + j;
+            // const int col_in_indices = col;
+            // const int col_in_indices = (col%8)*8 + col/8;
+            const int col_in_indices = (lane_id % 4) * 16 + warpN_idx *4 + nj * 4 + j;
+            // const int col_in_indices = (load_col_idx % 4) * 16 + (load_col_idx / 16) * 4 + (load_col_idx % 16) / 4;
 #else
-            const int col_idx = col_idx_base + j;
+            // const int col_idx = col_base + (lane_id % 4) * 2 + nj * 8 + j;
+            const int col_in_indices = warpN_idx * 16 + (lane_id % 4) * 2 + nj * 8 + j;
 #endif
-            bool is_vaild = smem_valid_indices(buffer, col_idx);
+            bool is_vaild = smem_valid_indices(buffer, col_in_indices);
             #pragma unroll
             for (int mi = 0; mi < size<0>(tensor); ++mi) {
                     if (!is_vaild) { tensor(mi, make_coord(j, nj)) = -INFINITY; }

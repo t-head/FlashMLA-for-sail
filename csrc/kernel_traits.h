@@ -75,8 +75,8 @@ struct Flash_kernel_traits {
     >;
     using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, elem_type>;
 
-    using SmemCopyOpQt = PPU_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, true, true, 1>;
-    using SmemCopyAtomQt = Copy_Atom<SmemCopyOpQt, elem_type>;
+    // using SmemCopyOpQt = PPU_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, true, true, 1>;
+    // using SmemCopyAtomQt = Copy_Atom<SmemCopyOpQt, elem_type>;
 
     using SmemCopyOpK = PPU_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, true, false, 1>;
     using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, elem_type>;
@@ -86,7 +86,7 @@ struct Flash_kernel_traits {
 
 #else
     using SmemCopyAtomQ = SmemCopyAtom;
-    using SmemCopyAtomQt = SmemCopyAtomTransposed;
+    // using SmemCopyAtomQt = SmemCopyAtomTransposed;
     using SmemCopyAtomK = SmemCopyAtom;
     // using SmemCopyAtomKVt = SmemCopyAtomTransposed
 #endif

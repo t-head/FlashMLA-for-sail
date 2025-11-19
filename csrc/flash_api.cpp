@@ -190,7 +190,7 @@ mha_fwd_kvcache_mla(
             // printf("oss:%s\n", oss.str().c_str());
 
             fmha_prof_params.set_flash_attn_params(
-                q_dtype == torch::kFloat16/*data_type*/,
+                q_dtype == torch::kBFloat16/*data_type*/,
                 params.is_causal/*custom_mask*/, params.b/*batch_size*/,
                 num_heads_ori/*num_heads*/, num_heads_k/*num_heads_k*/,
                 params.d/*head_dim*/, params.d_v/*head_dim_value*/,

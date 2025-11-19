@@ -248,7 +248,6 @@ template<typename Kernel_traits, bool IsFP8>
 void run_flash_sparse_decode_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // TODO.
     constexpr size_t smem_size = Kernel_traits::kSmemSizeAccum + Kernel_traits::kBlockN * 2 * sizeof(bool);
-    FLASH_ASSERT(params.ngroups % Kernel_traits::kBlockM == 0);
     const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
 
         auto kernel = &flash::flash_sparse_decode_fwd_kernel<Kernel_traits, IsFP8>;
@@ -306,9 +305,17 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, cudaStream_t strea
     FLASH_ASSERT(params.h == 1);
     FLASH_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
 
-    run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
-        576/*Headdim*/, 64/*kBlockM*/, 64/*kBlockN*/, 16/*kNwarps*/,
-        0/*Is_Q_in_regs*/, 0/*Share_Q_K_smem*/, T, 512/*Headdim_V*/,
-        1/*CrossCut*/, 0/*USE_MMA_M8*/, 4/*AtomLayoutQ*/, 1/*AtomLayoutP*/
-        >, IsFP8>(params, stream);
+    constexpr bool USE_MMA_M8 = 0;
+    constexpr static int kBlockN = 64;
+    // SEQLENG_SWITCH(params.seqlen_q, [&] {
+        constexpr int kBlockM = 64;
+        constexpr int AtomLayoutQ = kBlockM / 16;
+        constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
+        constexpr int AtomLayoutP = 1;
+        run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
+            576, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
+            T, 512, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+            >, IsFP8>(params, stream);
+    // });
+
 }

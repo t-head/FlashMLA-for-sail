@@ -1,6 +1,7 @@
 #pragma once
 
 #include "utils.h"
+#include "cutlass/arch/memory.h"
 
 namespace flash {
 
@@ -8,7 +9,7 @@ using namespace cute;
 
 template<typename T, int Size>
 __device__ __forceinline__ void load_128b_from_gmem(const void* src_ptr, T* dst_ptr) {
-    static_assert(sizeof(T) * Size== 128/8);
+    static_assert(sizeof(T) * Size == 128/8);
     // int4 ret;
     int4* ptr = reinterpret_cast<int4*>(dst_ptr);
     asm volatile("ld.global.nc.L1::evict_last.L2::128B.v4.s32 {%0, %1, %2, %3}, [%4];" \
@@ -35,9 +36,9 @@ __device__ __forceinline__ void cvt_fp8_bf16(const fp8T* src_ptr, bf16T* dst_ptr
 }
 
 
-template <int kBlockN, int kNThreads>
+template <typename ElementKVCache, int kBlockN, int kNThreads>
 struct KVCacheGmemBf16 {
-    using ElementKVCache = cutlass::bfloat16_t;
+    // using ElementKVCache = cutlass::bfloat16_t;
     using index_t = int64_t;
     static constexpr int kBlockKSmem = 64;
     static constexpr int kSwizzle = 3;
@@ -46,80 +47,32 @@ struct KVCacheGmemBf16 {
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(ElementKVCache);
     static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
 
-    using TensorK = decltype(make_tensor(make_gmem_ptr(static_cast<ElementKVCache*>(nullptr)),
-        Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{}));
+    // using TensorK = decltype(make_tensor(make_gmem_ptr(static_cast<ElementKVCache*>(nullptr)),
+    //     Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{}));
 
-    using SmemLayoutAtomK = decltype(composition(Swizzle<kSwizzle, 3, 3>{},
-        Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
-    using SmemLayoutAtomV = decltype(composition(Swizzle<kSwizzle, 3, 3>{},
+    using SmemLayoutAtomK = decltype(composition(
+#if ACOMPUTE_VERSION == 10000
+        PPU_Swizzle<kSwizzle, 3, 3>{},
+#else
+        Swizzle<kSwizzle, 3, 3>{},
+#endif
         Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
 
     using SmemLayoutK = decltype(tile_to_shape(SmemLayoutAtomK{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
-    using SmemLayoutV = decltype(tile_to_shape(SmemLayoutAtomV{},
+    using SmemLayoutV = decltype(tile_to_shape(SmemLayoutAtomK{},
         Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
     using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{},
         make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
+    using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
     using GmemLayoutAtom = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>,
         Int<kGmemThreadsPerRow>>, Stride<Int<kGmemThreadsPerRow>, _1>>;
-
-    using Gmem_copy_struct = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
+    using Gmem_copy_struct = SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>;
+    // using Gmem_copy_struct = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
     using GmemTiledCopy = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, ElementKVCache>{},
         GmemLayoutAtom{}, Layout<Shape<_1, _8>>{}));
-
-    using TensortKgK = decltype(GmemTiledCopy{}.get_thread_slice(int(0)).partition_S(TensorK{}));
-
-    GmemTiledCopy gmem_tiled_copy_K;
-    TensortKgK tKgK;
-
-    const int tidx;
-    int* gIndices_ptr;
-    ElementKVCache* gK_ptr;
-    const int block_size;
-    const index_t batch_stride;
-    const index_t row_stride;
-
-    CUTLASS_DEVICE
-    KVCacheGmemBf16(int tidx, int* gIndices_ptr, ElementKVCache* gK_ptr,
-        const int block_size, const index_t batch_stride, const index_t row_stride)
-        : tidx(tidx), block_size(block_size), batch_stride(batch_stride), row_stride(row_stride),
-          gIndices_ptr(gIndices_ptr), gK_ptr(gK_ptr)
-    {
-
-        TensorK gK = make_tensor(make_gmem_ptr(gK_ptr),
-            Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-        tKgK = gmem_tiled_copy_K.get_thread_slice(tidx).partition_S(gK);
-    };
-
-    template <bool Clear_OOB_K=true, typename Tensor0, typename Tensor1>
-    __forceinline__ __device__ void
-    load_from_gmem(int n_block, int kv_store_num, Tensor0 &smem_valid_indices, Tensor1 &sK) {
-
-        int row_offset_indices = tidx/8 + n_block * kBlockN;
-        int token_index = __ldg(gIndices_ptr + row_offset_indices);
-        bool is_token_valid = token_index >= 0;
-        smem_valid_indices(kv_store_num%2, tidx/8) = is_token_valid;
-        int block_index = token_index/block_size;
-        int rel_idx_in_block = (token_index+block_size) % block_size;
-        // ElementKVCache *gK_now = gK_base + block_index*batch_stride
-        //                           + rel_idx_in_block*row_stride
-        //                           + (tidx%8)*8;
-        Tensor tKsK = gmem_tiled_copy_K.get_thread_slice(tidx).partition_D(sK);
-        // Tensor tKgK = gmem_thr_copy_K.partition_S(gK);
-
-
-        tKgK.data() = gK_ptr + (int64_t) block_index*batch_stride
-                              + rel_idx_in_block*row_stride
-                              + (tidx%8)*8;
-        if (is_token_valid) {
-            cute::copy(gmem_tiled_copy_K, tKgK, tKsK);
-        } else if (Clear_OOB_K) {
-            cute::clear(tKsK);
-        }
-
-    };
 };
 
 template <int kBlockN, int kNThreads>
@@ -220,10 +173,18 @@ struct KVCacheGmemFP8 {
     __forceinline__ __device__ void
     load_from_gmem(int n_block, int kv_store_num, Tensor0 &smem_valid_indices, Tensor1 &sK) {
 
-        int row_offset_indices = tidx/8 + n_block * kBlockN;
+        const int load_col_idx = tidx/8;
+        #if ACOMPUTE_VERSION ==10000
+        // const int col_in_indices = load_col_idx;
+        const int col_in_indices = (load_col_idx % 4) * 16 + (load_col_idx / 16) * 4 + (load_col_idx % 16) / 4;
+        #else
+        const int col_in_indices = load_col_idx;
+        #endif
+
+        int row_offset_indices = load_col_idx + n_block * kBlockN;
         int token_index = __ldg(gIndices_ptr + row_offset_indices);
         bool is_token_valid = token_index >= 0;
-        smem_valid_indices(kv_store_num%2, tidx/8) = is_token_valid;
+        smem_valid_indices(kv_store_num%2, col_in_indices) = is_token_valid;
         int block_index = token_index/block_size;
         int rel_idx_in_block = (token_index+block_size) % block_size;
 
