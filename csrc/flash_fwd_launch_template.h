@@ -19,7 +19,7 @@ template<typename Kernel_traits>
 void printf_show_log(const void* kernel, Flash_fwd_params &params, const size_t smem_size,
                      bool is_causal, bool is_sparse = false, bool is_fp8 = false) {
     char *pEnv_params = std::getenv("show_log");
-    const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
+    int num_m_block;
     if (pEnv_params && isdigit(*pEnv_params)) {
         int value = std::stoi(std::string(pEnv_params));
         if (value > 0) {
@@ -27,8 +27,10 @@ void printf_show_log(const void* kernel, Flash_fwd_params &params, const size_t 
             cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
             if (is_sparse) {
+                num_m_block = (params.seqlen_q / params.ngroups) * cute::ceil_div(params.ngroups, Kernel_traits::kBlockM);
                 printf("[run_flash_sparse_decode_fwd_]: FP8 KVCache:%d\n", is_fp8);
             } else {
+                num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
                 printf("[run_flash_splitkv_fwd_]:\n");
             }
             printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
@@ -248,7 +250,7 @@ template<typename Kernel_traits, bool IsFP8>
 void run_flash_sparse_decode_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // TODO.
     constexpr size_t smem_size = Kernel_traits::kSmemSizeAccum + Kernel_traits::kBlockN * 2 * sizeof(bool);
-    const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
+    const int num_m_block = (params.seqlen_q / params.ngroups) * cute::ceil_div(params.ngroups, Kernel_traits::kBlockM);
 
         auto kernel = &flash::flash_sparse_decode_fwd_kernel<Kernel_traits, IsFP8>;
         printf_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size, false, true, IsFP8);

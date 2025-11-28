@@ -389,22 +389,23 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 
     // The thread index.
     const int tidx = threadIdx.x;
-    const int h_k_idx = m_block % (params.ngroups/kBlockM); // s_q = s_q_ori * h_q
-    const int s_q_idx = m_block / (params.ngroups/kBlockM);
+    const int h_k_idx = m_block % cute::ceil_div(params.ngroups, kBlockM); // s_q = s_q_ori * h_q
+    const int s_q_idx = m_block / cute::ceil_div(params.ngroups, kBlockM);
+    const int row_base = h_k_idx * kBlockM + s_q_idx * params.ngroups;
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     using KVCacheGmem = KVCacheGmemFP8<kBlockN, Kernel_traits::kNThreads>;
     using ElementKVCache = typename KVCacheGmem::ElementKVCache;
     using SmemLayoutKNoAiu = typename KVCacheGmem::SmemLayoutK;
     using SmemLayoutVtransposedNoAiu = typename KVCacheGmem::SmemLayoutVtransposed;
 
-    if (m_block * kBlockM >= params.seqlen_q) return;
+    if (row_base >= params.seqlen_q) return;
     // never has n_block_min >= n_block_max in tile scheduler mode
     assert(n_block_min < n_block_max);
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
     // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
-    const int row_offset_q = (batch_id * params.q_batch_stride + bidh * params.q_head_stride) + m_block * (kBlockM * params.q_row_stride);
+    const int row_offset_q = batch_id * params.q_batch_stride + bidh * params.q_head_stride + row_base * params.q_row_stride;
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
                             make_stride(params.q_row_stride, _1{}));
@@ -485,7 +486,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
 
     flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
-                            params.seqlen_q - m_block * kBlockM);
+                            params.ngroups - h_k_idx * kBlockM);
 
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
@@ -622,9 +623,9 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 
     // Epilogue
     if (NoSplit) {
-        flash::store<Kernel_traits, false, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+        flash::store<Kernel_traits, false, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
     } else {
-        flash::store<Kernel_traits, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+        flash::store<Kernel_traits, true, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
     }
 }
 
@@ -654,8 +655,9 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     const int tidx = threadIdx.x;
     const int lane_idx = tidx % 32;
     const int warp_idx = cutlass::canonical_warp_idx_sync();
-    const int h_k_idx = m_block % (params.ngroups/kBlockM); // s_q = s_q_ori * h_q
-    const int s_q_idx = m_block / (params.ngroups/kBlockM);
+    const int h_k_idx = m_block % cute::ceil_div(params.ngroups, kBlockM); // s_q = s_q_ori * h_q
+    const int s_q_idx = m_block / cute::ceil_div(params.ngroups, kBlockM);
+    const int row_base = h_k_idx * kBlockM + s_q_idx * params.ngroups;
 
     using KVCacheGmem = KVCacheGmemBf16<Element, kBlockN, Kernel_traits::kNThreads>;
     using SmemLayoutKNoAiu = typename KVCacheGmem::SmemLayoutK;
@@ -663,7 +665,7 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     using SmemLayoutVtNoAiu = typename KVCacheGmem::SmemLayoutVtransposed;
     using SmemLayoutVtNoSwizzle = typename KVCacheGmem::SmemLayoutVtransposedNoSwizzle;
 
-    if (m_block * kBlockM >= params.seqlen_q) return;
+    if (row_base >= params.seqlen_q) return;
     // never has n_block_min >= n_block_max in tile scheduler mode
     assert(n_block_min < n_block_max);
 
@@ -689,7 +691,11 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
     // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
-    const int row_offset_q = (batch_id * params.q_batch_stride + bidh * params.q_head_stride) + m_block * (kBlockM * params.q_row_stride);
+    const int row_offset_q = batch_id * params.q_batch_stride + bidh * params.q_head_stride + row_base * params.q_row_stride;
+    // q = q.view({batch_size, seqlen_q_ori, 1, ngroups, head_size}).transpose(2, 3)
+    //     .reshape({batch_size,      seqlen_q_ori * ngroups, 1,             head_size});
+    //               q_batch_stride,  q_row_stride,           q_head_stride, 1
+
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
                             make_stride(params.q_row_stride, _1{}));
@@ -770,7 +776,7 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
 
     flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
-                            params.seqlen_q - m_block * kBlockM);
+                            params.ngroups - h_k_idx * kBlockM);
 
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
@@ -919,9 +925,9 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
 
     // Epilogue
     if (NoSplit) {
-        flash::store<Kernel_traits, false, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+        flash::store<Kernel_traits, false, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
     } else {
-        flash::store<Kernel_traits, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+        flash::store<Kernel_traits, true, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
     }
 }
 

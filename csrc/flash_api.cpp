@@ -268,7 +268,8 @@ int gcd(int a, int b) {
 int
 get_num_sm_parts(
     const int num_heads_per_head_k,
-    const int num_heads_k
+    const int num_heads_k,
+    bool is_sparse_attn = false
 ) {
     // This should match the logic in the MLA kernel.
     //static constexpr int block_size_m = 64;
@@ -279,12 +280,15 @@ get_num_sm_parts(
     // static set occpuancy priori knowledge.
     int occupancy;
     // #if ACOMPUTE_VERSION == 10000
-    if (!is_sm89_or_newer()) {
+    if (std::string(dprops->name).find("810E") != std::string::npos) {
+        sm_count = 20;
+    }
+    if (is_sparse_attn) {
+        block_size_m = 64;
+        occupancy = 1;
+    } else if (!is_sm89_or_newer()) {
         block_size_m = num_heads_per_head_k > 64 ? 128 : (num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 16 - 1) / 16 * 16: 64);
         occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : 1;
-        if (std::string(dprops->name).find("810E") != std::string::npos) {
-            sm_count = 20;
-        }
     } else {
         // btv105 only use cross_cut method.
         block_size_m = num_heads_per_head_k <= 16 ? 16 : (num_heads_per_head_k <= 32 ? 32 : 64);
@@ -336,7 +340,7 @@ get_mla_metadata(
         // batch_size_per_head_k = seqlen_q_ori * batch_size;
     }
 
-    int num_sm_parts = get_num_sm_parts(num_tokens_per_head_k, num_heads_k);
+    int num_sm_parts = get_num_sm_parts(num_tokens_per_head_k, num_heads_k, is_sparse_attn);
 
     //static constexpr int block_size_n = 64;
     int block_size_n;

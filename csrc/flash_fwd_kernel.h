@@ -22,7 +22,7 @@ namespace flash {
 
 using namespace cute;
 
-template<typename Kernel_traits, bool Split, bool CrossCut = false, /*typename SharedStorage,*/ typename AccO, typename Softmax>
+template<typename Kernel_traits, bool Split, bool CrossCut = false, bool IsSparse = false, /*typename SharedStorage,*/ typename AccO, typename Softmax>
 __forceinline__ __device__ void store(const Flash_fwd_params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
                                       /*SharedStorage &shared_storage,*/__shared__ char* smem_,  AccO acc_o, Softmax softmax) {
 
@@ -78,10 +78,15 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
     //        ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q : bidh * params.b + binfo.q_offset(params.seqlen_q, 1, bidb)
     //    ) + m_block * kBlockM;
 
-    const index_t row_offset_o = bidb * params.o_batch_stride + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
-    const index_t row_offset_oaccum = (((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + m_block * kBlockM) * params.d_v;
-    const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
-    const index_t row_offset_lseaccum = ((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+    const int h_k_idx = m_block % cute::ceil_div(params.ngroups, kBlockM); // s_q = s_q_ori * h_q
+    const int s_q_idx = m_block / cute::ceil_div(params.ngroups, kBlockM);
+    const int row_base = IsSparse ? h_k_idx * kBlockM + s_q_idx * params.ngroups : m_block * kBlockM;
+    const int seqlen_q_max = IsSparse ? params.ngroups - h_k_idx * kBlockM : params.seqlen_q - m_block * kBlockM;
+
+    const index_t row_offset_o = bidb * params.o_batch_stride + bidh * params.o_head_stride + row_base * params.o_row_stride;
+    const index_t row_offset_oaccum = (((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + row_base) * params.d_v;
+    const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + row_base;
+    const index_t row_offset_lseaccum = ((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + row_base;
 
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
                                  Shape<Int<kBlockM>, Int<kHeadDimV>>{},
@@ -113,7 +118,7 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
         #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
             const int row = row_lse_base + (mi / MMA_ATOM_K_M) * warp_stride + (mi % MMA_ATOM_K_M) *8;
-            if (row < params.seqlen_q - m_block * kBlockM) { gLSEaccum(row) = lse(mi); }
+            if (row < seqlen_q_max) { gLSEaccum(row) = lse(mi); }
         }
 
     } else {
@@ -135,7 +140,7 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
             #pragma unroll
             for (int mi = 0; mi < size(lse); ++mi) {
                 const int row = get<0>(taccOcO_row(mi));
-                if (row < params.seqlen_q - m_block * kBlockM) { gLSEaccum(row) = lse(mi); }
+                if (row < seqlen_q_max) { gLSEaccum(row) = lse(mi); }
             }
         }
     }
@@ -148,7 +153,7 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
 
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy<false, true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, params.seqlen_q - m_block * kBlockM
+        gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, seqlen_q_max
     );
 }
 

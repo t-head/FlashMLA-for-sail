@@ -278,12 +278,13 @@ def main(torch_dtype):
     torch.cuda.set_device(device)
 
     correctness_cases = [
-        TestParam(b, s_q, s_k, is_varlen, is_causal, is_fp8, topk, test_performance=False)
+        TestParam(b, s_q, s_k, is_varlen, is_causal, is_fp8, topk, test_performance=False, h_q=h_q)
         for b in [1, 2, 6, 64]
         for s_q in [1, 2, 4]
         for s_k in [20, 140, 4096]
         for is_varlen in [False, True]
         for is_causal in [False, True]
+        for h_q in [128, 64, 32, 16, 8]
         for (is_fp8, topk) in [
             (False, None),
             (False, 128), # ppu1.0
