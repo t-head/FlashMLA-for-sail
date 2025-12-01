@@ -50,13 +50,18 @@ def worker(gpu_id, fa_cases, output, device, is_local, backend, mode):
 
 def read_cycle_from_nculog(filename):
     kernel_pattern = r"(.*)kernel(.*)Device(.*)"
+    duration_pattern = "__time_duration.sum"
     cycles_pattern = "__cycles_active.max"
     tc_pattern = "pct_of_peak_sustained_active"
     # "dram__throughput.avg.pct_of_peak_sustained_elapsed" or "ppu__dram_throughput.avg.pct_of_peak_sustained_elapsed"
+    l2_pattern = "hit_rate.pct"
     hbm_pattern = "throughput.avg.pct_of_peak_sustained_elapsed"
+
     kernel_list = []
+    duration_list = []
     cycles_list = []
     tc_list = []
+    l2_list = []
     hbm_list = []
 
     with open(filename, newline='') as log_file:
@@ -67,33 +72,49 @@ def read_cycle_from_nculog(filename):
                 cycles_list.append(int(line.strip().split()[-1]))
             if re.search(tc_pattern, line):
                 tc_list.append(float(line.strip().split()[-1]))
+            if re.search(l2_pattern, line):
+                l2_list.append(float(line.strip().split()[-1]))
             if re.search(hbm_pattern, line):
                 hbm_list.append(float(line.strip().split()[-1]))
+            if re.search(duration_pattern, line):
+                duration_list.append(float(line.strip().split()[-1]))
 
     assert(len(kernel_list) == len(cycles_list))
     assert(len(kernel_list) == len(tc_list))
+    assert(len(kernel_list) == len(l2_list))
     assert(len(kernel_list) == len(hbm_list))
+    assert(len(kernel_list) == len(duration_list))
+
 
     op_cycles = dict()
-    fwd_cycle_sum = 0
-    fwd_tc_sum = 0
-    fwd_hbm_sum = 0
+    fwd_cycle = 0
+    fwd_cycle_sum = 0 # sum of 3 kernels
+    duration = 0
+    fwd_tc = 0
+    fwd_l2 = 0
+    fwd_hbm = 0
 
     for i in range(len(kernel_list)):
         op = kernel_list[i]
         cycle = cycles_list[i]
-        op_cycles[op] = cycle
+        op_cycles[op] = [cycles_list[i], tc_list[i], l2_list[i], hbm_list[i], duration_list[i]]
+        assert ("fwd" in op.lower() or "mla" in op.lower())
         if "fwd" in op.lower() or "mla" in op.lower(): # flashmla ppu / triton / flashinfer
             fwd_cycle_sum += cycle
-            fwd_tc_sum += tc_list[i]
-            fwd_hbm_sum += hbm_list[i]
+        if "sparse" in op.lower() or "splitkv_mla_kernel" in op.lower():
+            fwd_cycle = cycles_list[i]
+            fwd_tc = tc_list[i]
+            fwd_l2 = l2_list[i]
+            fwd_hbm = hbm_list[i]
+            duration = duration_list[i]
+
     # calculate statistics data
     if fwd_cycle_sum != 0:
         # fwd unit case
-        return fwd_cycle_sum, fwd_tc_sum, fwd_hbm_sum, op_cycles
+        return fwd_cycle_sum, fwd_tc, fwd_l2, fwd_hbm, fwd_cycle, duration, op_cycles
     else:
         print("Not valid CSV file!")
-        return 0, 0, 0, []
+        return 0, 0, 0, 0, 0, 0, []
         #exit(-1)
 
 
@@ -108,8 +129,9 @@ def clean_casename(name):
 
 def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, backend="flash_mla", mode="metrics"):
     output_lines = list()
-    headers = ["casename","cycle","tc efficiency", "hbm efficiency", "cmd", "detail"]
-    # new_row=["casename"]  metrics.get("name", [])  ["detail"] 
+    # headers = ["casename","cycle","tc efficiency", "hbm efficiency", "cmd", "detail"]
+    headers = ["casename","cycle","tc efficiency", "L2 hit rate", "hbm efficiency", "duration", "cmd", "detail"]
+    # new_row=["casename"]  metrics.get("name", [])  ["detail"]
     # output_lines.append(new_row)
     if not os.path.exists("./logs"):
         os.makedirs("./logs")
@@ -125,19 +147,19 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, ba
             output_name = clean_casename(case) + backend
             cmd = '{} --set full -o {} python ./run_flash_mla.py --backend={} --format="{}" \
                 2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", output_name, backend, case, log_file)
-        else: 
-            metrics_string = "sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed" if dev=="gpu" else \
-                            "ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,ppu__dram_throughput.avg.pct_of_peak_sustained_elapsed".format("fp16" if "fp16" in case else "bf16")
+        else:
+            metrics_string = "gpu__time_duration.sum,sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,lts__t_sector_hit_rate.pct,dram__throughput.avg.pct_of_peak_sustained_elapsed" if dev=="gpu" else \
+                             "ppu__time_duration.sum,ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,l2__transaction_hit_rate.pct,ppu__dram_throughput.avg.pct_of_peak_sustained_elapsed".format("fp16" if "fp16" in case else "bf16")
             cmd = '{} --clock-control none --metrics="{}"  \
                 --page=details python ./run_flash_mla.py --backend={} --format="{}" \
                 2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, backend, case, log_file)
-        
+
         ret = run_cmd(cmd)
 
         if mode != "full":
             if ret.returncode == 0:
-                cycle, tc, hbm, detail = read_cycle_from_nculog(log_file)
-                row = [case.replace(",","_"), str(cycle), str(tc), str(hbm), str(cmd), str(detail)]
+                cycles, tc, l2, hbm, inner_cycle, duration, detail = read_cycle_from_nculog(log_file)
+                row = [case, str(cycles), str(tc), str(l2), str(hbm), str(inner_cycle), str(duration), str(cmd), str(detail)]
                 output_lines.append(row)
                 with open(f"{output_file}_{backend}.csv", "a") as f:
                     writer = csv.writer(f)
@@ -145,7 +167,7 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, ba
                     print("write result succeed")
             else:
                 print("ERROR: failed to run cmd, please check!!")
-                if len(fa_case) == 1:
+                if len(fa_cases) == 1:
                     exit(-1) # only one case, fail and exit
 
     output_file = output_file + '_' + backend + '.csv'

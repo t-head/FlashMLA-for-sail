@@ -26,6 +26,73 @@ if not any(k in device_name.lower() for k in ['ppu','zw','nvidia']):
 
 FLASHINFER_BACKEND = "fa2" if USE_PPU else "fa3"
 
+
+def quantize_k_cache(
+    input_k_cache: torch.Tensor,    # (num_blocks, block_size, h_k, d)
+    dv: int,
+    tile_size: int = 128,
+) -> torch.Tensor:
+    """
+    Quantize the k-cache
+    Return a tensor with shape (num_blocks, block_size, h_k, dv + 4(dv/tile_size) + t(d-dv)) of dtype uint8_t, where t = input_k_cache.element_size()
+    For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py or README.md
+    """
+    assert dv % tile_size == 0
+    num_tiles = dv // tile_size
+    num_blocks, block_size, h_k, d = input_k_cache.shape
+    assert h_k == 1
+    input_k_cache = input_k_cache.squeeze(2)    # [num_blocks, block_size, d]
+    input_elem_size = input_k_cache.element_size()
+
+    result = torch.empty((num_blocks, block_size, dv + num_tiles * 4 + input_elem_size * (d - dv)), dtype=torch.float8_e4m3fn, device=input_k_cache.device)
+    result_k_nope_part = result[..., :dv]
+    result_k_scale_factor = result[..., dv:dv + num_tiles * 4].view(torch.float32)
+    result_k_rope_part = result[..., dv + num_tiles * 4:].view(input_k_cache.dtype)
+    result_k_rope_part[:] = input_k_cache[..., dv:]
+
+    for tile_idx in range(0, num_tiles):
+        cur_scale_factors_inv = torch.abs(input_k_cache[..., tile_idx * tile_size:(tile_idx + 1) * tile_size]).max(dim=-1).values / 448.0  # [num_blocks, block_size]
+        result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inv
+
+        cur_scale_factors_inv.unsqueeze_(-1)    # [num_blocks, block_size, 1]
+        cur_quantized_nope = (input_k_cache[..., tile_idx * tile_size:(tile_idx + 1) * tile_size].float() / cur_scale_factors_inv.float()).to(torch.float8_e4m3fn)
+        result_k_nope_part[..., tile_idx * tile_size:(tile_idx + 1) * tile_size] = cur_quantized_nope
+
+    result = result.view(num_blocks, block_size, 1, -1)
+    return result
+
+
+def dequantize_k_cache(
+    quant_k_cache: torch.Tensor,    # (num_blocks, block_size, 1, bytes_per_token)
+    dv: int = 512,
+    tile_size: int = 128,
+    d: int = 576
+) -> torch.Tensor:
+    """
+    De-quantize the k-cache
+    """
+    assert dv % tile_size == 0
+    num_tiles = dv // tile_size
+    num_blocks, block_size, h_k, _ = quant_k_cache.shape
+    assert h_k == 1
+    result = torch.empty((num_blocks, block_size, d), dtype=torch.bfloat16, device=quant_k_cache.device)
+
+    quant_k_cache = quant_k_cache.view(num_blocks, block_size, -1)
+
+    input_nope = quant_k_cache[..., :dv]
+    input_scale = quant_k_cache[..., dv:dv + num_tiles * 4].view(torch.float32)
+    input_rope = quant_k_cache[..., dv + num_tiles * 4:].view(torch.bfloat16)
+    result[..., dv:] = input_rope
+
+    for tile_idx in range(0, num_tiles):
+        cur_nope = input_nope[..., tile_idx * tile_size:(tile_idx + 1) * tile_size].to(torch.float32)
+        cur_scales = input_scale[..., tile_idx].unsqueeze(-1)
+        result[..., tile_idx * tile_size:(tile_idx + 1) * tile_size] = cur_nope * cur_scales
+
+    result = result.view(num_blocks, block_size, 1, d)
+    return result
+
+
 def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
     query = query.float()
     key = key.float()
@@ -480,8 +547,8 @@ def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype, _b
     # return bytes / 10 ** 6 / perf_b
     return 1
 
-def run_dsa(s_q, s_kv, h_q, h_kv, d, dv, topk, dtype):
-    print(f"flash_mla_sparse: {s_q=}, {s_kv=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {topk=}, {dtype=}")
+def run_dsa_prefill(s_q, s_kv, h_q, h_kv, d, dv, topk, dtype):
+    print(f"dsa_prefill: {s_q=}, {s_kv=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {topk=}, {dtype=}")
     torch.set_default_dtype(torch.bfloat16)
 
     device = torch.device("cpu")
@@ -508,9 +575,87 @@ def run_dsa(s_q, s_kv, h_q, h_kv, d, dv, topk, dtype):
     device = torch.device("cuda:0")
     torch.set_default_device(device)
     torch.cuda.set_device(device)
+    torch.cuda.synchronize()
     out, max_logits, lse = flash_mla_sparse_fwd(q.to('cuda'), kv.to('cuda'), indices.to('cuda'), sm_scale=sm_scale)
+    torch.cuda.synchronize()
+    return 1
 
+def run_dsa_decode(b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, topk, is_fp8, dtype, block_size):
+    print(f"dsa_decode: {b=}, {s_q=}, topk={topk}, {h_q=}, {h_kv=}, {d=}, {dv=}, is_fp8={is_fp8}, {dtype=}")
 
+    torch.set_default_dtype(dtype)
+    device = torch.device("cuda:0")
+    torch.set_default_device(device)
+    torch.cuda.set_device(device)
+    torch.manual_seed(0)
+    random.seed(0)
+
+    # total_seqlens = cache_seqlens.sum().item()
+    # mean_seqlens = cache_seqlens.float().mean().int().item()
+    max_seqlen = cache_seqlens.max().item()
+    max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
+
+    # q = torch.randn(b, s_q, h_q, d, device='cpu')
+    q = torch.randn(b, s_q, h_q, d, device='cpu')
+    # q = torch.randn(b, s_q, h_q, d)
+    block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32,
+        device='cpu').view(b, max_seqlen_pad // block_size)
+    block_table = block_table.view(-1)[torch.randperm(block_table.numel(), device='cpu')].view(b, -1)
+
+    # block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
+    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device='cpu')
+    # blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
+
+    # abs_indices = torch.empty(b, s_q, topk, dtype=torch.int32, device="cpu")
+    indices_in_kvcache = torch.empty(b, s_q, topk, dtype=torch.int32, device="cpu")
+    for i in range(b):
+        # Generate indices
+        for j in range(s_q):
+            cur_abs_indices = torch.randperm(int(cache_seqlens[i].item()), device="cpu")[:topk]
+            cur_blocked_indices = block_table[i, cur_abs_indices // block_size] * block_size + (cur_abs_indices % block_size)
+            if len(cur_abs_indices) < topk:
+                pad_len = topk - len(cur_abs_indices)
+                cur_abs_indices = torch.cat([cur_abs_indices, torch.full((pad_len,), -1, device='cpu')])
+                cur_blocked_indices = torch.cat([cur_blocked_indices, torch.full((pad_len,), -1, device='cpu')])
+
+            # Mask KV
+            perm = torch.randperm(topk, device='cpu')
+            # cur_abs_indices = cur_abs_indices[perm]
+            cur_blocked_indices = cur_blocked_indices[perm]
+
+            # abs_indices[i, j, :] = cur_abs_indices
+            indices_in_kvcache[i, j, :] = cur_blocked_indices
+
+    if is_fp8:
+        blocked_k_quantized = quantize_k_cache(blocked_k, dv, 128)
+        blocked_k_dequantized = dequantize_k_cache(blocked_k_quantized)
+        blocked_k = blocked_k_dequantized
+
+    torch.cuda.synchronize()
+    tile_scheduler_metadata, num_splits = get_mla_metadata(
+        cache_seqlens.to('cuda'),
+        s_q * h_q // h_kv,
+        h_kv,
+        h_q,
+        is_fp8,
+        topk
+    )
+
+    torch.cuda.synchronize()
+    def flash_mla_decode_sparse():
+        return flash_mla_with_kvcache(
+            q.to('cuda'),
+            blocked_k.cuda() if not is_fp8 else blocked_k_quantized.cuda(),
+            block_table.to('cuda'),
+            cache_seqlens.to('cuda'),
+            dv,
+            tile_scheduler_metadata,
+            num_splits,
+            causal=causal,
+            is_fp8_kvcache=is_fp8,
+            indices=indices_in_kvcache.to('cuda'),
+        )
+    out_flash, lse_flash = flash_mla_decode_sparse()
     return 1
 
 available_targets = [
@@ -537,6 +682,7 @@ def convert_value(value):
 
 def get_params(input_str):
     input_str = re.sub(r'^.*?format=', '', input_str)
+    input_str = re.sub(r'^.*?flash_mla,MLA:', '', input_str).rstrip(".")
     pattern = r'(\w+):(\[.*?\]|[^,]+?)(?=,\w+:|$|,)'
     matches = re.findall(pattern, input_str)
     config_dict = {key: value for key, value in matches}
@@ -557,7 +703,7 @@ def get_params(input_str):
         # varlen
         config_dict["cache_seqlens"] = torch.tensor([max(random.normalvariate(config_dict["seqlen_k"], config_dict["seqlen_k"] / 2), config_dict["seq_q"]) + i for i in range(config_dict["batch_size"])], dtype=torch.int32, device="cpu")
         # fixlen
-        #config_dict["cache_seqlens"] = torch.full((config_dict["batch_size"],), config_dict["seqlen_k"], dtype=torch.int32, device="cpu")
+        # config_dict["cache_seqlens"] = torch.full((config_dict["batch_size"],), config_dict["seqlen_k"], dtype=torch.int32, device="cpu")
     else:
         config_dict["cache_seqlens"] = torch.tensor(json.loads(config_dict["seqlen_k"]), dtype=torch.int32, device="cpu")
 
@@ -579,11 +725,20 @@ if __name__ == "__main__":
     args = get_args()
 
     config = get_params(args.format)
-
     if config["sparse"] == "prefill":
-         assert args.backend=="flash_mla", "DSA perf only support flash_mla"
-         perf = run_dsa(config["seqlen_q"], config["seqlen_k"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["topk"], config["dtype"])
+        assert args.backend=="flash_mla", "DSA perf only support flash_mla"
+        perf = run_dsa_prefill(config["seqlen_q"], config["seqlen_k"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["topk"], config["dtype"])
+    elif config["sparse"] == "decode":
+        assert args.backend=="flash_mla", "DSA perf only support flash_mla"
+        if "block_size" not in config.keys():
+            config["block_size"] = 64
 
+        # FIXME: bf16 is not supported for CUDA. fp8 is not optimized for PPU.
+        if not USE_PPU:
+            config["is_fp8"] = 1
+        perf = run_dsa_decode(config["batch_size"], config["seq_q"], config["cache_seqlens"],
+                              config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"],
+                              config["causal"], config["topk"], config["is_fp8"], config["dtype"], config["block_size"])
     else:
         config["mla"] = args.backend
         if "block_size" not in config.keys():
