@@ -157,7 +157,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     // Allocate predicate tensors for k
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
 
-    flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
+    flash::copy<kNWarps, true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
                             params.h_q - m_block * kBlockM);
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
@@ -359,7 +359,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     //     for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d_v; }
     // }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+    flash::copy<kNWarps, /*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, params.h_q - m_block * kBlockM
     );
 
@@ -485,8 +485,8 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     // Allocate predicate tensors for k
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
 
-    flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
-                            params.ngroups - h_k_idx * kBlockM);
+    flash::copy<kNWarps, true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
+                params.ngroups - h_k_idx * kBlockM);
 
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
@@ -775,8 +775,8 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     // Allocate predicate tensors for k
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
 
-    flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
-                            params.ngroups - h_k_idx * kBlockM);
+    flash::copy<kNWarps, true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
+                params.ngroups - h_k_idx * kBlockM);
 
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
