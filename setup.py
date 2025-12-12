@@ -142,10 +142,19 @@ except Exception as _:
     date_time_str = now.strftime("%Y-%m-%d-%H-%M-%S")
     rev = '+' + date_time_str
 
+def custom_local_scheme(version):
+    return '+dev%03d.%s' % (version.distance, version.node[:7])
+
+def custom_version_scheme(version):
+    return '1.0.0'
 
 setup(
     name="flash_mla",
-    version="1.0.0",
+    use_scm_version={
+        "local_scheme": custom_local_scheme,
+        "version_scheme": custom_version_scheme,
+    },
+    setup_requires=["setuptools_scm"],
     packages=find_packages(include=['flash_mla']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
