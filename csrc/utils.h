@@ -225,9 +225,9 @@ inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //PPU: shared memory not support init by zero, need clear if not align.
 #ifdef USE_PPU
-template <int kNwarps, bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=true, bool Clear_OOB_K=true,
+template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=true, bool Clear_OOB_K=true,
 #else
-template <int kNwarps, bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
+template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
 #endif
           typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
@@ -241,31 +241,27 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 #if USE_AIU
     if constexpr (is_mix_iterator<typename Engine0::iterator>::value) {
         const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
-#if ACOMPUTE_VERSION == 10500
-        CUTE_STATIC_ASSERT(kNwarps % 4 == 0);
+#if 0 // ACOMPUTE_VERSION > 10000
+        // it is slower.
         if constexpr (!Is_even_MN) {
             tiled_copy.desc_.dim_h = max_MN;
         }
 
-        if (warp_idx == 0) {
-            #pragma unroll
-            for (int k = 0; k < (size<2>(S))/4; ++k) {
-                cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
+        if (blockDim.x / 32 <= 1) {
+            if (warp_idx == 0) {
+                cute::copy(tiled_copy, S, D);
             }
-        } else if (warp_idx == kNwarps/4) {
-            #pragma unroll
-            for (int k = (size<2>(S)/4); k < (size<2>(S)/2); ++k) {
-                cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
-            }
-        } else if (warp_idx == kNwarps/2) {
-            #pragma unroll
-            for (int k = (size<2>(S)/2); k < 3*(size<2>(S)/4); ++k) {
-                cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
-            }
-        } else if (warp_idx == kNwarps/4 * 3) {
-            #pragma unroll
-            for (int k =  3*(size<2>(S)/4); k < size<2>(S); ++k) {
-                cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
+        } else {
+            if (warp_idx == 0) {
+                #pragma unroll
+                for (int k = 0; k < (size<2>(S)); ++k) {
+                    cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
+                }
+            } else if (warp_idx == 1) {
+                #pragma unroll
+                for (int k = (size<2>(S)/2); k < size<2>(S); ++k) {
+                    cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
+                }
             }
         }
 
