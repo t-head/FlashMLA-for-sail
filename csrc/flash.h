@@ -8,8 +8,8 @@
 struct Flash_fwd_params {
     using index_t = int64_t;
 
-    int b, seqlen_q, d, d_v;
-    int h, h_h_k_ratio, ngroups;
+    int b, q_orig, seqlen_q, d, d_v;
+    int h, h_q, h_h_k_ratio, ngroups;
     bool is_causal;
     float scale_softmax, scale_softmax_log2;
     int *__restrict__ cu_seqlens_k;
@@ -55,6 +55,8 @@ struct Flash_fwd_params {
     void * workspace_ptr;
     size_t max_workspace_size;
 };
+
+using Flash_fwd_mla_params = Flash_fwd_params;
 
 struct SparsePrefillParams {
     int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;

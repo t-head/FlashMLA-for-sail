@@ -10,10 +10,14 @@
 #include "flash.h"
 #include "flash_fwd_kernel.h"
 #include "flash_sparse_fwd_kernel.h"
+#include "flash_splitkv/config.h" // for splitkv kernel
+#include "flash_splitkv/splitkv_mla.h"
+
 #ifdef __HGGCCC__
 #include "cuda_ad.h"
 #include "utils.h"
 #endif
+
 
 template<typename Kernel_traits>
 void printf_show_log(const void* kernel, Flash_fwd_params &params, const size_t smem_size,
@@ -116,6 +120,8 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
     // constexpr static int kBlockM = 64;  // Fixed for all head dimensions
 
     bool cross_cut = use_cross_cut(params.seqlen_q, params.b);
+    // Warp-Specialization only suppose page size 32 due to tsm limitation, hopper suppose page size64
+    bool warp_interleave = (params.seqlen_q >=128 && params.page_block_size == 32);
 // #if ACOMPUTE_VERSION==10000
     if (!is_sm89_or_newer()) {
         if (cross_cut) {
@@ -155,6 +161,10 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
                     Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
                     >, 1/*CrossCut*/>(params, stream);
             } else if (params.seqlen_q > 64) {
+                if (warp_interleave) {
+                    run_flash_splitkv_mla_kernel<T, 80>(params, stream);
+                    return;
+                }
                 constexpr static int kBlockM = 128;
                 constexpr static int kBlockN= 32;
                 constexpr bool USE_MMA_M8 = 0;

@@ -26,6 +26,8 @@ def get_sources():
         "csrc/flash_fwd_split_hdim576_512_bf16_sm80.cu",
         "csrc/flash_fwd_sparse_prefill_hdim576_512_bf16_sm80.cu",
         "csrc/flash_fwd_mla_metadata.cu",
+        "csrc/flash_splitkv/mla_combine.cu",
+        "csrc/flash_splitkv/splitkv_mla.cu",
     ]
 
     if not DISABLE_FP16:
@@ -113,7 +115,13 @@ ext_modules.append(
                     "-ppu-force-vregrr=true",
                     "-DUSE_PPU",
                     "-DUSE_AIU=1",
-                    "-DACOMPUTE_VERSION=10000"
+                    "-DACOMPUTE_VERSION=10000",
+                    "-mllvm",
+                    "-ppu-simt-branch=false",
+                    "-mllvm",
+                    "-ppu-disable-licm=true"
+                    # "-mllvm",
+                    # "-ppu-indvars-instr-sink-ctrl=true
                 ]
                 + cc_flag
             ) + get_features_args(),

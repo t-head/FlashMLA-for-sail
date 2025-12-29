@@ -55,16 +55,15 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
     max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
     print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
 
-    q = torch.randn(b, s_q, h_q, d)
-    # q = torch.ones(b, s_q, h_q, d)
+    q = torch.randn(b, s_q, h_q, d, device="cpu")
+    # q = torch.ones(b, s_q, h_q, d, device="cpu")
 
     block_size = paged_block_size
     block_table = torch.arange(
         b * max_seqlen_pad // block_size, dtype=torch.int32
     ).view(b, max_seqlen_pad // block_size)
-    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
-
-    # blocked_k = torch.ones(block_table.numel(), block_size, h_kv, d)
+    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device="cpu")
+    # blocked_k = torch.ones(block_table.numel(), block_size, h_kv, d, device="cpu")
     
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = (
@@ -79,8 +78,8 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
 
     def flash_mla():
         return flash_mla_with_kvcache(
-            q,
-            blocked_k,
+            q.to('cuda'),
+            blocked_k.to('cuda'),
             block_table,
             cache_seqlens,
             dv,
@@ -96,9 +95,9 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
             begin = i * max_seqlen_pad
             end = begin + cache_seqlens[i]
             O, LSE = scaled_dot_product_attention(
-                q[i].transpose(0, 1),
-                blocked_k.view(-1, h_kv, d)[begin:end].transpose(0, 1),
-                blocked_v.view(-1, h_kv, dv)[begin:end].transpose(0, 1),
+                q[i].transpose(0, 1).to('cuda'),
+                blocked_k.view(-1, h_kv, d)[begin:end].transpose(0, 1).to('cuda'),
+                blocked_v.view(-1, h_kv, dv)[begin:end].transpose(0, 1).to('cuda'),
                 h_q=h_q,
                 h_kv=h_kv,
                 is_causal=causal,
@@ -109,14 +108,14 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
 
     out_flash_, lse_flash = flash_mla()
     torch.cuda.nvtx.range_pop()
-    out_flash = out_flash_[..., :dv]
-    out_torch, lse_torch = ref_mla()
-    
+    if args.ref:
+        out_flash = out_flash_[..., :dv]
+        out_torch, lse_torch = ref_mla()
+        diff = out_flash - out_torch
 
-    diff = out_flash - out_torch
-    print(f'diff.max = {diff.max()}, diff.min = {diff.min()}')
-    cal_diff(out_flash, out_torch, "out")
-    cal_diff(lse_flash, lse_torch, "lse")
+        print(f'diff.max = {diff.max()}, diff.min = {diff.min()}')
+        cal_diff(out_flash, out_torch, "out")
+        cal_diff(lse_flash, lse_torch, "lse")
 
     # t = triton.testing.do_bench(flash_mla)
     # FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
@@ -139,14 +138,14 @@ def main(torch_dtype):
     h_kv = 1
     d, dv = 576, 512
     if 1:
-        if 0:
-            causal = False
-            b = 1
-            s = 4096
+        if 1:
+            causal = True
+            b = 32
+            s = 8192
             s_q = 1
-            h_q = 64
-            varlen = True
-            paged_block_size = 64
+            h_q = 128
+            varlen = False
+            paged_block_size = 32
             test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
         else:
             for b in [1, 2, 4, 8, 16, 32, 128]:
@@ -154,7 +153,7 @@ def main(torch_dtype):
                     for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
                         for s_q in [1, 2]:  # MTP = 1, 2
                             for varlen in [False, True]:
-                                for paged_block_size in [64, 16, 256]:
+                                for paged_block_size in [64, 32, 16, 256]:
                                     for causal in [True, False]:
                                         test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
     else:
@@ -177,6 +176,13 @@ if __name__ == "__main__":
         type=str,
         choices=["bf16", "fp16"],
         default="bf16",
+        help="Data type to use for testing (bf16 or fp16)",
+    )
+
+    parser.add_argument(
+        "--ref",
+        type=int,
+        default=1,
         help="Data type to use for testing (bf16 or fp16)",
     )
 

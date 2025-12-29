@@ -125,9 +125,10 @@ mha_fwd_kvcache_mla(
 
     Flash_fwd_params params {};
 
-     // Set the sizes.
+    // Set the sizes.
     params.b = batch_size;
     params.seqlen_q = seqlen_q;
+    params.q_orig = seqlen_q_ori;
     params.cu_seqlens_k = seqlens_k.data_ptr<int>();
     params.h = num_heads;
     params.h_h_k_ratio = num_heads / num_heads_k;
@@ -353,6 +354,7 @@ get_mla_metadata(
         // btv105 only use cross_cut method.
         block_size_n = 64;
     }
+
     static constexpr int fixed_overhead_num_blocks = 5;
 
     auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
