@@ -54,15 +54,18 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
     max_seqlen = cache_seqlens.max().item()
     max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
     print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
-
-    q = torch.randn(b, s_q, h_q, d, device="cpu")
+    if args.ref:
+        dev = 'cuda'
+    else:
+        dev = 'cpu'
+    q = torch.randn(b, s_q, h_q, d, device=dev)
     # q = torch.ones(b, s_q, h_q, d, device="cpu")
 
     block_size = paged_block_size
     block_table = torch.arange(
         b * max_seqlen_pad // block_size, dtype=torch.int32
     ).view(b, max_seqlen_pad // block_size)
-    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device="cpu")
+    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device=dev)
     # blocked_k = torch.ones(block_table.numel(), block_size, h_kv, d, device="cpu")
     
     for i in range(b):
@@ -138,7 +141,7 @@ def main(torch_dtype):
     h_kv = 1
     d, dv = 576, 512
     if 1:
-        if 1:
+        if 0:
             causal = True
             b = 32
             s = 8192
@@ -148,12 +151,12 @@ def main(torch_dtype):
             paged_block_size = 32
             test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
         else:
-            for b in [1, 2, 4, 8, 16, 32, 128]:
+            for b in [1, 8, 32, 128]:
                 for s in [256, 512, 1024, 4096, 8192]:
                     for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
                         for s_q in [1, 2]:  # MTP = 1, 2
                             for varlen in [False, True]:
-                                for paged_block_size in [64, 32, 16, 256]:
+                                for paged_block_size in [16, 32, 64, 256]:
                                     for causal in [True, False]:
                                         test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
     else:

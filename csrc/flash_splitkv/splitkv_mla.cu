@@ -1287,11 +1287,6 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         int end_block_idx = batch_idx == end_idx ? cute::ceil_div(end_seqlen, kBlockN) : cute::ceil_div(seqlen_k, kBlockN);
         const bool is_no_split = start_block_idx == 0 && end_block_idx == cute::ceil_div(seqlen_k, kBlockN);
 
-        // if (threadIdx.x == 0) {
-        //     printf("block[%d, %d, %d], batch_idx:%d, n_split_idx:%d, start_block_idx:%d, end_block_idx:%d, is_no_split:%d\n",
-        //         blockIdx.x, blockIdx.y, blockIdx.z, batch_idx, n_split_idx, start_block_idx, end_block_idx, is_no_split);
-        // }
-
         int rRightBorderForQSeq[2];
         if constexpr (Is_causal) {
             // The causal mask looks like:
@@ -1538,7 +1533,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
                 if (threadIdx.x == 0) {
                     __mbarrier_init(barrier_Q, 32);
                     CUTLASS_PRAGMA_UNROLL
-                    for (int i = 0; i < 9; ++i) {
+                    for (int i = 0; i < 2; ++i) {
                         __mbarrier_init(&barriers_K0[i], 32);
                         __mbarrier_init(&barriers_K1[i], 32);
                     }
@@ -1570,21 +1565,25 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t str
         int ctas_per_sm;
         cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &ctas_per_sm, mla_kernel, T::NUM_THREADS, smem_size);
-        printf("[splitkv_mla]:\n");
-        printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
 
-        cudaFuncAttributes attr;
-        cudaFuncGetAttributes(&attr, mla_kernel);
-        auto dprops = at::cuda::getCurrentDeviceProperties();
+        char *pEnv_params = std::getenv("show_log");
+        if (pEnv_params && isdigit(*pEnv_params)) {
+            printf("[splitkv_mla]:\n");
+            printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
 
-        int sm_count = dprops->multiProcessorCount == 64 ? 20 : dprops->multiProcessorCount;
-        printf("blockM:%d, blockN:%d, threads:%d, block_size:%d\n",
-                T::kBlockM, T::kBlockN, T::NUM_THREADS, params.page_block_size);
-        printf("Is_causal:%d\n", Is_causal);
-        printf("grid_n[%d, %d, %d]\n",
-                num_m_block, params.h, params.num_sm_parts);
-        printf("verg:%d, stack:%d, sm:%d, occpuancy:%0.3f\n", int(attr.numRegs), int(attr.localSizeBytes), sm_count,
-                float(num_m_block * params.h * params.num_sm_parts) / float(sm_count * ctas_per_sm));
+            cudaFuncAttributes attr;
+            cudaFuncGetAttributes(&attr, mla_kernel);
+            auto dprops = at::cuda::getCurrentDeviceProperties();
+
+            int sm_count = dprops->multiProcessorCount == 64 ? 20 : dprops->multiProcessorCount;
+            printf("blockM:%d, blockN:%d, threads:%d, block_size:%d\n",
+                    T::kBlockM, T::kBlockN, T::NUM_THREADS, params.page_block_size);
+            printf("Is_causal:%d\n", Is_causal);
+            printf("grid_n[%d, %d, %d]\n",
+                    num_m_block, params.h, params.num_sm_parts);
+            printf("verg:%d, stack:%d, sm:%d, occpuancy:%0.3f\n", int(attr.numRegs), int(attr.localSizeBytes), sm_count,
+                    float(num_m_block * params.h * params.num_sm_parts) / float(sm_count * ctas_per_sm));
+        }
 
         // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
         cudaLaunchAttribute mla_kernel_attributes[1];
