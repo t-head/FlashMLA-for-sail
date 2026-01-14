@@ -120,8 +120,7 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
     // constexpr static int kBlockM = 64;  // Fixed for all head dimensions
 
     bool cross_cut = use_cross_cut(params.seqlen_q, params.b);
-    // Warp-Specialization only suppose page size 32 due to tsm limitation, hopper suppose page size64
-    bool warp_interleave = (params.seqlen_q >=128 && params.page_block_size == 32);
+    bool warp_interleave = (params.seqlen_q >=128 && params.page_block_size == 64);
 // #if ACOMPUTE_VERSION==10000
     if (!is_sm89_or_newer()) {
         if (cross_cut) {

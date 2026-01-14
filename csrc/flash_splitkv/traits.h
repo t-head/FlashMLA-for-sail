@@ -31,9 +31,10 @@ struct Traits {
     static constexpr int BLOCK_SIZE_M = Config::BLOCK_SIZE_M;
     static constexpr int PAGE_BLOCK_SIZE = Config::PAGE_BLOCK_SIZE;
     static constexpr int kBlockM = Config::BLOCK_SIZE_M;
-    static constexpr int kBlockN = Config::PAGE_BLOCK_SIZE;
+    static constexpr int kBlockN = Config::BLOCK_SIZE_N;
     static constexpr int kHeadDim = Config::HEAD_DIM_K;
     static constexpr int kHeadDimV = Config::HEAD_DIM_V;
+    static constexpr int Page_In_BlockN = kBlockN / PAGE_BLOCK_SIZE;
 
     // static constexpr int NUM_THREADS = 256;
     static constexpr int NUM_THREADS = 512;
@@ -145,8 +146,6 @@ struct Traits {
         cute::array_aligned<float, kBlockM> smem_sScale0;
         cute::array_aligned<float, kBlockM> smem_sScale1;
         __mbarrier_t barrier_Q;
-        // __mbarrier_t barriers_K0[kHeadDim/64];
-        // __mbarrier_t barriers_K1[kHeadDim/64];
         __mbarrier_t barriers_K0[kHeadDim/256];
         __mbarrier_t barriers_K1[kHeadDim/256];
     };
