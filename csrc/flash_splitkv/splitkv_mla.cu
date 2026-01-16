@@ -46,7 +46,7 @@ inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
 }
 
 // Launch TMA copy for a range of KV tile
-// A tile has a shape of BlockN (32) x 64
+// A tile has a shape of PAGE_BLOCK_SIZE (64) x 64
 template<
     int START_HEAD_DIM_TILE_IDX,
     int END_HEAD_DIM_TILE_IDX,
@@ -56,8 +56,8 @@ template<
 >
 __forceinline__ __device__ void launch_kv_tiles_copy_aiu(
     TiledCopy tiled_copy,
-    Tensor<Engine0, Layout0> const &gKV,	// (BLOCK_N, HEAD_DIM_K)
-    Tensor<Engine1, Layout1> &sKV,	// (BLOCK_N, HEAD_DIM_K), swizzled
+    Tensor<Engine0, Layout0> const &gKV,	// (PAGE_BLOCK_SIZE, HEAD_DIM_K)
+    Tensor<Engine1, Layout1> &sKV,	// (PAGE_BLOCK_SIZE, HEAD_DIM_K), swizzled
     const Flash_fwd_mla_params &params,
     __mbarrier_t* barriers_K,
     int warp_idx
@@ -76,7 +76,7 @@ __forceinline__ __device__ void launch_kv_tiles_copy_aiu(
 
 
 // Launch TMA copy for a range of KV tile
-// A tile has a shape of BLOCK_N (32) x 64
+// A tile has a shape of PAGE_BLOCK_SIZE (64) x 64
 template<
     int START_HEAD_DIM_TILE_IDX,
     int END_HEAD_DIM_TILE_IDX,
@@ -86,8 +86,8 @@ template<
 >
 __forceinline__ __device__ void launch_kv_tiles_copy(
     TiledCopy tiled_copy,
-    Tensor<Engine0, Layout0> const &gKV,	// (BLOCK_N, HEAD_DIM_K)
-    Tensor<Engine1, Layout1> &sKV,	// (BLOCK_N, HEAD_DIM_K), swizzled
+    Tensor<Engine0, Layout0> const &gKV,	// (PAGE_BLOCK_SIZE, HEAD_DIM_K)
+    Tensor<Engine1, Layout1> &sKV,	// (PAGE_BLOCK_SIZE, HEAD_DIM_K), swizzled
     const Flash_fwd_mla_params &params,
     __mbarrier_t* barriers_K,
     int warp_idx
@@ -140,7 +140,7 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 //     typename Engine0, typename Layout0
 // >
 // __forceinline__ __device__ void prefetch_kv_tiles(
-//     Tensor<Engine0, Layout0> const &gKV,	// (BLOCK_N, HEAD_DIM_K)
+//     Tensor<Engine0, Layout0> const &gKV,	// (PAGE_BLOCK_SIZE, HEAD_DIM_K)
 //     TMA_K_OneTile &tma_K,
 //     int idx_in_warpgroup
 // ) {
@@ -169,10 +169,9 @@ __forceinline__ __device__ void gemm(Tensor2 &tCrC, Tensor0 const &tCrA, Tensor1
 }
 
 __forceinline__ __device__ void kernel_sleep_ns() {
-    // unsigned long long start = clock64();
+    unsigned long long start = clock64();
     // 10ns ≈ 10,00000 cycles（if ppu freq is 1 GHz）
-    // while (!(clock64() - start < 170000000ULL)); // 10us * 1700 cycles/us
-    __nanosleep(1);
+    while (!(clock64() - start < 170000000ULL)); // 10us * 1700 cycles/us
 }
 
 // Wait for one KV-tile to be ready, and then calculate P += Q K^T for one Q-tile (BLOCK_SIZE_Mx64) and one KV-tile (PAGE_BLOCK_SIZEx64)
@@ -263,7 +262,7 @@ __forceinline__ __device__ void  qkt_gemm_one_tile_rQ(
 }
 
 // Pipelined TMA wait and Q K^T gemm
-// In order to overlap memory copy (G->S copy for K) and computation, we divide both Q and K into tiles of shape (BLOCK_SIZE_M, 64), and (BLOCK_N, 64) respectively, and then do the computation as follows:
+// In order to overlap memory copy (G->S copy for K) and computation, we divide both Q and K into tiles of shape (BLOCK_SIZE_M, 64), and (PAGE_BLOCK_SIZE, 64) respectively, and then do the computation as follows:
 // - Wait for the 0-th tile to be ready using `barrier.wait()`
 // - Compute Q K^T for the 0-th tile
 // - Wait for the 1-st tile to be ready
@@ -280,7 +279,7 @@ template<
 > 
 __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     Tensor<Engine0, Layout0> &sQ,	// (BLOCK_SIZE_M, HEAD_DIM_K)
-    Tensor<Engine1, Layout1> &sKV,	// (BLOCK_N, HEAD_DIM_K)
+    Tensor<Engine1, Layout1> &sKV,	// (PAGE_BLOCK_SIZE, HEAD_DIM_K)
     Tensor<Engine2, Layout2> &rP,	// ((2, 2, 8), 1, 1)
     // Tensor<Engine3, Layout3> &rQ8,	// The 8-th tile of Q. We store it separately to leave some room for storing sP1
     __mbarrier_t* barriers,
@@ -297,7 +296,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(warp_idx * 32);
 
     Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _);	// (BLOCK_SIZE_M, 64, 9)
-    Tensor sKV_tiled = flat_divide(sKV, Shape<Int<T::kBlockN>, _64>{})(_, _, _0{}, _);	// (BLOCK_N, 64, 9)
+    Tensor sKV_tiled = flat_divide(sKV, Shape<Int<T::PAGE_BLOCK_SIZE>, _64>{})(_, _, _0{}, _);	// (PAGE_BLOCK_SIZE, 64, 9)
     Tensor thr_mma_sQ_tiled = smem_thr_copy_Q.partition_S(make_mix_tensor_like(sQ_tiled));
     Tensor thr_mma_sKV_tiled = smem_thr_copy_K.partition_S(make_mix_tensor_like(sKV_tiled));
 
@@ -400,7 +399,7 @@ template<
 > 
 __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_localP(
     Tensor<Engine0, Layout0> &rP,	// ((2, 2, 8), 1, 1), fragment A layout
-    Tensor<Engine1, Layout1> &sKV_half,	// (HEAD_DIM_V/2, BLOCK_N)
+    Tensor<Engine1, Layout1> &sKV_half,	// (HEAD_DIM_V/2, PAGE_BLOCK_SIZE)
     Tensor<Engine2, Layout2> &rO,	// ((2, 2, 32), 1, 1)
     int idx_in_warpgroup,
     int warp_idx
@@ -431,7 +430,7 @@ template<
 >
 __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
     Tensor<Engine0, Layout0> &sP,
-    Tensor<Engine1, Layout1> &sKV_half,	// (HEAD_DIM_V/2, BLOCK_N)
+    Tensor<Engine1, Layout1> &sKV_half,	// (HEAD_DIM_V/2, PAGE_BLOCK_SIZE)
     Tensor<Engine2, Layout2> &rO,	// ((2, 2, 32), 1, 1)
     int idx_in_warpgroup,
     int warp_idx
@@ -809,6 +808,27 @@ __forceinline__ __device__ void wg0_scale0_rO0(
     }
 }
 
+// Fill out-of-bound V with 0.0
+// We must fill it since it may contain NaN, which may propagate to the final result
+template<
+    typename T,
+    typename Engine0, typename Layout0
+>
+__forceinline__ __device__ void fill_oob_V(
+    Tensor<Engine0, Layout0> &sV,	// tile_to_shape(GMMA::Layout_MN_SW128_Atom<InputT>{}, Shape<Int<HALF_HEAD_DIM>, Int<T::PAGE_BLOCK_SIZE>>{}, LayoutRight{} );
+    int valid_window_size,
+    int idx_in_warpgroup
+) {
+    Tensor sV_int64 = make_tensor(make_smem_ptr((int64_t*)(sV.data().get())), (typename T::SmemLayoutV){});
+
+    valid_window_size = max(valid_window_size, 0);
+    int head_dim_size = size<0>(sV_int64);	// 128%head_dim_size == 0 should holds
+    for (int token_idx = valid_window_size + (idx_in_warpgroup/head_dim_size); token_idx < size<1>(sV); token_idx += (128/head_dim_size)) {
+        sV_int64(idx_in_warpgroup%head_dim_size, token_idx) = 0;
+    }
+}
+
+
 // Store O / OAccum
 template<
     typename T,
@@ -943,20 +963,7 @@ __forceinline__ __device__ auto get_half_V(
     Tensor<Engine0, Layout0> &sK
 ) {
     Tensor sV = make_tensor(sK.data(), (typename T::SmemLayoutV){});
-    return flat_divide(sV, Shape<Int<T::kHeadDimV/2>, Int<T::kBlockN>>{})(_, _, Int<(int)IS_R>{}, _0{});
-}
-
-template<
-    typename T
->
-__forceinline__ __device__ long get_block_index(
-    int block_idx,
-    const Flash_fwd_mla_params &params,
-    int* block_table_ptr
-) {
-    const int block_table_idx = block_idx * T::Page_In_BlockN;
-    const int block_table_offset = block_idx * T::kBlockN - block_table_idx * T::PAGE_BLOCK_SIZE;
-    return long(__ldg(block_table_ptr + block_table_idx) * params.k_batch_stride + block_table_offset * params.k_row_stride);
+    return flat_divide(sV, Shape<Int<T::kHeadDimV/2>, Int<T::PAGE_BLOCK_SIZE>>{})(_, _, Int<(int)IS_R>{}, _0{});
 }
 
 template<
@@ -1006,9 +1013,13 @@ __forceinline__ __device__ void wg0_subroutine(
     int idx_in_warpgroup,
     int wg_idx
 ) {
-    int start_token_idx = block_idx * T::kBlockN;
+    int start_token_idx = block_idx * T::PAGE_BLOCK_SIZE;
+    // #define GET_BLOCK_INDEX(block_idx) ((block_idx) >= end_block_idx ? 0 : __ldg(block_table_ptr + (block_idx)))
+    #define GET_BLOCK_INDEX(block_idx)  ((block_idx) >= end_block_idx ? 0 : __ldg(block_table_ptr + (block_idx)) * params.k_batch_stride)
     int nxt_block0 = block_idx+2;
     int nxt_block1 = block_idx+3;
+    long nxt_block0_index = GET_BLOCK_INDEX(nxt_block0);
+    long nxt_block1_index = GET_BLOCK_INDEX(nxt_block1);
 
     Tensor sV0L = get_half_V<T, 0>(sK0);
     Tensor sV1L = get_half_V<T, 0>(sK1);
@@ -1028,10 +1039,10 @@ __forceinline__ __device__ void wg0_subroutine(
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
         tKgK.data().ptr_ = make_gmem_ptr(
-                     reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block0, params, block_table_ptr));
+                     reinterpret_cast<T::InputT *>(params.k_ptr) + nxt_block0_index);
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
         Tensor tKsK0 = gmem_thr_copy_K.partition_D(sK0);
-        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block0*T::kBlockN);
+        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block0*T::PAGE_BLOCK_SIZE);
         launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK0, params, &barriers_K0[0], wg_idx);
     }
 
@@ -1055,10 +1066,10 @@ __forceinline__ __device__ void wg0_subroutine(
     // // Wait for rO0 += rPb @ sV1L, launch TMA
     if (!IS_BLK0_LAST && !IS_BLK1_LAST && __builtin_expect(block_idx+3 < end_block_idx, true)) {
         tKgK.data().ptr_ = make_gmem_ptr(
-                     reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block1, params, block_table_ptr));
+                     reinterpret_cast<T::InputT *>(params.k_ptr) + nxt_block1_index);
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
         Tensor tKsK1 = gmem_thr_copy_K.partition_D(sK1);
-        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block1*T::kBlockN);
+        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block1*T::PAGE_BLOCK_SIZE);
 
         launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK1, params, &barriers_K1[0], wg_idx);
     }
@@ -1118,17 +1129,20 @@ __forceinline__ __device__ void wg1_subroutine(
     int idx_in_warpgroup,
     int wg_idx
 ) {
-    int start_token_idx = block_idx * T::kBlockN;
+    int start_token_idx = block_idx * T::PAGE_BLOCK_SIZE;
     int nxt_block0 = block_idx+2;
     int nxt_block1 = block_idx+3;
+    long nxt_block0_index = GET_BLOCK_INDEX(nxt_block0);
+    long nxt_block1_index = GET_BLOCK_INDEX(nxt_block1);
     
     Tensor sV0R = get_half_V<T, 1>(sK0);
     Tensor sV1R = get_half_V<T, 1>(sK1);
 
+
     // Wait for rP1 and warpgroup 0, run bunch 1, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
 
-    auto rP1b = wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(sScale1, rO1, sM, rL, rRightBorderForQSeq, sScale0, rP1, params.scale_softmax_log2, start_token_idx+T::kBlockN, idx_in_warpgroup);
+    auto rP1b = wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(sScale1, rO1, sM, rL, rRightBorderForQSeq, sScale0, rP1, params.scale_softmax_log2, start_token_idx+T::PAGE_BLOCK_SIZE, idx_in_warpgroup);
 
     NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
@@ -1155,20 +1169,20 @@ __forceinline__ __device__ void wg1_subroutine(
     // Wait for rO1 += rP1b @ sV1R, launch TMA for the next V1R
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST) {
         tKgK.data().ptr_ = make_gmem_ptr(
-            reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block1, params, block_table_ptr));
+            reinterpret_cast<T::InputT *>(params.k_ptr) + nxt_block1_index);
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
         Tensor tKsK1 = gmem_thr_copy_K.partition_D(sK1);
-        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block1*T::kBlockN);
+        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block1*T::PAGE_BLOCK_SIZE);
         launch_kv_tiles_copy<4, 9>(tiled_copy, tKgK, tKsK1, params, &barriers_K1[1], wg_idx);
     }
 
     // // Wait for rO1 += sP0 @ sV0R, launch TMA for the next V0R
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
         tKgK.data().ptr_ = make_gmem_ptr(
-            reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block0, params, block_table_ptr));
+            reinterpret_cast<T::InputT *>(params.k_ptr) + nxt_block0_index);
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
         Tensor tKsK0 = gmem_thr_copy_K.partition_D(sK0);
-        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block0*T::kBlockN);
+        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block0*T::PAGE_BLOCK_SIZE);
         launch_kv_tiles_copy<4, 9>(tiled_copy, tKgK, tKsK0, params, &barriers_K0[1], wg_idx);
     }
 
@@ -1266,7 +1280,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 
     #pragma unroll 1
     for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
-        constexpr int kBlockN = T::kBlockN;
+        constexpr int kBlockN = T::PAGE_BLOCK_SIZE;
         const int n_split_idx = batch_idx == begin_idx ? begin_n_split_idx : 0;
         int seqlen_k = __ldg(params.cu_seqlens_k + batch_idx);
         const int start_block_idx = batch_idx == begin_idx ? begin_seqlen / kBlockN : 0;
@@ -1297,7 +1311,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             CUTLASS_PRAGMA_UNROLL
             for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
                 int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
-                rRightBorderForQSeq[local_row_idx] = min(seqlen_k-get_mask_len(params, m_block_idx, row_idx), end_block_idx*T::kBlockN);
+                rRightBorderForQSeq[local_row_idx] = min(seqlen_k-get_mask_len(params, m_block_idx, row_idx), end_block_idx*T::PAGE_BLOCK_SIZE);
             }
         } else {
             rRightBorderForQSeq[0] = rRightBorderForQSeq[1] = seqlen_k;
@@ -1306,7 +1320,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         int* block_table_ptr = params.block_table + batch_idx*params.block_table_batch_stride;	// (/) : (1)
 
         Tensor gK = make_tensor(make_gmem_ptr(
-                        reinterpret_cast<InputT *>(params.k_ptr) + get_block_index<T>(start_block_idx, params, block_table_ptr)),
+                        reinterpret_cast<InputT *>(params.k_ptr) + __ldg(block_table_ptr + start_block_idx) * params.k_batch_stride),
                         Shape<Int<kBlockN>, Int<T::kHeadDim>>{},
                         make_stride(params.k_row_stride, _1{}));
         // Copy K0 and K1
@@ -1324,7 +1338,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 
         if (start_block_idx+1 < end_block_idx) {
             tKgK.data().ptr_ = make_gmem_ptr(
-                    reinterpret_cast<InputT *>(params.k_ptr) + get_block_index<T>(start_block_idx + 1, params, block_table_ptr));
+                    reinterpret_cast<InputT *>(params.k_ptr) + __ldg(block_table_ptr + start_block_idx+1) * params.k_batch_stride);
             Tensor tKsK1 = gmem_thr_copy_K.partition_D(sK1);
             gmem_tiled_copy_K.desc_.dim_h = seqlen_k-((start_block_idx + 1) * kBlockN);
             launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK1, params, &barriers_K1[1], warp_idx);
@@ -1360,7 +1374,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         if (warpgroup_idx == 0) {
             // Warpgroup 0
             // Tensor rP0 = make_tensor<float>((typename T::rP0Layout){});
-            Tensor rP0 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kBlockN>>{});  // MMA, MMA_M, MMA_K
+            Tensor rP0 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::PAGE_BLOCK_SIZE>>{});  // MMA, MMA_M, MMA_K
             const int wg_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
 
             // NOTE We don't use the pipelined version of Q K^T here since it leads
@@ -1392,7 +1406,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         } else {
             // // Warpgroup 1
             // Tensor rP1 = make_tensor<float>((typename T::rP0Layout){});
-            Tensor rP1 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kBlockN>>{});  // MMA, MMA_M, MMA_K
+            Tensor rP1 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::PAGE_BLOCK_SIZE>>{});  // MMA, MMA_M, MMA_K
             const int wg_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
 
             if (start_block_idx+1 < end_block_idx) {
@@ -1544,7 +1558,6 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t str
     
         auto mla_kernel = &flash_fwd_splitkv_mla_kernel<T, Is_causal>;
         constexpr size_t smem_size = std::max(sizeof(typename T::SharedMemoryPlan), sizeof(typename T::SharedMemoryOutPut));
-
         C10_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
         const int num_m_block = cute::ceil_div(params.seqlen_q, T::kBlockM);

@@ -148,7 +148,7 @@ def main(torch_dtype):
             s_q = 1
             h_q = 128
             varlen = False
-            paged_block_size = 64
+            paged_block_size = 32
             test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
         else:
             for b in [1, 8, 32, 128]:
@@ -156,7 +156,7 @@ def main(torch_dtype):
                     for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
                         for s_q in [1, 2]:  # MTP = 1, 2
                             for varlen in [False, True]:
-                                for paged_block_size in [16, 64, 256]:
+                                for paged_block_size in [16, 32, 64, 256]:
                                     for causal in [True, False]:
                                         test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
     else:
