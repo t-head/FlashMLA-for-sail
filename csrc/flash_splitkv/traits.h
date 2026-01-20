@@ -34,7 +34,7 @@ struct Traits {
     static constexpr int kBlockN = Config::BLOCK_SIZE_N;
     static constexpr int kHeadDim = Config::HEAD_DIM_K;
     static constexpr int kHeadDimV = Config::HEAD_DIM_V;
-    static constexpr int Page_In_BlockN = kBlockN / PAGE_BLOCK_SIZE;
+    static constexpr float Page_In_BlockN = float(kBlockN) / (float)PAGE_BLOCK_SIZE;
 
     // static constexpr int NUM_THREADS = 256;
     static constexpr int NUM_THREADS = 512;

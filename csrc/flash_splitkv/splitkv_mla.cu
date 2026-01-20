@@ -456,9 +456,7 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
     Tensor rVt_copy_view = smem_thr_copy_Vt.retile_D(thr_mma_sKV_half);
 
     cute::copy(smem_tiled_copy_P, tSsP, rP_copy_view);
-
     cute::copy(smem_tiled_copy_Vt, tSsVt, rVt_copy_view);
-
     gemm(rO, rP_copy_view, rVt_copy_view, tiled_mma);
 }
 
@@ -956,6 +954,7 @@ __forceinline__ __device__ long get_block_index(
 ) {
     const int block_table_idx = block_idx * T::Page_In_BlockN;
     const int block_table_offset = block_idx * T::kBlockN - block_table_idx * T::PAGE_BLOCK_SIZE;
+
     return long(__ldg(block_table_ptr + block_table_idx) * params.k_batch_stride + block_table_offset * params.k_row_stride);
 }
 
@@ -1309,6 +1308,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
                         reinterpret_cast<InputT *>(params.k_ptr) + get_block_index<T>(start_block_idx, params, block_table_ptr)),
                         Shape<Int<kBlockN>, Int<T::kHeadDim>>{},
                         make_stride(params.k_row_stride, _1{}));
+
         // Copy K0 and K1
         typename T::GmemTiledCopyKV gmem_tiled_copy_K;
         auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(tidx);
@@ -1318,15 +1318,18 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
  
         gmem_tiled_copy_K.desc_ = AiuDesc{nullptr, kBlockN, params.k_row_stride, kBlockN, T::kBlockKSmem, 0};
 
-        gmem_tiled_copy_K.desc_.dim_h = seqlen_k - (start_block_idx * kBlockN);
-        launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K0[1], warp_idx);
-        launch_kv_tiles_copy<0, 4>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K0[0], warp_idx);
+        if (seqlen_k !=0) {
+            gmem_tiled_copy_K.desc_.dim_h = seqlen_k - (start_block_idx * kBlockN);
+            launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K0[1], warp_idx);
+            launch_kv_tiles_copy<0, 4>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K0[0], warp_idx);
+        }
 
         if (start_block_idx+1 < end_block_idx) {
             tKgK.data().ptr_ = make_gmem_ptr(
                     reinterpret_cast<InputT *>(params.k_ptr) + get_block_index<T>(start_block_idx + 1, params, block_table_ptr));
             Tensor tKsK1 = gmem_thr_copy_K.partition_D(sK1);
             gmem_tiled_copy_K.desc_.dim_h = seqlen_k-((start_block_idx + 1) * kBlockN);
+
             launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK1, params, &barriers_K1[1], warp_idx);
             launch_kv_tiles_copy<0, 4>(gmem_tiled_copy_K, tKgK, tKsK1, params, &barriers_K1[0], warp_idx);
         }
@@ -1366,8 +1369,10 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             // NOTE We don't use the pipelined version of Q K^T here since it leads
             // to a slow-down (or even register spilling, thanks to the great NVCC)
             // Issue P0 = Q @ K0^T, wait
-            cute::clear(rP0);
-            warpgroup_cooperative_qkt_gemm<T, 1>(sQ, sK0, rP0, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
+            if (seqlen_k !=0) {
+                cute::clear(rP0);
+                warpgroup_cooperative_qkt_gemm<T, 1>(sQ, sK0, rP0, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
+            }
 
             #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST) \
                 wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>( \
