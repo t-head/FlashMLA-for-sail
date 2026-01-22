@@ -191,6 +191,35 @@ struct Flash_fwd_kernel_traits : public Base {
         SmemLayoutAtomV{},
         Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
 
+//     using SmemLayoutKnew = decltype(tile_to_shape(
+//         SmemLayoutAtomQ{},
+//         Shape<Int<kBlockN>, Int<kHeadDim>, Int<kStages>>{}));
+//     using SmemLayoutVnew = decltype(tile_to_shape(
+//         SmemLayoutAtomV{},
+//         Shape<Int<kBlockN>, Int<kHeadDimV>, Int<kStages>>{}));
+
+// //     using SmemLayoutVnew = Layout<decltype(shape(SmemLayoutVnew0{})),
+// //     decltype(replace<2>(stride(SmemLayoutVnew0{}), Int<kBlockN*kHeadDim>{}))
+// //     >;
+
+
+//     using SmemLayoutVtnew0 = decltype(
+//         composition(SmemLayoutV{}, make_ordered_layout(
+//                 Shape<Int<kHeadDimV>, Int<kBlockN>, Int<kStages>>{},
+//                 Step<_2, _1, _3>{})));
+//     using SmemLayoutVtnew = Layout<decltype(shape(SmemLayoutVtnew0{})),
+//     decltype(replace<2>(stride(SmemLayoutVtnew0{}), Int<kBlockN*kHeadDim>{}))
+//     >;
+//     // using SmemLayoutVtnew1 = decltype(
+//     //     composition(SmemLayoutVnew{}, make_layout(
+//     //     Shape<Int<kHeadDim>, Int<kBlockN>, Int<kStages>>{},
+//     //     Stride<Int<kBlockN>, _1, Int<kBlockN*kHeadDim>>{}
+//     //    )));
+
+// // print_layout(SmemLayoutVtnew{});
+
+
+
     // https://github.com/ColfaxResearch/cutlass-kernels/blob/a222587e6d59b93ba704853d3946fb686d8b8892/src/fmha/fmha_forward.cu#L434
     using SmemLayoutVtransposed = decltype(
         composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));

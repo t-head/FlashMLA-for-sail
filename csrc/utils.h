@@ -241,31 +241,6 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 #if USE_AIU
     if constexpr (is_mix_iterator<typename Engine0::iterator>::value) {
         const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
-#if 0 // ACOMPUTE_VERSION > 10000
-        // it is slower.
-        if constexpr (!Is_even_MN) {
-            tiled_copy.desc_.dim_h = max_MN;
-        }
-
-        if (blockDim.x / 32 <= 1) {
-            if (warp_idx == 0) {
-                cute::copy(tiled_copy, S, D);
-            }
-        } else {
-            if (warp_idx == 0) {
-                #pragma unroll
-                for (int k = 0; k < (size<2>(S)); ++k) {
-                    cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
-                }
-            } else if (warp_idx == 1) {
-                #pragma unroll
-                for (int k = (size<2>(S)/2); k < size<2>(S); ++k) {
-                    cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
-                }
-            }
-        }
-
-#else
         if (warp_idx == 0) {
             if constexpr (!Is_even_MN) {
                 tiled_copy.desc_.dim_h = max_MN;
@@ -273,7 +248,6 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 
             cute::copy(tiled_copy, S, D);
         }
-#endif
         return;
     }
 #endif

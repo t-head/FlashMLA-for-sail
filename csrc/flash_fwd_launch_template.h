@@ -65,6 +65,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     //constexpr size_t smem_size = Kernel_traits::kSmemSize;
     constexpr size_t smem_size = Kernel_traits::kSmemSizeAccum;
     const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
+    // FLASH_ASSERT(params.page_block_size % Kernel_traits::kBlockN == 0);
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal, CrossCut>;
         //CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

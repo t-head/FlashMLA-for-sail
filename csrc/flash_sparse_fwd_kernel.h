@@ -231,7 +231,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
 
     clear(acc_o);
 
-    flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, kNWarps/AtomLayoutQ> softmax;
+    flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, AtomLayoutP, kNWarps/AtomLayoutQ> softmax;
 
     // These are the iterations where we don't need masking on S
     for (int n_block = 0; n_block < n_block_max; ++n_block) {
@@ -280,7 +280,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
         cute::copy(smem_tiled_copy_S, tSaS, tSsS);
         __syncthreads();
         if (n_block > 0) {
-            softmax.template softmax_rescale_o<AtomLayoutP>(acc_o, smem_row_scale);
+            softmax.template softmax_rescale_o(acc_o, smem_row_scale);
         }
         flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_current,
             tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
@@ -290,7 +290,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     softmax.template normalize_softmax_lse_per_warp<false>(smem_row_via_warp, smem_row_scale, params.sm_scale);
     __syncthreads();
 
-    softmax.template softmax_rescale_o<AtomLayoutP>(acc_o, smem_row_scale);
+    softmax.template softmax_rescale_o(acc_o, smem_row_scale);
 
     // store
     Tensor lse = make_tensor_like<ElementAccum>(softmax.lse);
@@ -486,7 +486,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
 
     flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
-                            params.ngroups - h_k_idx * kBlockM);
+                params.ngroups - h_k_idx * kBlockM);
 
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
@@ -550,7 +550,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 
     clear(acc_o);
 
-    flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, kNWarps/AtomLayoutQ> softmax;
+    flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, AtomLayoutP, kNWarps/AtomLayoutQ> softmax;
 
     // #pragma unroll
     for (; n_block < n_block_max; ++n_block) {
@@ -601,7 +601,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         __syncthreads();
 
         if (n_block > n_block_min) {
-            softmax.template softmax_rescale_o<AtomLayoutP>(acc_o, smem_row_scale);
+            softmax.template softmax_rescale_o(acc_o, smem_row_scale);
         }
         flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_current, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
             smem_thr_copy_P, smem_thr_copy_V);
@@ -616,7 +616,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 
     __syncthreads();
 
-    softmax.template softmax_rescale_o<AtomLayoutP>(acc_o, smem_row_scale);
+    softmax.template softmax_rescale_o(acc_o, smem_row_scale);
     // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z ==0) {
     //     printf("acc_o:");print_tensor(acc_o);printf("\n");
     // }
@@ -776,7 +776,7 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
 
     flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
-                            params.ngroups - h_k_idx * kBlockM);
+                params.ngroups - h_k_idx * kBlockM);
 
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
@@ -850,7 +850,7 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
 
     clear(acc_o);
 
-    flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, kNWarps/AtomLayoutQ> softmax;
+    flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, AtomLayoutP, kNWarps/AtomLayoutQ> softmax;
 
     for (; n_block < n_block_max; ++n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_s, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -906,7 +906,7 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
         __syncthreads();
 
         if (n_block > n_block_min) {
-            softmax.template softmax_rescale_o<AtomLayoutP>(acc_o, smem_row_scale);
+            softmax.template softmax_rescale_o(acc_o, smem_row_scale);
         }
         flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_current, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
             smem_thr_copy_P, smem_thr_copy_V);
@@ -921,7 +921,7 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
 
     __syncthreads();
 
-    softmax.template softmax_rescale_o<AtomLayoutP>(acc_o, smem_row_scale);
+    softmax.template softmax_rescale_o(acc_o, smem_row_scale);
 
     // Epilogue
     if (NoSplit) {

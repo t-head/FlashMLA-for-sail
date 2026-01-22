@@ -28,10 +28,7 @@
 
 #define SEQLENG_SWITCH(SEQLENG, ...)   \
   [&] {                                    \
-    if (SEQLENG <= 8) {                   \
-      constexpr static int kBlockM = 16;  \
-      return __VA_ARGS__();                \
-    } else if (SEQLENG <= 16) {            \
+    if (SEQLENG <= 16) {                  \
       constexpr static int kBlockM = 16;  \
       return __VA_ARGS__();                \
     } else if (SEQLENG <= 32) {            \
