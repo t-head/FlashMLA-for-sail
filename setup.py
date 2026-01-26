@@ -117,9 +117,7 @@ ext_modules.append(
                     "-DUSE_AIU=1",
                     "-DACOMPUTE_VERSION=10000",
                     "-mllvm",
-                    "-ppu-simt-branch=false",
-                    "-mllvm",
-                    "-ppu-disable-licm=true"
+                    "-ppu-simt-branch=false"
                     # "-mllvm",
                     # "-ppu-indvars-instr-sink-ctrl=true
                 ]

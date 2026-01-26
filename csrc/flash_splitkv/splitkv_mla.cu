@@ -1264,6 +1264,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     launch_q_copy<T>(params, begin_idx, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
 
     #pragma unroll 1
+    #pragma clang loop licm(disable)
     for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
         constexpr int kBlockN = T::kBlockN;
         const int n_split_idx = batch_idx == begin_idx ? begin_n_split_idx : 0;
