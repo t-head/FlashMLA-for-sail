@@ -792,6 +792,8 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         Tensor acc_s = partition_fragment_C(tiled_mma_s, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
 
+        __syncthreads();
+
         if (n_block > n_block_min) { // doble buffer for next part
             auto tKsK_current = kv_store_num ? tKsK_double : tKsK;
             // Advance gK
@@ -810,6 +812,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
             // isn't right and we get race conditions.
             cute::cp_async_fence();
             kv_store_num ^=1;
+
             flash::cp_async_wait<1>();
         } else {
             flash::cp_async_wait<0>();
@@ -882,6 +885,8 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         Tensor acc_s = partition_fragment_C(tiled_mma_s, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
 
+        __syncthreads();
+
         if (n_block > n_block_min) {
             // Advance gK
             auto tKsK_current = kv_store_num ? tKsK_double : tKsK;
@@ -899,11 +904,13 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
             // isn't right and we get race conditions.
             cute::cp_async_fence();
             kv_store_num ^=1;
+
             flash::cp_async_wait<1>();
         } else {
             flash::cp_async_wait<0>();
         }
         __syncthreads();
+
         block_table_idx = block_table_idx_nxt;
         cur_block_table = nxt_block_table;
 #if ACOMPUTE_VERSION == 10000
