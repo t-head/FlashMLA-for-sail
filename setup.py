@@ -35,7 +35,6 @@ def get_sources():
 
     return sources
 
-
 def get_features_args():
     features_args = []
     if DISABLE_FP16:
@@ -115,9 +114,7 @@ ext_modules.append(
                     "-ppu-force-vregrr=true",
                     "-DUSE_PPU",
                     "-DUSE_AIU=1",
-                    "-DACOMPUTE_VERSION=10000",
-                    "-mllvm",
-                    "-ppu-simt-branch=false"
+                    "-DACOMPUTE_VERSION=10000"
                     # "-mllvm",
                     # "-ppu-indvars-instr-sink-ctrl=true
                 ]

@@ -1075,6 +1075,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_params params) {
     int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
 
 #pragma unroll 1
+#pragma clang loop licm(disable)
     for (int batch_id = begin_idx; batch_id <= end_idx; ++batch_id) {
         const int n_split_idx = batch_id == begin_idx ? begin_n_split_idx : 0;
         const int seqlen_k = __ldg(params.cu_seqlens_k + batch_id);
