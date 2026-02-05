@@ -277,6 +277,8 @@ def main(torch_dtype):
     torch.set_default_device(device)
     torch.cuda.set_device(device)
 
+    first_case = [TestParam(1, 1, 4096, False, False, True, 2048, test_performance=False, h_q=128)]
+
     correctness_cases = [
         TestParam(b, s_q, s_k, is_varlen, is_causal, is_fp8, topk, test_performance=False, h_q=h_q)
         for b in [1, 2, 6, 64]
@@ -324,6 +326,7 @@ def main(torch_dtype):
         for s_k in [4096, 8192, 16384, 32768]
     ]
 
+    # testcases = first_case
     testcases = correctness_cases + corner_cases + performance_cases
 
     # Prune out unsupported cases

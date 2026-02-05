@@ -365,6 +365,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
 
 }
 
+#define CVT_OPT 1
 template<typename Kernel_traits, typename Params>
 __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     const Params &params, const int batch_id, const int bidh, const int m_block,
@@ -393,7 +394,11 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     const int s_q_idx = m_block / cute::ceil_div(params.ngroups, kBlockM);
     const int row_base = h_k_idx * kBlockM + s_q_idx * params.ngroups;
     const int warp_idx = cutlass::canonical_warp_idx_sync();
+#if CVT_OPT
+    using KVCacheGmem = KVCacheG2SFP8<kBlockN, Kernel_traits::kNThreads>;
+#else
     using KVCacheGmem = KVCacheGmemFP8<kBlockN, Kernel_traits::kNThreads>;
+#endif
     using ElementKVCache = typename KVCacheGmem::ElementKVCache;
     using SmemLayoutKNoAiu = typename KVCacheGmem::SmemLayoutK;
     using SmemLayoutVtransposedNoAiu = typename KVCacheGmem::SmemLayoutVtransposed;
@@ -530,12 +535,11 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     KVCacheGmem kvload_gmem(tidx, gIndices, gK_base, params.page_block_size,
         params.k_batch_stride, params.k_row_stride);
 
+#if CVT_OPT
+    kvload_gmem.template load_g2s_async(n_block, kv_store_num, smem_valid_indices, sK);
+#else
     kvload_gmem.template load_from_gmem(n_block, kv_store_num, smem_valid_indices, sK);
-    // if constexpr (IsFP8) {
-    //     kvload_gmem.template load_from_gmem(n_block, kv_store_num, smem_valid_indices, sK);
-    // } else {
-    //     kvload_gmem.template load_from_gmem(n_block, kv_store_num, smem_valid_indices, sK);
-    // }
+#endif
     kv_store_num++;
     cute::cp_async_fence();
 
@@ -556,7 +560,23 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     for (; n_block < n_block_max; ++n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_s, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
+#if CVT_OPT
+        auto sK_cvt = kv_store_num % 2 == 1 ? sK : sK_double;
+        auto sK_load = kv_store_num % 2 == 0 ? sK : sK_double;
+        auto Scale = kv_store_num % 2 == 1 ? kvload_gmem.tKrScale(_, 0) : kvload_gmem.tKrScale(_, 1);
+        if (n_block < n_block_max - 1) {
+            kvload_gmem.template load_g2s_async(n_block + 1, kv_store_num, smem_valid_indices, sK_load);
+            cute::cp_async_fence();
+            kv_store_num++;
+            flash::cp_async_wait<1>();
+        } else {
+            flash::cp_async_wait<0>();
+        }
 
+        __syncthreads();
+        kvload_gmem.template cvt_fp8_store(sK_cvt, sK_cvt, Scale);
+        __syncthreads();
+#else
         flash::cp_async_wait<0>();
         __syncthreads();
 
@@ -571,6 +591,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
             cute::cp_async_fence();
             kv_store_num++;
         }
+#endif
 
         // determine use kv buffer 0 or 1
         auto tSsK_current = kv_load_num % 2 == 0 ? tSsK : tSsK_double;
