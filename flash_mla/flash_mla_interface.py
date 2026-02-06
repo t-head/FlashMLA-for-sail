@@ -1,8 +1,37 @@
 from typing import Optional, Tuple
+import dataclasses
 
 import torch
 
 import flash_mla_cuda
+
+@dataclasses.dataclass
+class FlashMLASchedMeta:
+    """
+    A class that stores the tile scheduler metadata of FlashMLA
+    """
+
+    @dataclasses.dataclass
+    class Config:
+        b: int
+        s_q: int
+        h_q: int
+        page_block_size: int
+        h_k: int
+
+        causal: bool
+        is_fp8_kvcache: bool
+        topk: Optional[int]
+
+        extra_page_block_size: Optional[int]
+        extra_topk: Optional[int]
+
+    have_initialized: bool = False
+
+    config: Optional[Config] = None
+
+    tile_scheduler_metadata: Optional[torch.Tensor] = None   # (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
+    num_splits: Optional[torch.Tensor] = None                # (1), dtype torch.int32.
 
 
 def get_mla_metadata(
