@@ -149,7 +149,7 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, ba
                 2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", output_name, backend, case, log_file)
         else:
             metrics_string = "gpu__time_duration.sum,sm__cycles_active.max,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,lts__t_sector_hit_rate.pct,dram__throughput.avg.pct_of_peak_sustained_elapsed" if dev=="gpu" else \
-                             "ppu__time_duration.sum,ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,l2__transaction_hit_rate.pct,ppu__dram_throughput.avg.pct_of_peak_sustained_elapsed".format("fp16" if "fp16" in case else "bf16")
+                             "ppu__time_duration.sum,ce__cycles_active.max,cu__inst_executed_pipe_tensor_{}.avg.pct_of_peak_sustained_active,l2__requests_hit_rate.pct,ppu__dram_throughput.avg.pct_of_peak_sustained_elapsed".format("fp16" if "fp16" in case else "bf16")
             cmd = '{} --clock-control none --metrics="{}"  \
                 --page=details python ./run_flash_mla.py --backend={} --format="{}" \
                 2>&1 | tee -a {}'.format("ncu" if dev == "gpu" else "acu", metrics_string, backend, case, log_file)
