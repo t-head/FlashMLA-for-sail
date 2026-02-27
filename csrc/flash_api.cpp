@@ -19,6 +19,24 @@
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+struct GraphCaptureModeSuspender {
+    cudaStreamCaptureMode original_mode;
+
+    explicit GraphCaptureModeSuspender(cudaStreamCaptureMode relaxed_mode = cudaStreamCaptureModeRelaxed) {
+        original_mode = relaxed_mode;
+        // Exchange current thread's mode with relaxed_mode, and store previous mode in original_mode
+        cudaThreadExchangeStreamCaptureMode(&original_mode);
+    }
+
+    ~GraphCaptureModeSuspender() {
+        // Restore the saved original mode back to the current thread
+        cudaThreadExchangeStreamCaptureMode(&original_mode);
+    }
+
+    // Disable copying to prevent accidental double-restoration
+    GraphCaptureModeSuspender(const GraphCaptureModeSuspender&) = delete;
+    GraphCaptureModeSuspender& operator=(const GraphCaptureModeSuspender&) = delete;
+};
 
 std::vector<at::Tensor>
 mha_fwd_kvcache_mla(
@@ -174,31 +192,62 @@ mha_fwd_kvcache_mla(
         // check if cuda graph captured
         cudaStreamCaptureStatus captureStatus;
         cudaStreamIsCapturing(stream, &captureStatus);
+
+        std::string seqlen_kv_str;
         if (captureStatus != cudaStreamCaptureStatusNone) {
-            printf("dump info not supported in cuda graph mode\n");
+            // printf("dump info not supported in cuda graph mode\n");
+            GraphCaptureModeSuspender protector(cudaStreamCaptureModeRelaxed);
+
+            cudaStream_t side_stream;
+            // Create a temporary side stream not associated with the capture
+            if (cudaStreamCreateWithFlags(&side_stream, cudaStreamNonBlocking) == cudaSuccess) {
+                std::vector<int> tmp(params.b);
+
+                // Perform Device-to-Host copy on the side stream
+                // This won't be recorded in the graph
+                cudaMemcpyAsync(tmp.data(), params.cu_seqlens_k, sizeof(int) * params.b, cudaMemcpyDeviceToHost, side_stream);
+
+                // Synchronize the side stream (Safe because of Relaxed mode)
+                cudaStreamSynchronize(side_stream);
+
+                // Construct the string for profiling/UT analysis
+                std::ostringstream oss;
+                oss << "[";
+                for (int i = 0; i < params.b; ++i) {
+                    oss << tmp[i];
+                    if (i < params.b - 1) oss << ",";
+                }
+                oss << "]";
+                seqlen_kv_str = oss.str();
+
+                cudaStreamDestroy(side_stream);
+            }
         } else {
 
-            int* tmp = new int[params.b];
-            cudaMemcpyAsync(tmp, params.cu_seqlens_k, sizeof(int) * params.b, cudaMemcpyDeviceToHost, stream);
+            std::vector<int> tmp(params.b);
+            cudaMemcpyAsync(tmp.data(), params.cu_seqlens_k, sizeof(int) * params.b, cudaMemcpyDeviceToHost, stream);
+
+            cudaStreamSynchronize(stream);
+
             std::ostringstream oss;
             oss << "[";
-            for (int i = 0; i < int(params.b); ++i) {
+            for (int i = 0; i < params.b; ++i) {
                 oss << tmp[i];
-                if (i < int(params.b) - 1) oss << ",";
+                if (i < params.b - 1) oss << ",";
             }
             oss << "]";
-            free(tmp);
-            // printf("oss:%s\n", oss.str().c_str());
+            seqlen_kv_str = oss.str();
 
-            fmha_prof_params.set_flash_attn_params(
+        }
+
+        fmha_prof_params.set_flash_attn_params(
                 q_dtype == torch::kBFloat16/*data_type*/,
                 params.is_causal/*custom_mask*/, params.b/*batch_size*/,
                 num_heads_ori/*num_heads*/, num_heads_k/*num_heads_k*/,
                 params.d/*head_dim*/, params.d_v/*head_dim_value*/,
-                seqlen_q_ori/*seqlen_q*/, oss.str()/*seqlen_kv*/,
+                seqlen_q_ori/*seqlen_q*/, seqlen_kv_str/*seqlen_kv*/,
                 topk, is_fp8
             );
-        }
     }
 
     // tile_scheduler
@@ -614,30 +663,59 @@ mha_fwd_kvcache_mla_with_workspace(
         // check if cuda graph captured
         cudaStreamCaptureStatus captureStatus;
         cudaStreamIsCapturing(stream, &captureStatus);
-        if (captureStatus != cudaStreamCaptureStatusNone) {
-            printf("dump info not supported in cuda graph mode\n");
-        } else {
 
-            int* tmp = new int[params.b];
-            cudaMemcpyAsync(tmp, params.cu_seqlens_k, sizeof(int) * params.b, cudaMemcpyDeviceToHost, stream);
+        std::string seqlen_kv_str;
+        if (captureStatus != cudaStreamCaptureStatusNone) {
+            // printf("dump info not supported in cuda graph mode\n");
+            GraphCaptureModeSuspender protector(cudaStreamCaptureModeRelaxed);
+
+            cudaStream_t side_stream;
+            // Create a temporary side stream not associated with the capture
+            if (cudaStreamCreateWithFlags(&side_stream, cudaStreamNonBlocking) == cudaSuccess) {
+                std::vector<int> tmp(params.b);
+
+                // Perform Device-to-Host copy on the side stream
+                // This won't be recorded in the graph
+                cudaMemcpyAsync(tmp.data(), params.cu_seqlens_k, sizeof(int) * params.b, cudaMemcpyDeviceToHost, side_stream);
+
+                // Synchronize the side stream (Safe because of Relaxed mode)
+                cudaStreamSynchronize(side_stream);
+
+                // Construct the string for profiling/UT analysis
+                std::ostringstream oss;
+                oss << "[";
+                for (int i = 0; i < params.b; ++i) {
+                    oss << tmp[i];
+                    if (i < params.b - 1) oss << ",";
+                }
+                oss << "]";
+                seqlen_kv_str = oss.str();
+
+                cudaStreamDestroy(side_stream);
+            }
+        } else {
+            std::vector<int> tmp(params.b);
+            cudaMemcpyAsync(tmp.data(), params.cu_seqlens_k, sizeof(int) * params.b, cudaMemcpyDeviceToHost, stream);
+
+            cudaStreamSynchronize(stream);
+
             std::ostringstream oss;
             oss << "[";
-            for (int i = 0; i < int(params.b); ++i) {
+            for (int i = 0; i < params.b; ++i) {
                 oss << tmp[i];
-                if (i < int(params.b) - 1) oss << ",";
+                if (i < params.b - 1) oss << ",";
             }
             oss << "]";
-            free(tmp);
-            // printf("oss:%s\n", oss.str().c_str());
+            seqlen_kv_str = oss.str();
+        }
 
-            fmha_prof_params.set_flash_attn_params(
+        fmha_prof_params.set_flash_attn_params(
                 q_dtype == torch::kFloat16/*data_type*/,
                 params.is_causal/*custom_mask*/, params.b/*batch_size*/,
                 num_heads_ori/*num_heads*/, num_heads_k/*num_heads_k*/,
                 params.d/*head_dim*/, params.d_v/*head_dim_value*/,
-                seqlen_q_ori/*seqlen_q*/, oss.str()/*seqlen_kv*/
+                seqlen_q_ori/*seqlen_q*/, seqlen_kv_str/*seqlen_kv*/
             );
-        }
     }
 
     // tile_scheduler
@@ -766,16 +844,12 @@ std::vector<at::Tensor> sparse_prefill_fwd(
         // check if cuda graph captured
         cudaStreamCaptureStatus captureStatus;
         cudaStreamIsCapturing(params.stream, &captureStatus);
-        if (captureStatus != cudaStreamCaptureStatusNone) {
-            printf("dump info not supported in cuda graph mode\n");
-        } else {
-            fmha_prof_params.set_flash_attn_sparse_prefill_params(
-                q.dtype() == torch::kBFloat16/*data_type*/,
-                params.h_q/*num_heads*/, params.h_kv/*num_heads_k*/,
-                params.d_qk/*head_dim*/, params.d_v/*head_dim_value*/,
-                params.s_q/*seqlen_q*/, params.s_kv/*seqlen_k*/, params.topk
-            );
-        }
+        fmha_prof_params.set_flash_attn_sparse_prefill_params(
+            q.dtype() == torch::kBFloat16/*data_type*/,
+            params.h_q/*num_heads*/, params.h_kv/*num_heads_k*/,
+            params.d_qk/*head_dim*/, params.d_v/*head_dim_value*/,
+            params.s_q/*seqlen_q*/, params.s_kv/*seqlen_k*/, params.topk
+        );
     }
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
     run_sparse_prefill_fwd_dispatch<cutlass::bfloat16_t>(params);
