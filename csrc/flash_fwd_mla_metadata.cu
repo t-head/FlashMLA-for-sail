@@ -6,8 +6,6 @@
 #include "flash.h"
 #include "hardware_info.h"
 
-static constexpr int MaxBatchSize = 4096;
-
 __global__ void __launch_bounds__(32, 1, 1)
 get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
     int *seqlens_k_ptr = params.seqlens_k_ptr;
@@ -82,7 +80,6 @@ get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
 }
 
 void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream) {
-    FLASH_ASSERT(params.batch_size < MaxBatchSize);
     int smem_size = sizeof(int) * (params.batch_size*3+1);
     CHECK_CUDA(cudaFuncSetAttribute(get_mla_metadata_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     get_mla_metadata_kernel<<<1, 32, smem_size, stream>>>(params);
