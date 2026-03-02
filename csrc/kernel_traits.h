@@ -78,7 +78,7 @@ struct Flash_kernel_traits {
     // using SmemCopyOpQt = PPU_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, true, true, 1>;
     // using SmemCopyAtomQt = Copy_Atom<SmemCopyOpQt, elem_type>;
 
-    using SmemCopyOpK = PPU_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, true, false, 1>;
+    using SmemCopyOpK = PPU_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, true, false, kHeadDim_ / kBlockKSmem>;
     using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, elem_type>;
 
     // using SmemCopyOpKVt = Acompute10000_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, false, true>;
@@ -99,6 +99,7 @@ struct Flash_kernel_traits {
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
          int kHeadDimV_ = kHeadDim_,
          bool CrossCut_ = false, bool USE_MMA_M8_ = true, int AtomLayoutQ_ = kNWarps_, int AtomLayoutP_ = kNWarps_,
+         int kStages_ = 2,
          typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, USE_MMA_M8_, elem_type>>
 struct Flash_fwd_kernel_traits : public Base {
     using Element = typename Base::Element;
@@ -111,6 +112,7 @@ struct Flash_fwd_kernel_traits : public Base {
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * 32;
+    static constexpr int kStages = kStages_;
 
     /// only for CrossCut ///
 // #if ACOMPUTE_VERSION > 10000
@@ -139,12 +141,14 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kSwizzleV = kBlockKSmemV == 32 ? 2 : 3;
 
 #if USE_AIU
-    using SmemCopyOpVt = PPU_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmemV, true, true, 1>;
+    using SmemCopyOpVt = PPU_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmemV, true, true, kHeadDim / kBlockKSmemV>;
     using SmemCopyAtomVt = Copy_Atom<SmemCopyOpVt, elem_type>;
 #else
     using SmemCopyAtomVt = SmemCopyAtomTransposed;
 #endif
 
+
+    static_assert((CrossCut && kStages==3) || kStages == 2, "kStages can be 2 or 3 if CrossCut.");
     /// only for CrossCut ///
     static_assert(!CrossCut || kNWarps % AtomLayoutQ == 0, "kNWarps must be a multiple of AtomLayoutQ if CrossCut");
     static_assert(!CrossCut || kNWarps % AtomLayoutP == 0, "kNWarps must be a multiple of AtomLayoutP if CrossCut");
@@ -191,34 +195,16 @@ struct Flash_fwd_kernel_traits : public Base {
         SmemLayoutAtomV{},
         Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
 
-//     using SmemLayoutKnew = decltype(tile_to_shape(
-//         SmemLayoutAtomQ{},
-//         Shape<Int<kBlockN>, Int<kHeadDim>, Int<kStages>>{}));
-//     using SmemLayoutVnew = decltype(tile_to_shape(
-//         SmemLayoutAtomV{},
-//         Shape<Int<kBlockN>, Int<kHeadDimV>, Int<kStages>>{}));
-
-// //     using SmemLayoutVnew = Layout<decltype(shape(SmemLayoutVnew0{})),
-// //     decltype(replace<2>(stride(SmemLayoutVnew0{}), Int<kBlockN*kHeadDim>{}))
-// //     >;
-
-
-//     using SmemLayoutVtnew0 = decltype(
-//         composition(SmemLayoutV{}, make_ordered_layout(
-//                 Shape<Int<kHeadDimV>, Int<kBlockN>, Int<kStages>>{},
-//                 Step<_2, _1, _3>{})));
-//     using SmemLayoutVtnew = Layout<decltype(shape(SmemLayoutVtnew0{})),
-//     decltype(replace<2>(stride(SmemLayoutVtnew0{}), Int<kBlockN*kHeadDim>{}))
-//     >;
-//     // using SmemLayoutVtnew1 = decltype(
-//     //     composition(SmemLayoutVnew{}, make_layout(
-//     //     Shape<Int<kHeadDim>, Int<kBlockN>, Int<kStages>>{},
-//     //     Stride<Int<kBlockN>, _1, Int<kBlockN*kHeadDim>>{}
-//     //    )));
-
-// // print_layout(SmemLayoutVtnew{});
-
-
+    using SmemLayoutKstages = decltype(tile_to_shape(
+        SmemLayoutAtomQ{},
+        Shape<Int<kBlockN>, Int<kHeadDim>, Int<kStages>>{}));
+    using SmemLayoutVstages = decltype(tile_to_shape(
+        SmemLayoutAtomV{},
+        Shape<Int<kBlockN>, Int<kHeadDimV>, Int<kStages>>{}));
+    using SmemLayoutVtstage= decltype(
+        composition(SmemLayoutVstages{}, make_ordered_layout(
+                Shape<Int<kHeadDimV>, Int<kBlockN>, Int<kStages>>{},
+                Step<_2, _1, _3>{})));
 
     // https://github.com/ColfaxResearch/cutlass-kernels/blob/a222587e6d59b93ba704853d3946fb686d8b8892/src/fmha/fmha_forward.cu#L434
     using SmemLayoutVtransposed = decltype(
@@ -262,7 +248,8 @@ struct Flash_fwd_kernel_traits : public Base {
 
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     // static constexpr int kSmemKVSize = (size(SmemLayoutK{}) + size(SmemLayoutV{})) * sizeof(Element);
-    static constexpr int kSmemKVSize = (size(SmemLayoutK{}) * 2) * sizeof(Element);
+    // static constexpr int kSmemKVSize = (size(SmemLayoutK{}) * kStages) * sizeof(Element);
+    static constexpr int kSmemKVSize = size(SmemLayoutKstages{}) * sizeof(Element);
     static constexpr int OSmemSize = size(SmemLayoutO{}) * sizeof(Element);
     static constexpr int OSmemSizeAccum = size(SmemLayoutO{}) * sizeof(ElementAccum);
 

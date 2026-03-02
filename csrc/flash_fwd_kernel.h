@@ -567,6 +567,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     constexpr int AtomLayoutP = Kernel_traits::AtomLayoutP;
     constexpr bool USE_MMA_M8 = Kernel_traits::USE_MMA_M8;
     constexpr int MMA_ATOM_M = USE_MMA_M8 ? 8 : 16;
+    constexpr int kStages = Kernel_traits::kStages;
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
@@ -622,17 +623,13 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
-    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), typename Kernel_traits::SmemLayoutK{});
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), typename Kernel_traits::SmemLayoutKstages{});
+    Tensor sVt = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtstage{});
 
-    // double shared memory for k/v cache.
-    Tensor sK_double = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutK{});
-
-    Tensor sVt = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtransposed{});
-    Tensor sVt_double = make_tensor(sK_double.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     // sVtNoSwizzle
     Tensor sVtNoSwizzle = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
-    Tensor sP = make_tensor(sK_double.data() + size(sK_double), typename Kernel_traits::SmemLayoutP{});
+    Tensor sP = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutP{});
 
     Tensor smem_row_scale = make_tensor(make_smem_ptr(reinterpret_cast<float *>((sP.data() + size(sP)).get())),
         Shape<Int<kBlockM>>{}, Stride<_1>{});
@@ -650,12 +647,11 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
     Tensor tKgK = gmem_thr_copy_K.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K)
     Tensor tKsK = gmem_thr_copy_K.partition_D(sK);
-    Tensor tKsK_double = gmem_thr_copy_K.partition_D(sK_double);
 
     typename Kernel_traits::TiledMmaS tiled_mma_s;
     auto thr_mma_s = tiled_mma_s.get_thread_slice(tidx);
     Tensor tSrQ  = thr_mma_s.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
-    Tensor tSrK  = thr_mma_s.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
+    Tensor tSrK  = thr_mma_s.partition_fragment_B(sK(_, _, _0{}));               // (MMA,MMA_N,MMA_K)
 
     typename Kernel_traits::TiledMma tiled_mma_o;
     auto thr_mma_o = tiled_mma_o.get_thread_slice(tidx);
@@ -734,22 +730,20 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomK{}, tiled_mma_s);
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tid_thread_slice);
     auto tSsK = smem_thr_copy_K.partition_S(make_mix_tensor_like(sK));
-    auto tSsK_double = smem_thr_copy_K.partition_S(make_mix_tensor_like(sK_double));
 
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomVt{}, tiled_mma_o);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tid_thread_slice);
-
     auto tOsVt = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt));
-    auto tOsVt_double = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt_double));
 
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+    auto tKsK_current = tKsK(_, _, _, kv_store_num);
     if (!have_zero_seqlen_k)
-    flash::copy<Is_even_MN, true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
-    kv_store_num ^=1;
+    flash::copy<Is_even_MN, true>(gmem_tiled_copy_K, tKgK, tKsK_current, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
 
+    kv_store_num = kv_store_num < kStages -1 ? kv_store_num + 1 : 0;
     cute::cp_async_fence();
 
-#if ACOMPUTE_VERSION == 10000
+#if 0 //ACOMPUTE_VERSION == 10000
     // FIXME: (810/810E) cur_block_table is given in LINE #605
     // But it should be redefined here to avoid random fail
     // for cases like: batch & sk are large, sq2, hq128,hkv1,d576,dv512,causalTrue
@@ -760,6 +754,25 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     int nxt_block_table = GET_BLOCK_INDEX((n_block - 1), block_table_idx_nxt);
     index_t table_diff = ((block_table_idx - block_table_idx_nxt) * page_block_size - kBlockN) * params.k_row_stride
                        + (nxt_block_table - cur_block_table) * params.k_batch_stride;
+
+    auto KV_load = [&](int const n_block_load){
+        if (n_block_load >= n_block_min) {
+            auto tKsK_current = tKsK(_, _, _, kv_store_num);
+            if (block_table) {
+                tKgK.data() = tKgK.data() + table_diff;
+            } else if (hllm_block_table) {
+                // index_t table_index_diff = reinterpret_cast<Element *>(hllm_block_table[block_table_idx_nxt]) - reinterpret_cast<Element *>(hllm_block_table[block_table_idx]);
+                index_t table_index_diff = reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx_nxt)) - reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx));
+                tKgK.data() = tKgK.data() + table_diff + table_index_diff;
+            } else {
+                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            }
+            flash::copy</*Is_even_MN=*/true, true>(gmem_tiled_copy_K, tKgK, tKsK_current, tKcK, tKpK);
+            kv_store_num = kv_store_num < kStages -1 ? kv_store_num + 1 : 0;
+        }
+        cute::cp_async_fence();
+    };
+
     // table_offset_diff < 2 * params.page_block_size * params.k_row_stride
 
     // table_offset_diff = (block_table_offset_next - block_table_offset_cur) * params.k_row_stride
@@ -778,6 +791,18 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
     }
 
+    // #pragma unroll
+    // for(int stage = 1; stage < kStages-1; stage ++) {
+    if constexpr (kStages == 3) {
+        KV_load(n_block - 1);
+        cur_block_table = nxt_block_table;
+        block_table_idx = block_table_idx_nxt;
+        block_table_idx_nxt = (n_block - 2) * kBlockN / page_block_size;
+        nxt_block_table = GET_BLOCK_INDEX((n_block - 2), block_table_idx_nxt);
+        table_diff = ((block_table_idx - block_table_idx_nxt) * page_block_size - kBlockN) * params.k_row_stride
+                + (nxt_block_table - cur_block_table) * params.k_batch_stride;
+    }
+
     clear(acc_o);
 
     flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, AtomLayoutP, kNWarps/AtomLayoutQ> softmax;
@@ -792,52 +817,26 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         Tensor acc_s = partition_fragment_C(tiled_mma_s, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
 
-        __syncthreads();
-
-        if (n_block > n_block_min) { // doble buffer for next part
-            auto tKsK_current = kv_store_num ? tKsK_double : tKsK;
-            // Advance gK
-            if (block_table) {
-                tKgK.data() = tKgK.data() + table_diff;
-            } else if (hllm_block_table) {
-                // index_t table_index_diff = reinterpret_cast<Element *>(hllm_block_table[block_table_idx_nxt]) - reinterpret_cast<Element *>(hllm_block_table[block_table_idx]);
-                index_t table_index_diff = reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx_nxt)) - reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx));
-                tKgK.data() = tKgK.data() + table_diff + table_index_diff;
-            } else {
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
-            }
-
-            flash::copy</*Is_even_MN=*/true, true>(gmem_tiled_copy_K, tKgK, tKsK_current, tKcK, tKpK);
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
-            kv_store_num ^=1;
-
-            flash::cp_async_wait<1>();
-        } else {
-            flash::cp_async_wait<0>();
+        if (masking_step > 0){
+            __syncthreads();
         }
+
+        KV_load(n_block - kStages + 1);
+        flash::cp_async_wait<kStages-1>();
         __syncthreads();
 
         block_table_idx = block_table_idx_nxt;
         cur_block_table = nxt_block_table;
 #if ACOMPUTE_VERSION == 10000
         // see aone: https://project.aone.alibaba-inc.com/v2/project/996329/bug/78269863
-        cur_block_table = GET_BLOCK_INDEX((n_block - 1), block_table_idx);
+        cur_block_table = GET_BLOCK_INDEX((n_block - kStages + 1), block_table_idx);
 #endif
-        block_table_idx_nxt = (n_block - 2) * kBlockN / page_block_size;
-        nxt_block_table = GET_BLOCK_INDEX((n_block - 2), block_table_idx_nxt);
-        table_diff = ((block_table_idx - block_table_idx_nxt) * page_block_size - kBlockN) * params.k_row_stride
-                   + (nxt_block_table - cur_block_table) * params.k_batch_stride;
-        // determine use kv buffer 0 or 1
-        // auto tSsK_current = kv_load_num == 0 ? tSsK : tSsK_double;
-        // auto tOsVt_current = kv_load_num == 0 ? tOsVt : tOsVt_double;
-        auto tSsK_current = kv_load_num ? tSsK_double : tSsK;
-        auto tOsVt_current = kv_load_num ? tOsVt_double : tOsVt;
+        block_table_idx_nxt = (n_block - kStages) * kBlockN / page_block_size;
+        nxt_block_table = GET_BLOCK_INDEX((n_block - kStages), block_table_idx_nxt);
 
         if (!have_zero_seqlen_k)
         flash::gemm<Kernel_traits::Is_Q_in_regs>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
+            acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, kv_load_num), tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
 
@@ -865,13 +864,16 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         cute::copy(smem_tiled_copy_S, tSaS, tSsS);
         __syncthreads();
 
+        // table_diff move here to avoid Stall Memory Dependency of  s.wait sldcnt(0).
+        table_diff = ((block_table_idx - block_table_idx_nxt) * page_block_size - kBlockN) * params.k_row_stride
+                   + (nxt_block_table - cur_block_table) * params.k_batch_stride;
         if (masking_step > 0) {
             softmax.template softmax_rescale_o(acc_o, smem_row_scale);
         }
         if (!have_zero_seqlen_k)
-        flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_current, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
+        flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
             smem_thr_copy_P, smem_thr_copy_V);
-        kv_load_num ^=1;
+        kv_load_num = kv_load_num < kStages -1 ? kv_load_num + 1 : 0;
 
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
@@ -884,50 +886,25 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_s, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
-
         __syncthreads();
 
-        if (n_block > n_block_min) {
-            // Advance gK
-            auto tKsK_current = kv_store_num ? tKsK_double : tKsK;
-            if (block_table) {
-                tKgK.data() = tKgK.data() + table_diff;
-            } else if (hllm_block_table) {
-                // index_t table_index_diff = reinterpret_cast<Element *>(hllm_block_table[block_table_idx_nxt]) - reinterpret_cast<Element *>(hllm_block_table[block_table_idx]);
-                index_t table_index_diff = reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx_nxt)) - reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx));
-                tKgK.data() = tKgK.data() + table_diff + table_index_diff;
-            } else {
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
-            }
-            flash::copy</*Is_even_MN=*/true, true>(gmem_tiled_copy_K, tKgK, tKsK_current, tKcK, tKpK);
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
-            kv_store_num ^=1;
-
-            flash::cp_async_wait<1>();
-        } else {
-            flash::cp_async_wait<0>();
-        }
+        KV_load(n_block - kStages + 1);
+        flash::cp_async_wait<kStages-1>();
         __syncthreads();
 
         block_table_idx = block_table_idx_nxt;
         cur_block_table = nxt_block_table;
 #if ACOMPUTE_VERSION == 10000
         // see aone: https://project.aone.alibaba-inc.com/v2/project/996329/bug/78269863
-        cur_block_table = GET_BLOCK_INDEX((n_block - 1), block_table_idx);
+        cur_block_table = GET_BLOCK_INDEX((n_block - kStages + 1), block_table_idx);
 #endif
-        block_table_idx_nxt = (n_block - 2) * kBlockN / page_block_size;
-        nxt_block_table = GET_BLOCK_INDEX((n_block - 2), block_table_idx_nxt);
-        table_diff = ((block_table_idx - block_table_idx_nxt) * page_block_size - kBlockN) * params.k_row_stride
-                   + (nxt_block_table - cur_block_table) * params.k_batch_stride;
-
-        // determine use kv buffer 0 or 1
-        auto tSsK_current = kv_load_num ? tSsK_double : tSsK;
-        auto tOsVt_current = kv_load_num ? tOsVt_double : tOsVt;
+        block_table_idx_nxt = (n_block - kStages) * kBlockN / page_block_size;
+        nxt_block_table = GET_BLOCK_INDEX((n_block - kStages), block_table_idx_nxt);
+        // table_diff = ((block_table_idx - block_table_idx_nxt) * page_block_size - kBlockN) * params.k_row_stride
+        //            + (nxt_block_table - cur_block_table) * params.k_batch_stride;
 
         flash::gemm<Kernel_traits::Is_Q_in_regs>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
+            acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, kv_load_num), tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
 
@@ -937,11 +914,15 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         Tensor tSaS = smem_thr_copy_S.retile_S(rS);
         cute::copy(smem_tiled_copy_S, tSaS, tSsS);
         __syncthreads();
+
+        table_diff = ((block_table_idx - block_table_idx_nxt) * page_block_size - kBlockN) * params.k_row_stride
+                   + (nxt_block_table - cur_block_table) * params.k_batch_stride;
+
         softmax.template softmax_rescale_o(acc_o, smem_row_scale);
-        flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_current,
+        flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num),
             tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
             smem_thr_copy_P, smem_thr_copy_V);
-        kv_load_num ^=1;
+        kv_load_num = kv_load_num < kStages -1 ? kv_load_num + 1 : 0;
     }
 
     if (NoSplit) {

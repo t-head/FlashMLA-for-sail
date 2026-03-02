@@ -47,7 +47,7 @@ void printf_show_log(const void* kernel, Flash_fwd_params &params, const size_t 
             printf("blockM:%d, blockN:%d, threads:%d, params.num_splits:%d, block_size:%d\n",
                     Kernel_traits::kBlockM, Kernel_traits::kBlockN, Kernel_traits::kNThreads, params.num_splits, params.page_block_size);
             printf("Is_causal:%d, ngroups:%d\n", is_causal, params.ngroups);
-            printf("CrossCut:%d, USE_MMA_M8:%d\n", Kernel_traits::CrossCut, Kernel_traits::USE_MMA_M8);
+            printf("CrossCut:%d, USE_MMA_M8:%d, kStages:%d\n", Kernel_traits::CrossCut, Kernel_traits::USE_MMA_M8, Kernel_traits::kStages);
             printf("kNWarps:%d, AtomLayoutQ:%d, AtomLayoutP:%d\n", Kernel_traits::kNWarps, Kernel_traits::AtomLayoutQ, Kernel_traits::AtomLayoutP);
             printf("Is_Q_in_regs:%d, Share_Q_K_smem:%d\n", Kernel_traits::Is_Q_in_regs, Kernel_traits::Share_Q_K_smem);
             printf("seq[%d, %d], grid_n[%d, %d, %d]\n",
@@ -195,10 +195,11 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
         SEQLENG_SWITCH(params.seqlen_q, [&] {
             constexpr int AtomLayoutQ = kBlockM / 16;
             constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
+            constexpr int kStages = kBlockM <= 16 ? 3 : 2;
             constexpr int AtomLayoutP = 1;
             run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
                 Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
-                T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP, kStages
                 >, 1/*CrossCut*/>(params, stream);
         });
     }
