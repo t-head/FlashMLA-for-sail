@@ -130,7 +130,7 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
     # )
 
 
-def main(torch_dtype):
+def main(torch_dtype, loops = 1):
     device = torch.device("cuda:0")
     torch.set_default_dtype(torch_dtype)
     torch.set_default_device(device)
@@ -140,34 +140,37 @@ def main(torch_dtype):
 
     h_kv = 1
     d, dv = 576, 512
-    if 1:
-        if 0:
-            causal = True
-            b = 32
-            s = 8192
-            s_q = 1
-            h_q = 128
-            varlen = False
-            paged_block_size = 64
-            test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
+    for i in range(loops):
+        print(f'LOOP ROUND {i} START:')
+        if 1:
+            if 0:
+                causal = True
+                b = 32
+                s = 8192
+                s_q = 1
+                h_q = 128
+                varlen = False
+                paged_block_size = 64
+                test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
+            else:
+                for b in [1, 8, 32, 128]:
+                    for s in [256, 512, 1024, 4096, 8192]:
+                        for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
+                            for s_q in [1, 2]:  # MTP = 1, 2
+                                for varlen in [False, True]:
+                                    for paged_block_size in [16, 64, 256]:
+                                        for causal in [True, False]:
+                                            test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
         else:
-            for b in [1, 8, 32, 128]:
-                for s in [256, 512, 1024, 4096, 8192]:
-                    for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
-                        for s_q in [1, 2]:  # MTP = 1, 2
-                            for varlen in [False, True]:
-                                for paged_block_size in [16, 64, 256]:
+            for b in [1, 8, 128]:
+                for s in [4096, 8192]:
+                    for h_q in [16, 32]:  # TP = 8, 4, 2, 1
+                        for s_q in [1]:  # MTP = 1, 2
+                            for varlen in [True, False]:
+                                for paged_block_size in [64, 16, 256]:
                                     for causal in [True, False]:
                                         test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
-    else:
-        for b in [1, 8, 128]:
-            for s in [4096, 8192]:
-                for h_q in [16, 32]:  # TP = 8, 4, 2, 1
-                    for s_q in [1]:  # MTP = 1, 2
-                        for varlen in [True, False]:
-                            for paged_block_size in [64, 16, 256]:
-                                for causal in [True, False]:
-                                    test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, paged_block_size)
+        print(f'LOOP ROUND {i} FINISH')
 
 
 
@@ -189,10 +192,17 @@ if __name__ == "__main__":
         help="Data type to use for testing (bf16 or fp16)",
     )
 
+    parser.add_argument(
+        "--loops",
+        type=int,
+        default=1,
+        help="loop round num for precision test",
+    )
+
     args = parser.parse_args()
 
     torch_dtype = torch.bfloat16
     if args.dtype == "fp16":
         torch_dtype = torch.float16
 
-    main(torch_dtype)
+    main(torch_dtype, int(args.loops))
