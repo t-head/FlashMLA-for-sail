@@ -121,7 +121,8 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
     // constexpr static int kBlockM = 64;  // Fixed for all head dimensions
 
     bool cross_cut = use_cross_cut(params.seqlen_q, params.b);
-    bool warp_interleave = (params.seqlen_q >=128 && params.page_block_size == 64);
+
+    bool warp_interleave = params.seqlen_q >=128 && params.page_block_size == 64;
 // #if ACOMPUTE_VERSION==10000
     if (!is_sm89_or_newer()) {
         if (cross_cut) {
@@ -189,6 +190,11 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
         }
     } else {
 // #else
+        if (warp_interleave  && params.num_blocks > 40) {
+            // cta size small than sms do not use warp interleave since memory efficiency not good on 890.
+            run_flash_splitkv_mla_kernel<T, 89>(params, stream);
+            return;
+        }
         FLASH_ASSERT(cross_cut);
         constexpr bool USE_MMA_M8 = 0;
         constexpr static int kBlockN = 64;

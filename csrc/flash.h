@@ -42,6 +42,7 @@ struct Flash_fwd_params {
 
     int *__restrict__ tile_scheduler_metadata_ptr;
     int num_sm_parts;
+    int num_blocks;
     int *__restrict__ num_splits_ptr;
     int num_splits;  // For split-KV version
     int seqlen_k; // real kvsize.

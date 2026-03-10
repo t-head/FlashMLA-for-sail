@@ -100,6 +100,7 @@ mha_fwd_kvcache_mla(
 
     const int max_num_blocks_per_seq = block_table.size(1);
     const int num_blocks = kcache.size(0);
+
     const int page_block_size = kcache.size(1);
     const int num_heads_k = kcache.size(2);
     //const int seqlen_k = max_num_blocks_per_seq * page_block_size;
@@ -181,6 +182,7 @@ mha_fwd_kvcache_mla(
     params.block_table = block_table.data_ptr<int>();
     params.block_table_batch_stride = block_table.stride(0);
     params.page_block_size = page_block_size;
+    params.num_blocks = num_blocks;
     params.indices_batch_stride = is_sparse_attn ? indices->stride(0) : 0;
     params.indices_row_stride = is_sparse_attn ? indices->stride(1) : 0;
     //params.seqlen_k = seqlen_k;
@@ -652,6 +654,7 @@ mha_fwd_kvcache_mla_with_workspace(
     params.hllm_block_table = block_table.data_ptr<int64_t>();
     params.block_table_batch_stride = block_table.stride(0);
     params.page_block_size = page_block_size;
+    params.num_blocks = num_blocks;
     //params.seqlen_k = seqlen_k;
     params.workspace_ptr = workspace_ptr;
     params.max_workspace_size = max_workspace_size;
