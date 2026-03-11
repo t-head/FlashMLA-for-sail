@@ -321,6 +321,7 @@ int
 get_num_sm_parts(
     const int num_heads_per_head_k,
     const int num_heads_k,
+    const int batch,
     bool is_sparse_attn = false
 ) {
     // This should match the logic in the MLA kernel.
@@ -342,14 +343,17 @@ get_num_sm_parts(
         block_size_m = num_heads_per_head_k > 64 ? 128 : (num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 16 - 1) / 16 * 16: 64);
         occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : 1;
     } else {
-        // btv105 only use cross_cut method.
-        block_size_m = num_heads_per_head_k <= 16 ? 16 : (num_heads_per_head_k <= 32 ? 32 : 64);
+        // btv105 small head size use corss split
+        block_size_m = num_heads_per_head_k <= 16 ? 16 : num_heads_per_head_k <= 32 ? 32 : num_heads_per_head_k >= 128 ? 128 : 64;
         occupancy = 1;
     }
 // #endif
 
-    // int num_sm_parts = (occupancy * sm_count) / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
-    int num_sm_parts = (occupancy * sm_count) / gcd(cutlass::ceil_div(num_heads_per_head_k, block_size_m) * num_heads_k, occupancy * sm_count);
+    // to avoid too big empty sm split parts when batch is small
+    int num_sm_parts = num_heads_per_head_k > 128 && batch < 4 ?
+        (occupancy * sm_count) / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m) :
+        (occupancy * sm_count) / gcd(cutlass::ceil_div(num_heads_per_head_k, block_size_m) * num_heads_k, occupancy * sm_count);
+
     // make sure num_sm_parts <= 320 && can be divided by sm_count
     num_sm_parts = num_sm_parts <= 320 ? num_sm_parts : ((320 / sm_count) * sm_count);
     return num_sm_parts;
@@ -392,7 +396,7 @@ get_mla_metadata(
         // batch_size_per_head_k = seqlen_q_ori * batch_size;
     }
 
-    int num_sm_parts = get_num_sm_parts(num_tokens_per_head_k, num_heads_k, is_sparse_attn);
+    int num_sm_parts = get_num_sm_parts(num_tokens_per_head_k, num_heads_k, batch_size, is_sparse_attn);
 
     //static constexpr int block_size_n = 64;
     int block_size_n;
@@ -437,7 +441,7 @@ flash_mla_get_workspace_size(
     const int num_heads_k,
     const int head_size_v
 ) {
-    int num_sm_parts = get_num_sm_parts(num_heads_per_head_k, num_heads_k);
+    int num_sm_parts = get_num_sm_parts(num_heads_per_head_k, batch_size, num_heads_k);
 
     constexpr size_t size_per_elemnet_int = sizeof(int32_t);
     size_t metadata_workspace_size = size_per_elemnet_int * num_sm_parts * TileSchedulerMetaDataSize;
@@ -474,7 +478,7 @@ get_mla_metadata_with_workspace(
     int *seqlens_k_ptr = seqlens_k.data_ptr<int>();
     auto options = seqlens_k.options();
 
-    int num_sm_parts = get_num_sm_parts(num_heads_per_head_k, num_heads_k);
+    int num_sm_parts = get_num_sm_parts(num_heads_per_head_k, batch_size, num_heads_k);
 
     // static constexpr int block_size_n = 64;
     int block_size_n;
