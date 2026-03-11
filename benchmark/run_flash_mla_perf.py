@@ -22,6 +22,7 @@ if __name__ == '__main__':
     parser.add_argument('--format', default=None, type=str, required=False, help='the string of FA cases')
     parser.add_argument('--output', default="output", type=str, required=False, help='the output storing cycles of FA cases')
     parser.add_argument('--local', default=False, action="store_true", required=False, help='specify if run local')
+    parser.add_argument('--consecutive', default=False, action="store_true", required=False, help='specify if run_flahs_mla.py with caselist')
     parser.add_argument('--backend', default="flash_mla", type=str, required=False, help='specify backend, all, flash_mla, flash_infer, flash_mla_triton')
     parser.add_argument('--mode', default="metrics", type=str, choices=['metrics', 'full'], required=False, help='specify if run full ncu')
     parser.add_argument('--device', default=None, type=str, required=False, help='specify which device to run. 0 means gpu0. 0,3 means gpu0,1,2,3')
@@ -44,9 +45,9 @@ if __name__ == '__main__':
     if args.device == None:
         if args.backend == "all":
             for backend in ['flash_mla', 'flash_infer', 'flash_mla_triton'] :
-                run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, backend, args.mode)
+                run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, backend, args)
         else:
-            run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend, args.mode)
+            run_fa_cycle_on_device(fa_cases, args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend, args)
     else:
         devices = str_to_list(args.device)
         if len(devices) == 1 or len(devices) > 2:
@@ -59,6 +60,6 @@ if __name__ == '__main__':
         fa_cases_groups = split_list_into_groups(fa_cases, len(num_gpus))
         for i in range(len(num_gpus)):
             # 创建子进程并传递 GPU ID, 在worker中循环 backend的取值
-            p = mp.Process(target=worker, args=(num_gpus[i], fa_cases_groups[i], args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend, args.mode))
+            p = mp.Process(target=worker, args=(num_gpus[i], fa_cases_groups[i], args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend, args))
             p.start()
             processes.append(p)

@@ -14,18 +14,23 @@ try:
 except ImportError:
     print("Import triton failed, please install if need!")
 import argparse
-
+import atexit
+def cuda_sync_at_exit():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        print("CUDA synchronized on exit.")
+atexit.register(cuda_sync_at_exit)
 # pip install flashinfer-python
 from flash_mla import get_mla_metadata, flash_mla_with_kvcache, flash_mla_sparse_fwd
 import json
-
+from utils import read_cmds_from_file
 device_name = torch.cuda.get_device_name()
 USE_PPU = (device_name.lower().find("ppu") != -1) or (device_name.lower().find("zw") != -1)
 if not any(k in device_name.lower() for k in ['ppu','zw','nvidia']):
     print("Warning: Unrecognized device name: "+ device_name)
 
 FLASHINFER_BACKEND = "fa2" if USE_PPU else "fa3"
-
+ref_device='cuda'
 
 def quantize_k_cache(
     input_k_cache: torch.Tensor,    # (num_blocks, block_size, h_k, d)
@@ -187,7 +192,7 @@ def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_
     for seq_len in cache_seqlens[1:]:
         kv_indptr.append((seq_len + block_size - 1) // block_size + kv_indptr[-1])
 
-    q_indptr = torch.arange(0, b + 1, device='cpu').int() * s_q
+    q_indptr = torch.arange(0, b + 1, device=ref_device).int() * s_q
     kv_indptr = torch.tensor(kv_indptr, dtype=torch.int32)
     kv_indices = torch.tensor(kv_indices, dtype=torch.int32)
 
@@ -530,13 +535,12 @@ def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype, _b
     print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
 
     # q = torch.randn(b, s_q, h_q, d, device='cpu')
-    q = torch.randn(b, s_q, h_q, d, device='cpu')
+    q = torch.randn(b, s_q, h_q, d, device=ref_device)
     # q = torch.randn(b, s_q, h_q, d)
     block_size = _block_size
-    block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32,
-        device='cpu').view(b, max_seqlen_pad // block_size)
+    block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32, device=ref_device).view(b, max_seqlen_pad // block_size)
     # block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
-    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device='cpu')
+    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device=ref_device)
     # blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
 
     out_b, lse_b = target_func(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype)
@@ -556,17 +560,17 @@ def run_dsa_prefill(s_q, s_kv, h_q, h_kv, d, dv, topk, dtype):
     torch.manual_seed(0)
     random.seed(0)
 
-    q = torch.randn((s_q, h_q, d), device='cpu')
-    kv = torch.randn((s_kv, h_kv, d), device='cpu')
-    indices = torch.full((s_q, h_kv, topk), s_kv, dtype=torch.int32, device='cpu')
+    q = torch.randn((s_q, h_q, d), device=ref_device)
+    kv = torch.randn((s_kv, h_kv, d), device=ref_device)
+    indices = torch.full((s_q, h_kv, topk), s_kv, dtype=torch.int32, device=ref_device)
     for s in range(s_q):
         for h in range(h_kv):
             # NOTE We use the following method to generate indices so that most indices lies within [s_kv-20000, s_kv), which is more realistic for sparse attention
-            near_mask = torch.randint(0, 32, (min(topk, s_kv),)) < 31
-            cur_indices = torch.randperm(s_kv)[:topk]
-            cur_indices[near_mask] = torch.randint(max(0, s_kv - 20000), s_kv - 1, (near_mask.sum().item(),))
+            near_mask = torch.randint(0, 32, (min(topk, s_kv),), device=ref_device) < 31
+            cur_indices = torch.randperm(s_kv, device=ref_device)[:topk]
+            cur_indices[near_mask] = torch.randint(max(0, s_kv - 20000), s_kv - 1, (near_mask.sum().item(),), device=ref_device)
             if len(cur_indices) < topk:
-                cur_indices = torch.cat([cur_indices, torch.full((topk - len(cur_indices),), 2147480000)])
+                cur_indices = torch.cat([cur_indices, torch.full((topk - len(cur_indices),), 2147480000)], device=ref_device)
             cur_indices = cur_indices[torch.randperm(topk)]
             indices[s, h] = cur_indices
 
@@ -596,30 +600,30 @@ def run_dsa_decode(b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, topk, is_fp8
     max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
 
     # q = torch.randn(b, s_q, h_q, d, device='cpu')
-    q = torch.randn(b, s_q, h_q, d, device='cpu')
+    q = torch.randn(b, s_q, h_q, d, device=ref_device)
     # q = torch.randn(b, s_q, h_q, d)
     block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32,
-        device='cpu').view(b, max_seqlen_pad // block_size)
-    block_table = block_table.view(-1)[torch.randperm(block_table.numel(), device='cpu')].view(b, -1)
+        device=ref_device).view(b, max_seqlen_pad // block_size)
+    block_table = block_table.view(-1)[torch.randperm(block_table.numel(), device=ref_device)].view(b, -1)
 
     # block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
-    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device='cpu')
+    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device=ref_device)
     # blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
 
     # abs_indices = torch.empty(b, s_q, topk, dtype=torch.int32, device="cpu")
-    indices_in_kvcache = torch.empty(b, s_q, topk, dtype=torch.int32, device="cpu")
+    indices_in_kvcache = torch.empty(b, s_q, topk, dtype=torch.int32, device=ref_device)
     for i in range(b):
         # Generate indices
         for j in range(s_q):
-            cur_abs_indices = torch.randperm(int(cache_seqlens[i].item()), device="cpu")[:topk]
+            cur_abs_indices = torch.randperm(int(cache_seqlens[i].item()), device=ref_device)[:topk]
             cur_blocked_indices = block_table[i, cur_abs_indices // block_size] * block_size + (cur_abs_indices % block_size)
             if len(cur_abs_indices) < topk:
                 pad_len = topk - len(cur_abs_indices)
-                cur_abs_indices = torch.cat([cur_abs_indices, torch.full((pad_len,), -1, device='cpu')])
-                cur_blocked_indices = torch.cat([cur_blocked_indices, torch.full((pad_len,), -1, device='cpu')])
+                cur_abs_indices = torch.cat([cur_abs_indices, torch.full((pad_len,), -1, device=ref_device)])
+                cur_blocked_indices = torch.cat([cur_blocked_indices, torch.full((pad_len,), -1, device=ref_device)])
 
             # Mask KV
-            perm = torch.randperm(topk, device='cpu')
+            perm = torch.randperm(topk, device=ref_device)
             # cur_abs_indices = cur_abs_indices[perm]
             cur_blocked_indices = cur_blocked_indices[perm]
 
@@ -701,11 +705,11 @@ def get_params(input_str):
 
     if type(config_dict["seqlen_k"]) is int:
         # varlen
-        config_dict["cache_seqlens"] = torch.tensor([max(random.normalvariate(config_dict["seqlen_k"], config_dict["seqlen_k"] / 2), config_dict["seq_q"]) + i for i in range(config_dict["batch_size"])], dtype=torch.int32, device="cpu")
+        config_dict["cache_seqlens"] = torch.tensor([max(random.normalvariate(config_dict["seqlen_k"], config_dict["seqlen_k"] / 2), config_dict["seq_q"]) + i for i in range(config_dict["batch_size"])], dtype=torch.int32, device=ref_device)
         # fixlen
         # config_dict["cache_seqlens"] = torch.full((config_dict["batch_size"],), config_dict["seqlen_k"], dtype=torch.int32, device="cpu")
     else:
-        config_dict["cache_seqlens"] = torch.tensor(json.loads(config_dict["seqlen_k"]), dtype=torch.int32, device="cpu")
+        config_dict["cache_seqlens"] = torch.tensor(json.loads(config_dict["seqlen_k"]), dtype=torch.int32, device=ref_device)
 
     config_dict["dtype"] = torch.bfloat16 if config_dict["dtype"] == "bf16" else torch.half
 
@@ -713,35 +717,53 @@ def get_params(input_str):
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--format", type=str, required=True, default="--format=flash_mla:flash_mla,batch_size:1,seqlen:200,num_heads:128,num_heads_kv:1,head_dim:576,head_dim_v:512,causal:True,dtype:bf16",
+    parser.add_argument("--format", type=str, required=False, default=None,
                         help="use this option to pass fmha_params string.")
+    parser.add_argument("--caselist", type=str, required=False, help="input flashmla test caselist")
+    parser.add_argument("--case_idx", type=int, required=False, help="line index of flashmla case in caselist")
     parser.add_argument('--backend', default="flash_mla", type=str, required=False, help='specify backend, flash_mla, flash_infer, flash_mla_triton')
-
+    parser.add_argument("--ref_device", type=str, choices=['cuda', 'cpu'], help="where to initilize input" )
     args = parser.parse_args()
+    global ref_device
+    if args.ref_device:
+        ref_device = args.ref_device
     return args
 
 
 if __name__ == "__main__":
     args = get_args()
-
-    config = get_params(args.format)
-    if config["sparse"] == "prefill":
-        assert args.backend=="flash_mla", "DSA perf only support flash_mla"
-        perf = run_dsa_prefill(config["seqlen_q"], config["seqlen_k"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["topk"], config["dtype"])
-    elif config["sparse"] == "decode":
-        assert args.backend=="flash_mla", "DSA perf only support flash_mla"
-        if "block_size" not in config.keys():
-            config["block_size"] = 64
-
-        # FIXME: bf16 is not supported for CUDA. fp8 is not optimized for PPU.
-        if not USE_PPU:
-            config["is_fp8"] = 1
-        perf = run_dsa_decode(config["batch_size"], config["seq_q"], config["cache_seqlens"],
-                              config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"],
-                              config["causal"], config["topk"], config["is_fp8"], config["dtype"], config["block_size"])
+    mla_cases = list()
+    if args.format:
+        mla_cases = [args.format]
+    elif args.caselist:
+        mla_cases = read_cmds_from_file(args.caselist)
+        if len(mla_cases) == 0:
+            print("no mla_cases found")
+            exit(-1)
+        if args.case_idx:
+            mla_cases = [mla_cases[args.case_idx-1]]
     else:
-        config["mla"] = args.backend
-        if "block_size" not in config.keys():
-            config["block_size"] = 64
-        # exit(0)
-        perf = compare_a(config["mla"], config["batch_size"], config["seq_q"], config["cache_seqlens"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["causal"], config["dtype"], config["block_size"])
+        print("ERROR: must give --caselist or --format")
+        exit(1)
+    for item in mla_cases:
+        config = get_params(item)
+        if config["sparse"] == "prefill":
+            assert args.backend=="flash_mla", "DSA perf only support flash_mla"
+            perf = run_dsa_prefill(config["seqlen_q"], config["seqlen_k"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["topk"], config["dtype"])
+        elif config["sparse"] == "decode":
+            assert args.backend=="flash_mla", "DSA perf only support flash_mla"
+            if "block_size" not in config.keys():
+                config["block_size"] = 64
+
+            # FIXME: bf16 is not supported for CUDA. fp8 is not optimized for PPU.
+            if not USE_PPU:
+                config["is_fp8"] = 1
+            perf = run_dsa_decode(config["batch_size"], config["seq_q"], config["cache_seqlens"],
+                                config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"],
+                                config["causal"], config["topk"], config["is_fp8"], config["dtype"], config["block_size"])
+        else:
+            config["mla"] = args.backend
+            if "block_size" not in config.keys():
+                config["block_size"] = 64
+            # exit(0)
+            perf = compare_a(config["mla"], config["batch_size"], config["seq_q"], config["cache_seqlens"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["causal"], config["dtype"], config["block_size"])
