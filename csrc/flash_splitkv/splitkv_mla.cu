@@ -25,17 +25,17 @@ using cutlass::arch::NamedBarrier;
 static constexpr float MAX_INIT_VAL_SM = -1e30f;
 static constexpr float MAX_INIT_VAL = -1e33f;
 
-
-__forceinline__ __device__ int get_AorC_row_idx(int local_row_idx, int idx_in_warpgroup) {
+__forceinline__ __device__ int get_AorC_row_idx(int local_row_idx, int idx_in_warpgroup)
+{
     // In the layout of fragment A and fragment C during WGMMA, data each thread holds resides in two particular rows. This function converts the local_row_idx (0~2) to the actual row_idx
     // You may refer to this link for the detailed layout: https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-a
-    int row_idx = (idx_in_warpgroup/32)*16 + local_row_idx*8 + (idx_in_warpgroup%32/4);
+    int row_idx = (idx_in_warpgroup / 32) * 16 + local_row_idx * 8 + (idx_in_warpgroup % 32 / 4);
     return row_idx;
 }
 
-
 template <typename To_type, typename Engine, typename Layout>
-inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
+inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor)
+{
     using From_type = typename Engine::value_type;
     constexpr int numel = decltype(size(tensor))::value;
     NumericArrayConverterPPU<To_type, From_type, numel> convert_op;
@@ -47,85 +47,92 @@ inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
 
 // Launch TMA copy for a range of KV tile
 // A tile has a shape of BlockN (32) x 64
-template<
+template <
     int START_HEAD_DIM_TILE_IDX,
     int END_HEAD_DIM_TILE_IDX,
     typename TiledCopy,
     typename Engine0, typename Layout0,
-    typename Engine1, typename Layout1
->
+    typename Engine1, typename Layout1>
 __forceinline__ __device__ void launch_kv_tiles_copy_aiu(
     TiledCopy tiled_copy,
-    Tensor<Engine0, Layout0> const &gKV,	// (BLOCK_N, HEAD_DIM_K)
-    Tensor<Engine1, Layout1> &sKV,	// (BLOCK_N, HEAD_DIM_K), swizzled
+    Tensor<Engine0, Layout0> const &gKV, // (BLOCK_N, HEAD_DIM_K)
+    Tensor<Engine1, Layout1> &sKV,       // (BLOCK_N, HEAD_DIM_K), swizzled
     const Flash_fwd_mla_params &params,
-    __mbarrier_t* barriers_K,
-    int warp_idx
-) {
-    if (warp_idx == 0) {
-        Tensor cur_gKV = gKV(_, _0{}, Int<START_HEAD_DIM_TILE_IDX>{});
-        Tensor cur_sKV = sKV(_, _0{}, Int<START_HEAD_DIM_TILE_IDX>{});
-        cute::copy(tiled_copy, cur_gKV, cur_sKV);
-        // cutlass::arch::cpasync_barrier_arrive_noinc(&barriers_K[START_HEAD_DIM_TILE_IDX]);
-    }
+    __mbarrier_t *barriers_K,
+    int warp_idx)
+{
+    // if (warp_idx == 0) {
+    Tensor cur_gKV = gKV(_, _0{}, Int<START_HEAD_DIM_TILE_IDX>{});
+    Tensor cur_sKV = sKV(_, _0{}, Int<START_HEAD_DIM_TILE_IDX>{});
+    cute::copy(tiled_copy, cur_gKV, cur_sKV);
+    // cutlass::arch::cpasync_barrier_arrive_noinc(&barriers_K[START_HEAD_DIM_TILE_IDX]);
+    // }
 
-    if constexpr (START_HEAD_DIM_TILE_IDX+1 < END_HEAD_DIM_TILE_IDX) {
-        launch_kv_tiles_copy_aiu<START_HEAD_DIM_TILE_IDX+1, END_HEAD_DIM_TILE_IDX>(tiled_copy, gKV, sKV, params, barriers_K, warp_idx);
+    if constexpr (START_HEAD_DIM_TILE_IDX + 1 < END_HEAD_DIM_TILE_IDX)
+    {
+        launch_kv_tiles_copy_aiu<START_HEAD_DIM_TILE_IDX + 1, END_HEAD_DIM_TILE_IDX>(tiled_copy, gKV, sKV, params, barriers_K, warp_idx);
     }
 }
-
 
 // Launch TMA copy for a range of KV tile
 // A tile has a shape of BLOCK_N (32) x 64
-template<
+template <
     int START_HEAD_DIM_TILE_IDX,
     int END_HEAD_DIM_TILE_IDX,
     typename TiledCopy,
     typename Engine0, typename Layout0,
-    typename Engine1, typename Layout1
->
+    typename Engine1, typename Layout1>
 __forceinline__ __device__ void launch_kv_tiles_copy(
     TiledCopy tiled_copy,
-    Tensor<Engine0, Layout0> const &gKV,	// (BLOCK_N, HEAD_DIM_K)
-    Tensor<Engine1, Layout1> &sKV,	// (BLOCK_N, HEAD_DIM_K), swizzled
+    Tensor<Engine0, Layout0> const &gKV, // (BLOCK_N, HEAD_DIM_K)
+    Tensor<Engine1, Layout1> &sKV,       // (BLOCK_N, HEAD_DIM_K), swizzled
     const Flash_fwd_mla_params &params,
-    __mbarrier_t* barriers_K,
-    int warp_idx
-) {
+    __mbarrier_t *barriers_K,
+    int warp_idx)
+{
     launch_kv_tiles_copy_aiu<START_HEAD_DIM_TILE_IDX, END_HEAD_DIM_TILE_IDX>(tiled_copy, gKV, sKV, params, barriers_K, warp_idx);
-    if (warp_idx == 0)
-        cutlass::arch::cpasync_barrier_arrive_noinc(barriers_K);
+    // if (warp_idx == 0)
+    cutlass::arch::cpasync_barrier_arrive_noinc(barriers_K);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-//PPU: shared memory not support init by zero, need clear if not align.
-template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=true, bool Clear_OOB_K=true,
+// PPU: shared memory not support init by zero, need clear if not align.
+template <bool Is_even_MN = true, bool Is_even_K = true, bool Clear_OOB_MN = true, bool Clear_OOB_K = true,
           typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
 __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
-                            Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
-                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
+                                     Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
+                                     Tensor<Engine3, Layout3> const &predicate_K, const int max_MN = 0)
+{
 
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
 
-    CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
-    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
-    CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
+    CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D)); // MMA
+    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D)); // MMA_M
+    CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D)); // MMA_K
     // There's no case where !Clear_OOB_K && Clear_OOB_MN
     static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
-    #pragma unroll
-    for (int m = 0; m < size<1>(S); ++m) {
-        if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
-            #pragma unroll
-            for (int k = 0; k < size<2>(S); ++k) {
-                if (Is_even_K || predicate_K(k)) {
+#pragma unroll
+    for (int m = 0; m < size<1>(S); ++m)
+    {
+        if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN)
+        {
+#pragma unroll
+            for (int k = 0; k < size<2>(S); ++k)
+            {
+                if (Is_even_K || predicate_K(k))
+                {
                     cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
-                } else if (Clear_OOB_K) {
+                }
+                else if (Clear_OOB_K)
+                {
                     cute::clear(D(_, m, k));
                 }
             }
-        } else if (Clear_OOB_MN) {
+        }
+        else if (Clear_OOB_MN)
+        {
             cute::clear(D(_, m, _));
         }
     }
@@ -159,16 +166,19 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 template <
     typename Tensor0, typename Tensor1,
     typename Tensor2, typename TiledMma>
-__forceinline__ __device__ void gemm(Tensor2 &tCrC, Tensor0 const &tCrA, Tensor1 const &tCrB, TiledMma &tiled_mma) {
-    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(tCrC));                     // MMA_M
-    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
-    #pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
+__forceinline__ __device__ void gemm(Tensor2 &tCrC, Tensor0 const &tCrA, Tensor1 const &tCrB, TiledMma &tiled_mma)
+{
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(tCrC)); // MMA_M
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB)); // MMA_K
+#pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i)
+    {
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), tCrC);
     }
 }
 
-__forceinline__ __device__ void kernel_sleep_ns() {
+__forceinline__ __device__ void kernel_sleep_ns()
+{
     // unsigned long long start = clock64();
     // 10ns ≈ 10,00000 cycles（if ppu freq is 1 GHz）
     // while (!(clock64() - start < 170000000ULL)); // 10us * 1700 cycles/us
@@ -177,7 +187,7 @@ __forceinline__ __device__ void kernel_sleep_ns() {
 
 // Wait for one KV-tile to be ready, and then calculate P += Q K^T for one Q-tile (BLOCK_SIZE_Mx64) and one KV-tile (PAGE_BLOCK_SIZEx64)
 // The Q-tile should be in shared memory
-template<
+template <
     typename TiledMMA,
     typename TiledCopyA,
     typename TiledCopyB,
@@ -187,32 +197,29 @@ template<
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
     typename Engine3, typename Layout3,
-    typename Engine4, typename Layout4
-> 
+    typename Engine4, typename Layout4>
 __forceinline__ __device__ void qkt_gemm_one_tile_sQ(
     TiledMMA &tiled_mma,
     TiledCopyA &smem_tiled_copy_Q,
     TiledCopyB &smem_tiled_copy_K,
     ThrCopyA &smem_thr_copy_Q,
     ThrCopyB &smem_thr_copy_K,
-    Tensor<Engine0, Layout0> const &sQ_tiled,	// (MMA, 1, 4)
-    Tensor<Engine1, Layout1> const &thr_mma_sQ_tile,	// (MMA, 1, 4)
-    Tensor<Engine2, Layout2> const &sKV_tiled,	// (MMA, 1, 4)
-    Tensor<Engine3, Layout3> const &thr_mma_sKV_tile,	// (MMA, 1, 4)
-    Tensor<Engine4, Layout4> &rP,	// ((2, 2, 8), 1, 1)
-    __mbarrier_t* barrier,
-    bool &cur_phase,
-    int idx_in_warpgroup
-) {
+    Tensor<Engine0, Layout0> const &sQ_tiled,         // (MMA, 1, 4)
+    Tensor<Engine1, Layout1> const &thr_mma_sQ_tile,  // (MMA, 1, 4)
+    Tensor<Engine2, Layout2> const &sKV_tiled,        // (MMA, 1, 4)
+    Tensor<Engine3, Layout3> const &thr_mma_sKV_tile, // (MMA, 1, 4)
+    Tensor<Engine4, Layout4> &rP,                     // ((2, 2, 8), 1, 1)
+    int idx_in_warpgroup)
+{
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
     Tensor rQ = thr_mma.partition_fragment_A(sQ_tiled);
     Tensor rK = thr_mma.partition_fragment_B(sKV_tiled);
 
     Tensor rQ_copy_view = smem_thr_copy_Q.retile_D(rQ);
-    CUTE_STATIC_ASSERT_V(size<1>(thr_mma_sQ_tile) == size<1>(rQ_copy_view));// M
+    CUTE_STATIC_ASSERT_V(size<1>(thr_mma_sQ_tile) == size<1>(rQ_copy_view)); // M
 
     Tensor rK_copy_view = smem_thr_copy_K.retile_D(rK);
-    CUTE_STATIC_ASSERT_V(size<1>(thr_mma_sKV_tile) == size<1>(rK_copy_view));// M
+    CUTE_STATIC_ASSERT_V(size<1>(thr_mma_sKV_tile) == size<1>(rK_copy_view)); // M
 
     cute::copy(smem_tiled_copy_Q, thr_mma_sQ_tile, rQ_copy_view);
 
@@ -224,36 +231,29 @@ __forceinline__ __device__ void qkt_gemm_one_tile_sQ(
     cute::gemm(tiled_mma, rQ_copy_view(_, _, _3{}), rK_copy_view(_, _, _3{}), rP);
 }
 
-template<
+template <
     typename TiledMMA,
     typename TiledCopy,
+    typename ThrCopy,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
-    typename Engine3, typename Layout3
-> 
-__forceinline__ __device__ void  qkt_gemm_one_tile_rQ(
+    typename Engine3, typename Layout3>
+__forceinline__ __device__ void qkt_gemm_one_tile_rQ(
     TiledMMA &tiled_mma,
     TiledCopy &smem_tiled_copy_K,
-    Tensor<Engine0, Layout0> const &thr_mma_rQ_tile,	// (MMA, 1, 4)
-    Tensor<Engine1, Layout1> const &sKV_tiled,
-    Tensor<Engine2, Layout2> const &thr_mma_sKV_tile,	// (MMA, 1, 4)
-    Tensor<Engine3, Layout3> &rP,	// ((2, 2, 8), 1, 1)
-    __mbarrier_t* barrier,
-    int idx_in_warpgroup,
-    const int warp_idx
-) {
+    ThrCopy &smem_thr_copy_K,
+    Tensor<Engine0, Layout0> const &thr_mma_rQ_tile,  // (MMA, 1, 4)
+    Tensor<Engine1, Layout1> const &sKV_tiled,        // (MMA, 1, 4)
+    Tensor<Engine2, Layout2> const &thr_mma_sKV_tile, // (MMA, 1, 4)
+    Tensor<Engine3, Layout3> &rP,                     // ((2, 2, 8), 1, 1)
+    int idx_in_warpgroup)
+{
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
     Tensor rK = thr_mma.partition_fragment_B(sKV_tiled);
-    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(warp_idx * 32);
     Tensor rK_copy_view = smem_thr_copy_K.retile_D(rK);
-    CUTE_STATIC_ASSERT_V(size<1>(thr_mma_sKV_tile) == size<1>(rK_copy_view));// M
+    CUTE_STATIC_ASSERT_V(size<1>(thr_mma_sKV_tile) == size<1>(rK_copy_view)); // M
 
-    // if ((idx_in_warpgroup / 32) == 0) {
-    //     __mbarrier_token_t token = __mbarrier_arrive(barrier);
-    //     while (!__mbarrier_test_wait(barrier, token));
-    // }
-    
     cute::copy(smem_tiled_copy_K, thr_mma_sKV_tile, rK_copy_view);
 
     cute::gemm(tiled_mma, thr_mma_rQ_tile(_, _, _0{}), rK_copy_view(_, _, _0{}), rP);
@@ -270,24 +270,24 @@ __forceinline__ __device__ void  qkt_gemm_one_tile_rQ(
 // - Compute Q K^T for the 1-st tile
 // ...
 // This gives latter tiles more time to be ready, and thus can overlap the memory copy and computation
-template<
-    typename T, // Traits
-    int PHASE_IDX,	// See comments in the code
+template <
+    typename T,    // Traits
+    int PHASE_IDX, // See comments in the code
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
-    typename Engine2, typename Layout2
-    // typename Engine3, typename Layout3
-> 
+    typename Engine2, typename Layout2,
+    typename Engine3, typename Layout3>
 __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
-    Tensor<Engine0, Layout0> &sQ,	// (BLOCK_SIZE_M, HEAD_DIM_K)
-    Tensor<Engine1, Layout1> &sKV,	// (BLOCK_N, HEAD_DIM_K)
-    Tensor<Engine2, Layout2> &rP,	// ((2, 2, 8), 1, 1)
-    // Tensor<Engine3, Layout3> &rQ8,	// The 8-th tile of Q. We store it separately to leave some room for storing sP1
-    __mbarrier_t* barriers,
+    Tensor<Engine0, Layout0> &sQ,   // (BLOCK_SIZE_M, HEAD_DIM_K)
+    Tensor<Engine1, Layout1> &sKV0, // (BLOCK_N, HEAD_DIM_K)
+    Tensor<Engine1, Layout1> &sKV1, // (BLOCK_N, HEAD_DIM_K)
+    Tensor<Engine2, Layout2> &rP,   // ((2, 2, 8), 1, 1)
+    Tensor<Engine3, Layout3> &rQ8,  // The 8-th tile of Q. We store it separately to leave some room for storing sP1
+    __mbarrier_t *barriers,
     bool &cur_phase,
     int idx_in_warpgroup,
-    const int warp_idx
-) {
+    const int warp_idx)
+{
     typename T::TiledMma tiled_mma;
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
     auto smem_tiled_copy_K = make_tiled_copy_B(typename T::SmemCopyAtomK{}, tiled_mma);
@@ -296,21 +296,53 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename T::SmemCopyAtomQ{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(warp_idx * 32);
 
-    Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _);	// (BLOCK_SIZE_M, 64, 9)
-    Tensor sKV_tiled = flat_divide(sKV, Shape<Int<T::kBlockN>, _64>{})(_, _, _0{}, _);	// (BLOCK_N, 64, 9)
+    Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _); // (BLOCK_SIZE_M, 64, 9)
+    Tensor sKV0_tiled = flat_divide(sKV0, Shape<Int<T::kBlockN>, _64>{})(_, _, _0{}, _);  // (BLOCK_N, 64, 9)
+    Tensor sKV1_tiled = flat_divide(sKV1, Shape<Int<T::kBlockN>, _64>{})(_, _, _0{}, _);  // (BLOCK_N, 64, 9)
     Tensor thr_mma_sQ_tiled = smem_thr_copy_Q.partition_S(make_mix_tensor_like(sQ_tiled));
-    Tensor thr_mma_sKV_tiled = smem_thr_copy_K.partition_S(make_mix_tensor_like(sKV_tiled));
+    Tensor thr_mma_sKV0_tiled = smem_thr_copy_K.partition_S(make_mix_tensor_like(sKV0_tiled));
+    Tensor thr_mma_sKV1_tiled = smem_thr_copy_K.partition_S(make_mix_tensor_like(sKV1_tiled));
 
     #define QKT_GEMM_ONE_TILE(TILE_IDX) \
-        qkt_gemm_one_tile_sQ(tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, \
-                smem_thr_copy_Q, smem_thr_copy_K, \
-                sQ_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sQ_tiled(_, _, _, Int<TILE_IDX>{}), \
-                sKV_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV_tiled(_, _, _, Int<TILE_IDX>{}), \
-                rP, barriers + TILE_IDX, cur_phase, idx_in_warpgroup);
+        if constexpr(TILE_IDX == 8) { \
+            qkt_gemm_one_tile_rQ(tiled_mma, smem_tiled_copy_K, smem_thr_copy_K, \
+                    rQ8, sKV1_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV1_tiled(_, _, _, Int<TILE_IDX>{}), \
+                    rP, idx_in_warpgroup); \
+        } else if constexpr(TILE_IDX < 4) { \
+            qkt_gemm_one_tile_sQ(tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, \
+                    smem_thr_copy_Q, smem_thr_copy_K, \
+                    sQ_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sQ_tiled(_, _, _, Int<TILE_IDX>{}), \
+                    sKV0_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV0_tiled(_, _, _, Int<TILE_IDX>{}), \
+                    rP, idx_in_warpgroup); \
+        } else  { \
+            qkt_gemm_one_tile_sQ(tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, \
+                    smem_thr_copy_Q, smem_thr_copy_K, \
+                    sQ_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sQ_tiled(_, _, _, Int<TILE_IDX>{}), \
+                    sKV1_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV1_tiled(_, _, _, Int<TILE_IDX>{}), \
+                    rP, idx_in_warpgroup); \
+        }
 
-    if constexpr (PHASE_IDX == 0) {
+// #define QKT_GEMM_ONE_TILE(TILE_IDX)                                                                                \
+//     if constexpr (TILE_IDX == 8)                                                                                   \
+//     {                                                                                                              \
+//         qkt_gemm_one_tile_rQ(tiled_mma, smem_tiled_copy_K, smem_thr_copy_K,                                        \
+//                              rQ8, sKV0_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV0_tiled(_, _, _, Int<TILE_IDX>{}), \
+//                              rP, idx_in_warpgroup);                                                                \
+//     }                                                                                                              \
+//     else                                                                                                           \
+//     {                                                                                                              \
+//         qkt_gemm_one_tile_sQ(tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,                                      \
+//                              smem_thr_copy_Q, smem_thr_copy_K,                                                     \
+//                              sQ_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sQ_tiled(_, _, _, Int<TILE_IDX>{}),          \
+//                              sKV0_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV0_tiled(_, _, _, Int<TILE_IDX>{}),      \
+//                              rP, idx_in_warpgroup);                                                                \
+//     }
+
+    if constexpr (PHASE_IDX == 0)
+    {
         // In PHASE-0, warpgroup 0 calculates Q K^T for the first 4 tiles
-        while(!cutlass::arch::test_wait(&barriers[0], cur_phase, 1)) {
+        while (!cutlass::arch::test_wait(&barriers[0], cur_phase, 1))
+        {
             kernel_sleep_ns();
         };
 
@@ -319,30 +351,38 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(2);
         QKT_GEMM_ONE_TILE(3);
         // cur_phase ^= 1;
-    } else if constexpr (PHASE_IDX == 1) {
+    }
+    else if constexpr (PHASE_IDX == 1)
+    {
         // In PHASE-1, warpgroup 1 calculates Q K^T for all the 9 tiles
-        while(!cutlass::arch::test_wait(&barriers[1], cur_phase, 1)) {
+        while (!cutlass::arch::test_wait(&barriers[1], cur_phase, 1))
+        {
             kernel_sleep_ns();
         };
+
         QKT_GEMM_ONE_TILE(4);
         QKT_GEMM_ONE_TILE(5);
         QKT_GEMM_ONE_TILE(6);
         QKT_GEMM_ONE_TILE(7);
         QKT_GEMM_ONE_TILE(8);
 
-        while(!cutlass::arch::test_wait(&barriers[0], cur_phase, 1)) {
+        while (!cutlass::arch::test_wait(&barriers[0], cur_phase, 1))
+        {
             kernel_sleep_ns();
         };
         QKT_GEMM_ONE_TILE(0);
         QKT_GEMM_ONE_TILE(1);
         QKT_GEMM_ONE_TILE(2);
         QKT_GEMM_ONE_TILE(3);
-        cur_phase ^= 1;
-    } else {
+        cur_phase = (cur_phase + 1) & 1;
+    }
+    else
+    {
         // In PHASE-2, warpgroup 0 calculates Q K^T for the last 5 tiles
         static_assert(PHASE_IDX == 2);
 
-        while(!cutlass::arch::test_wait(&barriers[1], cur_phase, 1)) {
+        while (!cutlass::arch::test_wait(&barriers[1], cur_phase, 1))
+        {
             kernel_sleep_ns();
         };
 
@@ -351,31 +391,30 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(6);
         QKT_GEMM_ONE_TILE(7);
         QKT_GEMM_ONE_TILE(8);
-        cur_phase ^= 1;
+        cur_phase = (cur_phase + 1) & 1;
     }
 }
 
-template<
+template <
     typename T,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
-    typename Engine2, typename Layout2
->
+    typename Engine2, typename Layout2>
 __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_no_pipeline(
-    Tensor<Engine0, Layout0> &rQ,	// (BLOCK_SIZE_M, HEAD_DIM_K)
-    Tensor<Engine1, Layout1> &sKV,	// (BLOCK_SIZE_M, HEAD_DIM_K)
-    Tensor<Engine2, Layout2> &rP,	// ((2, 2, 8), 1, 1)
-    int idx_in_warpgroup
-) {
+    Tensor<Engine0, Layout0> &rQ,  // (BLOCK_SIZE_M, HEAD_DIM_K)
+    Tensor<Engine1, Layout1> &sKV, // (BLOCK_SIZE_M, HEAD_DIM_K)
+    Tensor<Engine2, Layout2> &rP,  // ((2, 2, 8), 1, 1)
+    int idx_in_warpgroup)
+{
     typename T::TiledMma tiled_mma;
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
 
-    Tensor rK = thr_mma.partition_fragment_B(sKV);	// (MMA, 1, 576/16=36)
+    Tensor rK = thr_mma.partition_fragment_B(sKV); // (MMA, 1, 576/16=36)
     auto smem_tiled_copy_K = make_tiled_copy_B(typename T::SmemCopyAtomK{}, tiled_mma);
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(idx_in_warpgroup);
     Tensor rK_copy_view = smem_thr_copy_K.retile_D(rK);
     auto tSsK = smem_thr_copy_K.partition_S(make_mix_tensor_like(sKV));
-    CUTE_STATIC_ASSERT_V(size<1>(tSsK) == size<1>(rK_copy_view));            // M
+    CUTE_STATIC_ASSERT_V(size<1>(tSsK) == size<1>(rK_copy_view)); // M
     cute::copy(smem_tiled_copy_K, tSsK, rK_copy_view);
 
     // auto smem_tiled_copy_Q = make_tiled_copy_A(typename T::SmemCopyAtomQ{}, tiled_mma);
@@ -390,21 +429,19 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_no_pipeline(
     gemm(rP, rQ, rK, tiled_mma);
 }
 
-
 // Compute O += PV, where P resides in register
-template<
+template <
     typename T,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
-    typename Engine2, typename Layout2
-> 
+    typename Engine2, typename Layout2>
 __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_localP(
-    Tensor<Engine0, Layout0> &rP,	// ((2, 2, 8), 1, 1), fragment A layout
-    Tensor<Engine1, Layout1> &sKV_half,	// (HEAD_DIM_V/2, BLOCK_N)
-    Tensor<Engine2, Layout2> &rO,	// ((2, 2, 32), 1, 1)
+    Tensor<Engine0, Layout0> &rP,       // ((2, 2, 8), 1, 1), fragment A layout
+    Tensor<Engine1, Layout1> &sKV_half, // (HEAD_DIM_V/2, BLOCK_N)
+    Tensor<Engine2, Layout2> &rO,       // ((2, 2, 32), 1, 1)
     int idx_in_warpgroup,
-    int warp_idx
-) {
+    int warp_idx)
+{
     // const int warp_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
     typename T::TiledMma tiled_mma;
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
@@ -415,27 +452,25 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_localP(
     Tensor rVt_copy_view = smem_thr_copy_Vt.retile_D(rVt);
     auto tSsVt = smem_thr_copy_Vt.partition_S(make_mix_tensor_like(sKV_half));
 
-    CUTE_STATIC_ASSERT_V(size<1>(tSsVt) == size<1>(rVt_copy_view));            // M
+    CUTE_STATIC_ASSERT_V(size<1>(tSsVt) == size<1>(rVt_copy_view)); // M
     cute::copy(smem_tiled_copy_Vt, tSsVt, rVt_copy_view);
 
     gemm(rO, rP, rVt, tiled_mma);
 }
 
-
 // Compute O += PV, where P resides in shared memory
-template<
+template <
     typename T,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
-    typename Engine2, typename Layout2
->
+    typename Engine2, typename Layout2>
 __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
     Tensor<Engine0, Layout0> &sP,
-    Tensor<Engine1, Layout1> &sKV_half,	// (HEAD_DIM_V/2, BLOCK_N)
-    Tensor<Engine2, Layout2> &rO,	// ((2, 2, 32), 1, 1)
+    Tensor<Engine1, Layout1> &sKV_half, // (HEAD_DIM_V/2, BLOCK_N)
+    Tensor<Engine2, Layout2> &rO,       // ((2, 2, 32), 1, 1)
     int idx_in_warpgroup,
-    int warp_idx
-) {
+    int warp_idx)
+{
     // TiledMMA tiled_mma = (typename T::TiledMMA_PV_RemoteP){};
     // const int warp_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
 
@@ -450,7 +485,7 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
 
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
     Tensor thr_mma_sP = thr_mma.partition_fragment_A(sP);
-    Tensor thr_mma_sKV_half = thr_mma.partition_fragment_B(sKV_half);	// (MMA, 1, 64/16=4)
+    Tensor thr_mma_sKV_half = thr_mma.partition_fragment_B(sKV_half); // (MMA, 1, 64/16=4)
 
     Tensor rP_copy_view = smem_thr_copy_P.retile_D(thr_mma_sP);
     Tensor rVt_copy_view = smem_thr_copy_Vt.retile_D(thr_mma_sKV_half);
@@ -509,13 +544,14 @@ __forceinline__ __device__ auto wg0_bunch_0(
         float new_max = max(sM(row_idx), cur_max);
         float scale_for_old = exp2f(sM(row_idx) - new_max);
 
-        __syncwarp();   // Make sure all reads have finished before updating sM
+        __syncwarp(); // Make sure all reads have finished before updating sM
 
-        if (idx_in_warpgroup%4 == 0) {
+        if (idx_in_warpgroup % 4 == 0)
+        {
             sScale0(row_idx) = scale_for_old;
             sM(row_idx) = new_max;
         }
-        
+
         // Scale-O
         // CUTLASS_PRAGMA_UNROLL
         // for (int i = local_row_idx ? 4 : 0; i < size(rO0); i += 8) {
@@ -552,42 +588,46 @@ template<
     typename Engine2, typename Layout2,
     typename Engine3, typename Layout3,
     typename Engine4, typename Layout4,
-    typename Engine5, typename Layout5
->
+    typename Engine5, typename Layout5>
 __forceinline__ __device__ auto wg1_bunch_0(
     // Tensor<Engine0, Layout0> &rP1b,	// ((2, 2, 8), 1, 1)
-    Tensor<Engine1, Layout1> &sScale1,	// (BLOCK_SIZE_M)
-    Tensor<Engine2, Layout2> &rO1,	// ((2, 2, 32), 1, 1)
-    Tensor<Engine3, Layout3> &sM,	// (BLOCK_SIZE_M)
+    Tensor<Engine1, Layout1> &sScale1, // (BLOCK_SIZE_M)
+    Tensor<Engine2, Layout2> &rO1,     // ((2, 2, 32), 1, 1)
+    Tensor<Engine3, Layout3> &sM,      // (BLOCK_SIZE_M)
     float rL[2],
     int rRightBorderForQSeq[2],
-    Tensor<Engine4, Layout4> const &sScale0,	// (BLOCK_SIZE_M)
-    Tensor<Engine5, Layout5> &rP1,	// ((2, 2, 8), 1, 1)
+    Tensor<Engine4, Layout4> const &sScale0, // (BLOCK_SIZE_M)
+    Tensor<Engine5, Layout5> &rP1,           // ((2, 2, 8), 1, 1)
     float scale_softmax_log2,
     int start_token_idx,
-    int idx_in_warpgroup
-) {
+    int idx_in_warpgroup)
+{
     CUTLASS_PRAGMA_UNROLL
-    for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+    for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx)
+    {
         int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
 
         // Mask, and get row-wise max
         float cur_max = MAX_INIT_VAL;
         CUTLASS_PRAGMA_UNROLL
-        for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8) {
-            if constexpr (IS_BLK1_LAST || IS_BLK2_LAST) {
+        for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8)
+        {
+            if constexpr (IS_BLK1_LAST || IS_BLK2_LAST)
+            {
                 // Need to apply the mask when either this block is the last one, or
                 // the next block is the last one (because of the causal mask)
                 // int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
-                int token_idx = start_token_idx + (i/8)*16 + idx_in_warpgroup%4;
+                int token_idx = start_token_idx + (i / 8) * 16 + idx_in_warpgroup % 4;
                 rP1(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP1(i) : MAX_INIT_VAL;
-                rP1(i+1) = token_idx+4 < rRightBorderForQSeq[local_row_idx] ? rP1(i+1) : MAX_INIT_VAL;
-                rP1(i+2) = token_idx+8 < rRightBorderForQSeq[local_row_idx] ? rP1(i+2) : MAX_INIT_VAL;
-                rP1(i+3) = token_idx+12 < rRightBorderForQSeq[local_row_idx] ? rP1(i+3) : MAX_INIT_VAL;
-            } else if constexpr (IS_BLK0_LAST) {
-                rP1(i) = rP1(i+1) = rP1(i+2) = rP1(i+3) = MAX_INIT_VAL;
+                rP1(i + 1) = token_idx + 4 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 1) : MAX_INIT_VAL;
+                rP1(i + 2) = token_idx + 8 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 2) : MAX_INIT_VAL;
+                rP1(i + 3) = token_idx + 12 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 3) : MAX_INIT_VAL;
             }
-            cur_max = max(cur_max, max(max(rP1(i), rP1(i+1)), max(rP1(i+2), rP1(i+3))));
+            else if constexpr (IS_BLK0_LAST)
+            {
+                rP1(i) = rP1(i + 1) = rP1(i + 2) = rP1(i + 3) = MAX_INIT_VAL;
+            }
+            cur_max = max(cur_max, max(max(rP1(i), rP1(i + 1)), max(rP1(i + 2), rP1(i + 3))));
         }
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
@@ -599,21 +639,24 @@ __forceinline__ __device__ auto wg1_bunch_0(
         float scale_for_old = exp2f(old_max - new_max);
 
         __syncwarp();
-        if (idx_in_warpgroup%4 == 0) {
+        if (idx_in_warpgroup % 4 == 0)
+        {
             sM(row_idx) = new_max;
             sScale1(row_idx) = scale_for_old;
         }
 
         // Scale, exp, and get row-wise expsum
         float cur_sum = 0;
-        if constexpr (!IS_BLK0_LAST) {
+        if constexpr (!IS_BLK0_LAST)
+        {
             CUTLASS_PRAGMA_UNROLL
-            for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8) {
-                rP1(i) = exp2f(rP1(i)*scale_softmax_log2 - new_max);
-                rP1(i+1) = exp2f(rP1(i+1)*scale_softmax_log2 - new_max);
-                rP1(i+2) = exp2f(rP1(i+2)*scale_softmax_log2 - new_max);
-                rP1(i+3) = exp2f(rP1(i+3)*scale_softmax_log2 - new_max);
-                cur_sum += (rP1(i) + rP1(i+1) + rP1(i+2) + rP1(i+3));
+            for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8)
+            {
+                rP1(i) = exp2f(rP1(i) * scale_softmax_log2 - new_max);
+                rP1(i + 1) = exp2f(rP1(i + 1) * scale_softmax_log2 - new_max);
+                rP1(i + 2) = exp2f(rP1(i + 2) * scale_softmax_log2 - new_max);
+                rP1(i + 3) = exp2f(rP1(i + 3) * scale_softmax_log2 - new_max);
+                cur_sum += (rP1(i) + rP1(i + 1) + rP1(i + 2) + rP1(i + 3));
             }
         }
 
@@ -810,18 +853,16 @@ __forceinline__ __device__ void save_rP1_to_sP(
     cute::copy(r2s_copy, thr_copy_rPb, thr_copy_sP);
 }
 
-
 // Save rPb (64x64, bfloat16/half) to sP using the stmatrix instruction
-template<
+template <
     typename T,
     typename Engine0, typename Layout0,
-    typename Engine1, typename Layout1
->
+    typename Engine1, typename Layout1>
 __forceinline__ __device__ void save_rP0_to_sP(
     Tensor<Engine0, Layout0> &rPb,
     Tensor<Engine1, Layout1> &sP,
-    int idx_in_warpgroup
-) {
+    int idx_in_warpgroup)
+{
     typename T::TiledMma tiled_mma;
     auto r2s_copy = make_tiled_copy_C(typename T::SmemCopyAtomS{}, tiled_mma);
     ThrCopy thr_copy = r2s_copy.get_slice(idx_in_warpgroup);
@@ -831,22 +872,22 @@ __forceinline__ __device__ void save_rP0_to_sP(
     cute::copy(r2s_copy, thr_copy_rPb, thr_copy_sP);
 }
 
-
 // Retrieve rPb (64x64, bfloat16/half) from sP using the ldmatrix instruction
-template<
+template <
     typename T,
     typename Engine0, typename Layout0,
-    typename Engine1, typename Layout1
->
+    typename Engine1, typename Layout1>
 __forceinline__ __device__ void retrieve_rP_from_sP(
     Tensor<Engine0, Layout0> &rPb,
     Tensor<Engine1, Layout1> const &sP,
-    int idx_in_warpgroup
-) {
+    int idx_in_warpgroup)
+{
     typename T::TiledMma tiled_mma;
+    const int warp_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
+
     auto thr_mma = tiled_mma.get_thread_slice(idx_in_warpgroup);
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename T::SmemCopyAtomQ{}, tiled_mma);
-    auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(idx_in_warpgroup);
+    auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(warp_idx * 32);
     Tensor tSsQ = smem_thr_copy_Q.partition_S(make_mix_tensor_like(sP));
     // Tensor tSrQ  = thr_mma.partition_fragment_A(sP);
     // Tensor rQ8 = smem_thr_copy_Q.retile_D(tSrQ);
@@ -1053,12 +1094,11 @@ __forceinline__ __device__ void store_o(
     using GmemTiledCopyO = std::conditional_t<
         IS_NO_SPLIT,
         typename T::GmemTiledCopyO,
-        typename T::GmemTiledCopyOaccum
-    >;
+        typename T::GmemTiledCopyOaccum>;
     // T::GmemTiledCopyO gmem_tiled_copy_Oaccum;
     GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(threadIdx.x);
-    Tensor tOsO = gmem_thr_copy_O.partition_S(sOutputBuf);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tOsO = gmem_thr_copy_O.partition_S(sOutputBuf); // ((Atom,AtomNum),ATOM_M,ATOM_N)
     Tensor tOgO = gmem_thr_copy_O.partition_D(gOorAccum);
 
     Tensor tOrO = make_tensor<ElementO>(shape(tOgO));
@@ -1067,21 +1107,19 @@ __forceinline__ __device__ void store_o(
     cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
 
     // Construct identity layout for sO
-    Tensor cO = make_identity_tensor(make_shape(size<0>(sOutputBuf), size<1>(sOutputBuf)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    Tensor cO = make_identity_tensor(make_shape(size<0>(sOutputBuf), size<1>(sOutputBuf))); // (BLK_M,BLK_K) -> (blk_m,blk_k)
     // Repeat the partitioning with identity layouts
-    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);                           // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+    Tensor tOcO = gmem_thr_copy_O.partition_D(cO); // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
     Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
 
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     copy<false, true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, num_valid_seq_q
-    );
+        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, num_valid_seq_q);
 }
 
-template<
+template <
     typename T,
-    typename Tensor0
->
+    typename Tensor0>
 __forceinline__ __device__ void launch_q_copy(
     const Flash_fwd_mla_params &params,
     int batch_idx,
@@ -1120,35 +1158,46 @@ __forceinline__ __device__ void launch_q_copy(
     }
 }
 
-template<
+template <
     typename T,
     bool IS_R,
-    typename Engine0, typename Layout0
->
+    typename Engine0, typename Layout0>
 __forceinline__ __device__ auto get_half_V(
-    Tensor<Engine0, Layout0> &sK
-) {
+    Tensor<Engine0, Layout0> &sK)
+{
     Tensor sV = make_tensor(sK.data(), (typename T::SmemLayoutV){});
-    return flat_divide(sV, Shape<Int<T::kHeadDimV/2>, Int<T::kBlockN>>{})(_, _, Int<(int)IS_R>{}, _0{});
+    return flat_divide(sV, Shape<Int<T::kHeadDimV / 2>, Int<T::kBlockN>>{})(_, _, Int<(int)IS_R>{}, _0{});
 }
 
-template<
-    typename T
->
+template <
+    typename T,
+    bool IS_R,
+    typename Engine0, typename Layout0>
+__forceinline__ __device__ auto get_half_V2(
+    int block_idx,
+    Tensor<Engine0, Layout0> sK0)
+{
+    const int blk_idx = (block_idx) % 3;
+    Tensor sV = make_tensor(sK0.data(), (typename T::SmemLayoutV){});
+    return flat_divide(sV, Shape<Int<T::kHeadDimV / 2>, Int<T::kBlockN>>{})(_, _, Int<(int)IS_R>{}, _0{});
+}
+
+template <
+    typename T>
 __forceinline__ __device__ long get_block_index(
     int block_idx,
     const Flash_fwd_mla_params &params,
-    int* block_table_ptr
-) {
-    const int block_table_idx = block_idx * T::Page_In_BlockN;
+    int *block_table_ptr)
+{
+    // const int block_table_idx = block_idx * T::Page_In_BlockN;
+    const int block_table_idx = block_idx * 1 / 2;
     const int block_table_offset = block_idx * T::kBlockN - block_table_idx * T::PAGE_BLOCK_SIZE;
-
     return long(__ldg(block_table_ptr + block_table_idx) * params.k_batch_stride + block_table_offset * params.k_row_stride);
 }
 
-template<
+template <
     typename T,
-    bool IS_BLK0_LAST,	// "BLK0" means block_idx+0, "BLK1" means block_idx+1, ...
+    bool IS_BLK0_LAST, // "BLK0" means block_idx+0, "BLK1" means block_idx+1, ...
     bool IS_BLK1_LAST,
     typename TiledCopy,
     typename Engine0, typename Layout0,
@@ -1160,26 +1209,28 @@ template<
     typename Engine6, typename Layout6,
     typename Engine7, typename Layout7,
     typename Engine8, typename Layout8,
-    // typename Engine9, typename Layout9,
+    typename Engine9, typename Layout9,
     typename Engine10, typename Layout10,
-    typename Engine11, typename Layout11
+    typename Engine11, typename Layout11,
+    typename Engine12, typename Layout12,
+    typename Engine13, typename Layout13
 >
 __forceinline__ __device__ void wg0_subroutine(
     TiledCopy tiled_copy,
     Tensor<Engine0, Layout0> &tKgK,
     Tensor<Engine1, Layout1> &sQ,
-    Tensor<Engine2, Layout2> &sK0,
-    // Tensor<Engine2, Layout2> &sK0N,
-    Tensor<Engine3, Layout3> &sK1,
-    // Tensor<Engine3, Layout3> &sK1N,
-    Tensor<Engine4, Layout4> &sP0,
-    Tensor<Engine5, Layout5> &sP1,
-    Tensor<Engine6, Layout6> &sM,
-    Tensor<Engine7, Layout7> &sScale0,
-    Tensor<Engine8, Layout8> &sScale1,
-    // Tensor<Engine9, Layout9> &rQ8,
-    Tensor<Engine10, Layout10> &rP0,
-    Tensor<Engine11, Layout11> &rO0,
+    Tensor<Engine2, Layout2> sK,
+    Tensor<Engine3, Layout3> &cur_sK0,
+    Tensor<Engine4, Layout4> &cur_sK1,
+    Tensor<Engine5, Layout5> &nxt_sK0,
+    Tensor<Engine6, Layout6> &sP0,
+    Tensor<Engine7, Layout7> &sP1,
+    Tensor<Engine8, Layout8> &sM,
+    Tensor<Engine9, Layout9> &sScale0,
+    Tensor<Engine10, Layout10> &sScale1,
+    Tensor<Engine11, Layout11> &rQ8,
+    Tensor<Engine12, Layout12> &rP0,
+    Tensor<Engine13, Layout13> &rO0,
     float rL[2],
     int rRightBorderForQSeq[2],
     __mbarrier_t barriers_K0[9],
@@ -1191,15 +1242,28 @@ __forceinline__ __device__ void wg0_subroutine(
     int block_idx,
     int end_block_idx,
     int idx_in_warpgroup,
-    int wg_idx
+    int wg_idx,
+    int &kv_idx
 ) {
     int start_token_idx = block_idx * T::kBlockN;
     int nxt_block0 = block_idx+2;
     int nxt_block1 = block_idx+3;
 
-    Tensor sV0L = get_half_V<T, 0>(sK0);
-    Tensor sV1L = get_half_V<T, 0>(sK1);
+    Tensor sV0L = get_half_V<T, 0>(cur_sK0);
+    Tensor sV1L = get_half_V<T, 0>(cur_sK1);
 
+    auto nxt_sK1 = cur_sK0;
+
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
+        if (wg_idx == 0) {
+            tKgK.data().ptr_ = make_gmem_ptr(
+                reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block0, params, block_table_ptr));
+            auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
+            Tensor tKsK0 = gmem_thr_copy_K.partition_D(nxt_sK0);
+            tiled_copy.desc_.dim_h = seqlen_k - (nxt_block0 * T::kBlockN);
+            launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK0, params, &barriers_K0[0], wg_idx);
+        }
+    }
     // Calc P0 = softmax(P0)
 #if ACOMPUTE_VERSION == 10000
     Tensor rPb = wg0_bunch_0< T, IS_BLK0_LAST || IS_BLK1_LAST > (rP0, rO0, sScale0, sM, rL, rRightBorderForQSeq, params.scale_softmax_log2, start_token_idx, idx_in_warpgroup);
@@ -1213,16 +1277,28 @@ __forceinline__ __device__ void wg0_subroutine(
     wg0_scale0_rO0(rO0, sScale0, idx_in_warpgroup);
     warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV0L, rO0, idx_in_warpgroup, wg_idx);
 
+    //  if (!IS_BLK0_LAST && !IS_BLK1_LAST && __builtin_expect(block_idx + 3 < end_block_idx, true)) {
+    //     if (wg_idx == 0) {
+    //         tKgK.data().ptr_ = make_gmem_ptr(
+    //             reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block1, params, block_table_ptr));
+    //         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
+    //         Tensor tKsK1 = gmem_thr_copy_K.partition_D(nxt_sK1);
+    //         tiled_copy.desc_.dim_h = seqlen_k - (nxt_block1 * T::kBlockN);
+    //         launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK1, params, &barriers_K1[0], wg_idx);
+    //     }
+    // }
     // Wait for warpgroup 1, rescale P0, notify warpgroup 1
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        tKgK.data().ptr_ = make_gmem_ptr(
-                     reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block0, params, block_table_ptr));
-        auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
-        Tensor tKsK0 = gmem_thr_copy_K.partition_D(sK0);
-        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block0*T::kBlockN);
-        launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK0, params, &barriers_K0[0], wg_idx);
+    if (!IS_BLK0_LAST && !IS_BLK1_LAST && __builtin_expect(block_idx + 3 < end_block_idx, true)) {
+        if (wg_idx == 0) {
+            tKgK.data().ptr_ = make_gmem_ptr(
+                reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block1, params, block_table_ptr));
+            auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
+            Tensor tKsK1 = gmem_thr_copy_K.partition_D(nxt_sK1);
+            tiled_copy.desc_.dim_h = seqlen_k - (nxt_block1 * T::kBlockN);
+            launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK1, params, &barriers_K1[0], wg_idx);
+        }
     }
 
     wg0_scale_rP0<T>(sScale1, rP0, rPb, idx_in_warpgroup);
@@ -1231,36 +1307,32 @@ __forceinline__ __device__ void wg0_subroutine(
     NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sP0Ready);
 
     // Wait for warpgroup 1, rescale O0, issue rO0 += rPb @ sV1L
-    if constexpr (!IS_BLK0_LAST) {
+    if constexpr (!IS_BLK0_LAST)
+    {
         NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
         wg0_rescale_rO0(rO0, sScale1, rL, idx_in_warpgroup);
         warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup, wg_idx);
     }
 
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST)
+    {
         cute::clear(rP0);
-        warpgroup_cooperative_qkt_gemm<T, 0>(sQ, sK0, rP0, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
-    }
-
-    // // Wait for rO0 += rPb @ sV1L, launch TMA
-    if (!IS_BLK0_LAST && !IS_BLK1_LAST && __builtin_expect(block_idx+3 < end_block_idx, true)) {
-        tKgK.data().ptr_ = make_gmem_ptr(
-                     reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block1, params, block_table_ptr));
-        auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
-        Tensor tKsK1 = gmem_thr_copy_K.partition_D(sK1);
-        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block1*T::kBlockN);
-
-        launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK1, params, &barriers_K1[0], wg_idx);
+        warpgroup_cooperative_qkt_gemm<T, 0>(sQ, nxt_sK0, nxt_sK1, rP0, rQ8, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
     }
 
     // Issue P0 = Q @ K0^T
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        warpgroup_cooperative_qkt_gemm<T, 2>(sQ, sK0, rP0, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST)
+    {
+        warpgroup_cooperative_qkt_gemm<T, 2>(sQ, nxt_sK0, nxt_sK1, rP0, rQ8, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
     }
+
+    kv_idx = (kv_idx + 2) % 3;
+    cur_sK0 = sK(_, _, kv_idx);
+    cur_sK1 = sK(_, _, (kv_idx + 1) % 3);
+    nxt_sK0 = sK(_, _, (kv_idx + 2) % 3);
 }
 
-
-template<
+template <
     typename T,
     bool IS_BLK0_LAST,
     bool IS_BLK1_LAST,
@@ -1275,26 +1347,28 @@ template<
     typename Engine6, typename Layout6,
     typename Engine7, typename Layout7,
     typename Engine8, typename Layout8,
-    // typename Engine9, typename Layout9,
+    typename Engine9, typename Layout9,
     typename Engine10, typename Layout10,
-    typename Engine11, typename Layout11
+    typename Engine11, typename Layout11,
+    typename Engine12, typename Layout12,
+    typename Engine13, typename Layout13
 >
 __forceinline__ __device__ void wg1_subroutine(
     TiledCopy tiled_copy,
     Tensor<Engine0, Layout0> &tKgK,
     Tensor<Engine1, Layout1> &sQ,
-    Tensor<Engine2, Layout2> &sK0,
-    // Tensor<Engine2, Layout2> &sK0N,
-    Tensor<Engine3, Layout3> &sK1,
-    // Tensor<Engine3, Layout3> &sK1N,
-    Tensor<Engine4, Layout4> &sP0,
-    Tensor<Engine5, Layout5> &sP1,
-    Tensor<Engine6, Layout6> &sM,
-    Tensor<Engine7, Layout7> &sScale0,
-    Tensor<Engine8, Layout8> &sScale1,
-    // Tensor<Engine9, Layout9> &rQ8,
-    Tensor<Engine10, Layout10> &rP1,
-    Tensor<Engine11, Layout11> &rO1,
+    Tensor<Engine2, Layout2> sK,
+    Tensor<Engine3, Layout3> &cur_sK1,
+    Tensor<Engine4, Layout4> &cur_sK0,
+    Tensor<Engine5, Layout5> &nxt_sK1,
+    Tensor<Engine6, Layout6> &sP0,
+    Tensor<Engine7, Layout7> &sP1,
+    Tensor<Engine8, Layout8> &sM,
+    Tensor<Engine9, Layout9> &sScale0,
+    Tensor<Engine10, Layout10> &sScale1,
+    Tensor<Engine11, Layout11> &rQ8,
+    Tensor<Engine12, Layout12> &rP1,
+    Tensor<Engine13, Layout13> &rO1,
     float rL[2],
     int rRightBorderForQSeq[2],
     __mbarrier_t barriers_K0[9],
@@ -1306,15 +1380,30 @@ __forceinline__ __device__ void wg1_subroutine(
     int block_idx,
     int end_block_idx,
     int idx_in_warpgroup,
-    int wg_idx
+    int wg_idx,
+    int &kv_idx
 ) {
     int start_token_idx = block_idx * T::kBlockN;
     int nxt_block0 = block_idx+2;
     int nxt_block1 = block_idx+3;
-    
-    Tensor sV0R = get_half_V<T, 1>(sK0);
-    Tensor sV1R = get_half_V<T, 1>(sK1);
 
+    auto nxt_sK0 = cur_sK1;
+    Tensor sV0R = get_half_V<T, 1>(cur_sK0);
+    Tensor sV1R = get_half_V<T, 1>(cur_sK1);
+
+    // Wait for rO1 += rP1b @ sV1R, launch TMA for the next V1R
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST)
+    {
+        if (wg_idx == 0)
+        {
+            tKgK.data().ptr_ = make_gmem_ptr(
+                reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block1, params, block_table_ptr));
+            auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
+            Tensor tKsK1 = gmem_thr_copy_K.partition_D(nxt_sK1);
+            tiled_copy.desc_.dim_h = seqlen_k - (nxt_block1 * T::kBlockN);
+            launch_kv_tiles_copy<4, 9>(tiled_copy, tKgK, tKsK1, params, &barriers_K1[1], wg_idx);
+        }
+    }
     // Wait for rP1 and warpgroup 0, run bunch 1, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
 
@@ -1340,37 +1429,33 @@ __forceinline__ __device__ void wg1_subroutine(
     // Wait for sP0, issue rO1 += sP0 @ sV0R, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sP0Ready);
 
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
+        if (wg_idx == 0) {
+            tKgK.data().ptr_ = make_gmem_ptr(
+                reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block0, params, block_table_ptr));
+            auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
+            Tensor tKsK0 = gmem_thr_copy_K.partition_D(nxt_sK0);
+            tiled_copy.desc_.dim_h = seqlen_k-(nxt_block0*T::kBlockN);
+            launch_kv_tiles_copy<4, 9>(tiled_copy, tKgK, tKsK0, params, &barriers_K0[1], wg_idx);
+        }
+    }
+    
     warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup, wg_idx);
 
     if constexpr (!IS_BLK0_LAST) {
         NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
     }
 
-    // Wait for rO1 += rP1b @ sV1R, launch TMA for the next V1R
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST) {
-        tKgK.data().ptr_ = make_gmem_ptr(
-            reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block1, params, block_table_ptr));
-        auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
-        Tensor tKsK1 = gmem_thr_copy_K.partition_D(sK1);
-        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block1*T::kBlockN);
-        launch_kv_tiles_copy<4, 9>(tiled_copy, tKgK, tKsK1, params, &barriers_K1[1], wg_idx);
-    }
-
-    // // Wait for rO1 += sP0 @ sV0R, launch TMA for the next V0R
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        tKgK.data().ptr_ = make_gmem_ptr(
-            reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block0, params, block_table_ptr));
-        auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
-        Tensor tKsK0 = gmem_thr_copy_K.partition_D(sK0);
-        tiled_copy.desc_.dim_h = seqlen_k-(nxt_block0*T::kBlockN);
-        launch_kv_tiles_copy<4, 9>(tiled_copy, tKgK, tKsK0, params, &barriers_K0[1], wg_idx);
-    }
-
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST) {
         cute::clear(rP1);
         // Issue rP1 = sQ @ sK1, wait
-        warpgroup_cooperative_qkt_gemm<T, 1>(sQ, sK1, rP1, barriers_K1, cur_phase_K1, idx_in_warpgroup, wg_idx);
+        warpgroup_cooperative_qkt_gemm<T, 1>(sQ, nxt_sK0, nxt_sK1, rP1, rQ8, barriers_K1, cur_phase_K1, idx_in_warpgroup, wg_idx);
     }
+
+    kv_idx = (kv_idx + 2) % 3;
+    cur_sK1 = sK(_, _, kv_idx);
+    cur_sK0 = sK(_, _, (kv_idx + 1) % 3);
+    nxt_sK1 = sK(_, _, (kv_idx + 2) % 3);
 }
 
 // A helper function for determining the length of the causal mask for one q token
@@ -1412,29 +1497,30 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     // Define shared tensors
     extern __shared__ char wksp_buf[];
     using SharedMemoryPlan = typename T::SharedMemoryPlan;
-    SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
+    SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan *>(wksp_buf);
     Tensor sQ = make_tensor(make_smem_ptr(plan.smem_sQ.data()), (typename T::SmemLayoutQ){});
-    Tensor sK0 = make_tensor(make_smem_ptr(plan.smem_sK0.data()), (typename T::SmemLayoutK){});
-    Tensor sK1 = make_tensor(make_smem_ptr(plan.smem_sK1.data()), (typename T::SmemLayoutK){});
-    Tensor sP0 = make_tensor(make_smem_ptr(plan.smem_sP0.data()), (typename T::SmemLayoutP0){});
-    Tensor sP1 = make_tensor(make_smem_ptr(plan.smem_sP1.data()), (typename T::SmemLayoutP0){});
+    Tensor sK = make_tensor(make_smem_ptr(plan.smem_sK.data()), (typename T::SmemLayoutK){});
+    Tensor sP0 = make_tensor(flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, Int<T::PAGE_BLOCK_SIZE>>{})(_, _, _0{}, _8{}).data(), (typename T::SmemLayoutP0){}); // Overlap with sQ's 8-th tile
+    Tensor sP1 = make_tensor(sP0.data() + sP0.size(), (typename T::SmemLayoutP0){});
     Tensor sM = make_tensor(make_smem_ptr(plan.smem_sM.data()), make_shape(Int<T::BLOCK_SIZE_M>{}));
-    Tensor sL_reduction_wksp = make_tensor(make_smem_ptr(plan.sL_reduction_wksp.data()), make_shape(Int<2*T::BLOCK_SIZE_M>{}));
+    Tensor sL_reduction_wksp = make_tensor(make_smem_ptr(plan.sL_reduction_wksp.data()), make_shape(Int<2 * T::BLOCK_SIZE_M>{}));
     Tensor sScale0 = make_tensor(make_smem_ptr(plan.smem_sScale0.data()), make_shape(Int<T::BLOCK_SIZE_M>{}));
     Tensor sScale1 = make_tensor(make_smem_ptr(plan.smem_sScale1.data()), make_shape(Int<T::BLOCK_SIZE_M>{}));
     // char* sO_addr = (char*)plan.smem_sK0.data();	// Overlap with sK0 and sK1
-    char* sO_addr = (char*)plan.smem_sQ.data();	// Overlap with sK0 and sK1
+    char *sO_addr = (char *)plan.smem_sQ.data(); // Overlap with sK0 and sK1
 
     // // Define TMA stuffs
-    __mbarrier_t* barrier_Q = &(plan.barrier_Q);
-    __mbarrier_t* barriers_K0 = plan.barriers_K0;
-    __mbarrier_t* barriers_K1 = plan.barriers_K1;
+    __mbarrier_t *barrier_Q = &(plan.barrier_Q);
+    __mbarrier_t *barriers_K0 = plan.barriers_K0;
+    __mbarrier_t *barriers_K1 = plan.barriers_K1;
 
     // // Initialize TMA barriers
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0)
+    {
         __mbarrier_init(barrier_Q, 32);
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < 2; ++i)
+        {
             __mbarrier_init(&barriers_K0[i], 32);
             __mbarrier_init(&barriers_K1[i], 32);
         }
@@ -1443,24 +1529,26 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 
     // // Programmatic Dependent Launch: Wait for the previous kernel to finish
     // cudaGridDependencySynchronize();
-    
+
     int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr + partition_idx * TileSchedulerMetaDataSize;
     // We don't use __ldg here, otherwise NVCC (ptxas, in particular) will do instruction reorder and place __ldg (LDG.E.128.CONSTANT in SASS) in front of cudaGridDependencySynchronize() (ACQBULK in SASS), leading to data race.
-    int4 tile_scheduler_metadata = *(reinterpret_cast<int4 *>(tile_scheduler_metadata_ptr));    
+    int4 tile_scheduler_metadata = *(reinterpret_cast<int4 *>(tile_scheduler_metadata_ptr));
     int begin_idx = tile_scheduler_metadata.x;
     int begin_seqlen = tile_scheduler_metadata.y;
     int end_idx = tile_scheduler_metadata.z;
     int end_seqlen = tile_scheduler_metadata.w;
 
-    if (begin_idx >= params.b) return;
+    if (begin_idx >= params.b)
+        return;
     int begin_n_split_idx = *(tile_scheduler_metadata_ptr + 4);
 
     // Copy the first Q
     launch_q_copy<T>(params, begin_idx, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
 
-    #pragma unroll 1
-    #pragma clang loop licm(disable)
-    for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
+#pragma unroll 1
+#pragma clang loop licm(disable)
+    for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx)
+    {
         constexpr int kBlockN = T::kBlockN;
         const int n_split_idx = batch_idx == begin_idx ? begin_n_split_idx : 0;
         int seqlen_k = __ldg(params.cu_seqlens_k + batch_idx);
@@ -1469,7 +1557,8 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         const bool is_no_split = start_block_idx == 0 && end_block_idx == cute::ceil_div(seqlen_k, kBlockN);
 
         int rRightBorderForQSeq[2];
-        if constexpr (Is_causal) {
+        if constexpr (Is_causal)
+        {
             // The causal mask looks like:
             // XXXX
             // XXXX
@@ -1508,9 +1597,13 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         // Copy K0 and K1
         typename T::GmemTiledCopyKV gmem_tiled_copy_K;
         auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(tidx);
+        Tensor tKgK = gmem_thr_copy_K.partition_S(make_mix_tensor_like(gK)); // (KCPY, KCPY_N, KCPY_K)
 
-        Tensor tKgK = gmem_thr_copy_K.partition_S(make_mix_tensor_like(gK));  // (KCPY, KCPY_N, KCPY_K)
-        Tensor tKsK0 = gmem_thr_copy_K.partition_D(sK0);
+        Tensor cur_sK0 = sK(_, _, 0);
+        Tensor cur_sK1 = sK(_, _, 1);
+        Tensor nxt_sK0 = sK(_, _, 2);
+        Tensor tKsK0 = gmem_thr_copy_K.partition_D(cur_sK0);
+        Tensor tKsK1 = gmem_thr_copy_K.partition_D(cur_sK1);
  
         // gmem_tiled_copy_K.desc_ = AiuDesc{nullptr, kBlockN, params.k_row_stride, kBlockN, T::kBlockKSmem, 0};
 #if ACOMPUTE_VERSION == 10000
@@ -1518,20 +1611,22 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 #else
         gmem_tiled_copy_K.desc_.init(nullptr, kBlockN, params.d, params.k_row_stride);
 #endif
-        if (seqlen_k !=0) {
-            gmem_tiled_copy_K.desc_.dim_h = seqlen_k - (start_block_idx * kBlockN);
-            launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K0[1], warp_idx);
-            launch_kv_tiles_copy<0, 4>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K0[0], warp_idx);
-        }
+        if (seqlen_k != 0) {
+            if (warp_idx == 0) {
+                gmem_tiled_copy_K.desc_.dim_h = seqlen_k - (start_block_idx * kBlockN);
+                launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK1, params, &barriers_K0[1], warp_idx);
+                launch_kv_tiles_copy<0, 4>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K0[0], warp_idx);
+            }
+         }
 
         if (start_block_idx+1 < end_block_idx) {
-            tKgK.data().ptr_ = make_gmem_ptr(
-                    reinterpret_cast<InputT *>(params.k_ptr) + get_block_index<T>(start_block_idx + 1, params, block_table_ptr));
-            Tensor tKsK1 = gmem_thr_copy_K.partition_D(sK1);
-            gmem_tiled_copy_K.desc_.dim_h = seqlen_k-((start_block_idx + 1) * kBlockN);
-
-            launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK1, params, &barriers_K1[1], warp_idx);
-            launch_kv_tiles_copy<0, 4>(gmem_tiled_copy_K, tKgK, tKsK1, params, &barriers_K1[0], warp_idx);
+            if (warp_idx == 0) {
+                tKgK.data().ptr_ = make_gmem_ptr(
+                        reinterpret_cast<InputT *>(params.k_ptr) + get_block_index<T>(start_block_idx + 1, params, block_table_ptr));
+                gmem_tiled_copy_K.desc_.dim_h = seqlen_k - ((start_block_idx + 1) * kBlockN);
+                launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K1[1], warp_idx);
+                launch_kv_tiles_copy<0, 4>(gmem_tiled_copy_K, tKgK, tKsK1, params, &barriers_K1[0], warp_idx);
+            }
         }
 
         Tensor rO = partition_fragment_C((typename T::TiledMma){}, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV / 2>>{});	// ((2, 2, 32), 1, 1)
@@ -1547,18 +1642,10 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         while(!cutlass::arch::test_wait(barrier_Q, cur_phase_Q, 1)) {
             kernel_sleep_ns();
         }
-        cur_phase_Q ^= 1;
-        // Tensor rQ8 = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
-        // retrieve_rP_from_sP<T>(rQ8, local_tile(sQ, Shape<_64, _64>{}, Coord<_0, _8>{}), idx_in_warpgroup);
-        // copy sQ to rQ.
-        // auto thr_mma = tiled_mma.get_thread_slice(idx_in_warpgroup);
-        // auto smem_tiled_copy_Q = make_tiled_copy_A(typename T::SmemCopyAtomQ{}, tiled_mma);
-        // auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(idx_in_warpgroup);
-        // Tensor tSsQ = smem_thr_copy_Q.partition_S(make_mix_tensor_like(sQ));
-        // Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);
-        // Tensor rQ8 = smem_thr_copy_Q.retile_D(tSrQ);
-        // CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(rQ8));
-        // cute::copy(smem_tiled_copy_Q, tSsQ, rQ8);
+        cur_phase_Q = (cur_phase_Q + 1) & 1;
+
+        Tensor rQ8 = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
+        retrieve_rP_from_sP<T>(rQ8, local_tile(sQ, Shape<_128, _64>{}, Coord<_0, _8>{}), idx_in_warpgroup);
 
         if (warpgroup_idx == 0) {
             // Warpgroup 0
@@ -1571,16 +1658,16 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             // Issue P0 = Q @ K0^T, wait
             if (seqlen_k !=0) {
                 cute::clear(rP0);
-                warpgroup_cooperative_qkt_gemm<T, 1>(sQ, sK0, rP0, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
+                warpgroup_cooperative_qkt_gemm<T, 1>(sQ, cur_sK0, cur_sK1, rP0, rQ8, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
             }
 
-            #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST) \
-                wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>( \
-                    gmem_tiled_copy_K, tKgK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
-                    rP0, rO, rL, rRightBorderForQSeq, \
-                    barriers_K0, barriers_K1, cur_phase_K0, params, \
-                    block_table_ptr, seqlen_k, block_idx, end_block_idx, idx_in_warpgroup, wg_idx \
-                ); \
+            int idx = 0;
+            #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
+                wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>(                            \
+                gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
+                rP0, rO, rL, rRightBorderForQSeq,                                     \
+                barriers_K0, barriers_K1, cur_phase_K0, params,                       \
+                block_table_ptr, seqlen_k, block_idx, end_block_idx, idx_in_warpgroup, wg_idx, idx); \
 
             int block_idx = start_block_idx;
 
@@ -1602,17 +1689,17 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 
             if (start_block_idx+1 < end_block_idx) {
                 // Issue rP1 = sQ @ sK1, wait
-                warpgroup_cooperative_qkt_gemm<T, 1>(sQ, sK1, rP1, barriers_K1, cur_phase_K1, idx_in_warpgroup, wg_idx);
+                warpgroup_cooperative_qkt_gemm<T, 1>(sQ, cur_sK1, cur_sK0, rP1, rQ8, barriers_K1, cur_phase_K1, idx_in_warpgroup, wg_idx);
             }
 
-            #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST) \
-                wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>( \
-                    gmem_tiled_copy_K, tKgK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
-                    rP1, rO, rL, rRightBorderForQSeq, \
-                    barriers_K0, barriers_K1, cur_phase_K1, params, \
-                    block_table_ptr, seqlen_k, block_idx, end_block_idx, idx_in_warpgroup, wg_idx \
-                );
-            
+            int idx = 0;
+            #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST)       \
+                wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(              \
+                gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
+                rP1, rO, rL, rRightBorderForQSeq,                                     \
+                barriers_K0, barriers_K1, cur_phase_K1, params,                       \
+                block_table_ptr, seqlen_k, block_idx, end_block_idx, idx_in_warpgroup, wg_idx, idx); \
+ 
             int block_idx = start_block_idx;
             #pragma unroll 1
             for (; block_idx < end_block_idx-3; block_idx += 2) {
@@ -1640,23 +1727,28 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 
         // Reduce rL across warpgroups
         int my_row = get_AorC_row_idx(0, idx_in_warpgroup);
-        if (idx_in_warpgroup%4 == 0) {
-            sL_reduction_wksp[my_row + warpgroup_idx*128] = rL[0];
-            sL_reduction_wksp[my_row + 8 + warpgroup_idx*128] = rL[1];
+        if (idx_in_warpgroup % 4 == 0)
+        {
+            sL_reduction_wksp[my_row + warpgroup_idx * 128] = rL[0];
+            sL_reduction_wksp[my_row + 8 + warpgroup_idx * 128] = rL[1];
         }
         __syncthreads();
 
-        if (warpgroup_idx == 0) {
+        if (warpgroup_idx == 0)
+        {
             rL[0] += sL_reduction_wksp[my_row + 128];
             rL[1] += sL_reduction_wksp[my_row + 8 + 128];
-        } else {
-            if (idx_in_warpgroup%4 == 0) {
+        }
+        else
+        {
+            if (idx_in_warpgroup % 4 == 0)
+            {
                 sL_reduction_wksp[my_row] += rL[0];
                 sL_reduction_wksp[my_row + 8] += rL[1];
             }
             __syncwarp();
             rL[0] = sL_reduction_wksp[my_row];
-            rL[1] = sL_reduction_wksp[my_row+8];
+            rL[1] = sL_reduction_wksp[my_row + 8];
         }
 
         // Prune out when rL is 0.0f or NaN
@@ -1669,69 +1761,81 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             rL[i] = (rL[i] == 0.0f || rL[i] != rL[i]) ? 1.0f : rL[i];
 
         // Epilogue
-        int num_valid_seq_q = min(params.seqlen_q - m_block_idx*T::BLOCK_SIZE_M, T::BLOCK_SIZE_M);
-        if (is_no_split) {
-            InputT* o_ptr = (InputT*)params.o_ptr + batch_idx*params.o_batch_stride + m_block_idx*T::BLOCK_SIZE_M*params.o_row_stride + k_head_idx*params.o_head_stride;	// (BLOCK_SIZE_M, HEAD_DIM_V) : (params.o_row_stride, 1)
-            float* softmax_lse_ptr = (float*)params.softmax_lse_ptr + (batch_idx*params.h + k_head_idx)*params.seqlen_q + m_block_idx*T::BLOCK_SIZE_M;	// (BLOCK_SIZE_M) : (1)
+        int num_valid_seq_q = min(params.seqlen_q - m_block_idx * T::BLOCK_SIZE_M, T::BLOCK_SIZE_M);
+        if (is_no_split)
+        {
+            InputT *o_ptr = (InputT *)params.o_ptr + batch_idx * params.o_batch_stride + m_block_idx * T::BLOCK_SIZE_M * params.o_row_stride + k_head_idx * params.o_head_stride; // (BLOCK_SIZE_M, HEAD_DIM_V) : (params.o_row_stride, 1)
+            float *softmax_lse_ptr = (float *)params.softmax_lse_ptr + (batch_idx * params.h + k_head_idx) * params.seqlen_q + m_block_idx * T::BLOCK_SIZE_M;                     // (BLOCK_SIZE_M) : (1)
 
             Tensor gO = make_tensor(make_gmem_ptr(o_ptr), make_layout(
-                    Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV>>{},
-                            make_stride(params.o_row_stride, _1{})));
+                                                              Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV>>{},
+                                                              make_stride(params.o_row_stride, _1{})));
             Tensor gSoftmaxLse = make_tensor(make_gmem_ptr(softmax_lse_ptr), Layout<
-                Shape<Int<T::BLOCK_SIZE_M>>,
-                Stride<_1>>{});
+                                                                                 Shape<Int<T::BLOCK_SIZE_M>>,
+                                                                                 Stride<_1>>{});
 
             store_o<T, true>(rO, gO, rL, sO_addr, params, batch_idx, k_head_idx, m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
 
-            if (batch_idx+1 <= end_idx) {
-                launch_q_copy<T>(params, batch_idx+1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
-            } else {
+            if (batch_idx + 1 <= end_idx)
+            {
+                launch_q_copy<T>(params, batch_idx + 1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
+            }
+            else
+            {
                 // Allow the next kernel (the combine kernel) to launch
                 // The next kernel MUST be the combine kernel
                 cudaTriggerProgrammaticLaunchCompletion();
             }
 
             int i = threadIdx.x;
-            if (i < num_valid_seq_q) {
+            if (i < num_valid_seq_q)
+            {
                 float cur_L = sL_reduction_wksp[i];
                 gSoftmaxLse(i) = (cur_L == 0.0f || cur_L != cur_L) ? INFINITY : logf(cur_L) + sM(i) / (float)M_LOG2E;
             }
-        } else {
+        }
+        else
+        {
             // Don't use __ldg because of PDL and instruction reordering
             int split_idx = params.num_splits_ptr[batch_idx] + n_split_idx;
 
-            float* oaccum_ptr = (float*)params.oaccum_ptr + ((split_idx*params.h + k_head_idx)*params.seqlen_q + m_block_idx*T::BLOCK_SIZE_M)*T::kHeadDimV;	// (BLOCK_SIZE_M, HEAD_DIM_V) : (HEAD_DIM_V, 1)
-            float* softmax_lseaccum_ptr = (float*)params.softmax_lseaccum_ptr + (split_idx*params.h + k_head_idx)*params.seqlen_q + m_block_idx*T::BLOCK_SIZE_M;	// (BLOCK_SIZE_M) : (1)
+            float *oaccum_ptr = (float *)params.oaccum_ptr + ((split_idx * params.h + k_head_idx) * params.seqlen_q + m_block_idx * T::BLOCK_SIZE_M) * T::kHeadDimV;    // (BLOCK_SIZE_M, HEAD_DIM_V) : (HEAD_DIM_V, 1)
+            float *softmax_lseaccum_ptr = (float *)params.softmax_lseaccum_ptr + (split_idx * params.h + k_head_idx) * params.seqlen_q + m_block_idx * T::BLOCK_SIZE_M; // (BLOCK_SIZE_M) : (1)
             Tensor gOAccum = make_tensor(make_gmem_ptr(oaccum_ptr), Layout<
-                Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV>>,
-                Stride<Int<T::kHeadDimV>, _1>
-            >{});
+                                                                        Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV>>,
+                                                                        Stride<Int<T::kHeadDimV>, _1>>{});
             Tensor gSoftmaxLseAccum = make_tensor(make_gmem_ptr(softmax_lseaccum_ptr), Layout<
-                Shape<Int<T::BLOCK_SIZE_M>>,
-                Stride<_1>
-            >{});
+                                                                                           Shape<Int<T::BLOCK_SIZE_M>>,
+                                                                                           Stride<_1>>{});
 
             int i = threadIdx.x;
-            if (i < num_valid_seq_q) {
+            if (i < num_valid_seq_q)
+            {
                 float cur_L = sL_reduction_wksp[i];
                 gSoftmaxLseAccum(i) = (cur_L == 0.0f || cur_L != cur_L) ? -INFINITY : log2f(cur_L) + sM(i);
             }
+
             store_o<T, false>(rO, gOAccum, rL, sO_addr, params, batch_idx, k_head_idx, m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
 
             __syncthreads();
 
-            if (batch_idx+1 <= end_idx) {
-                if (threadIdx.x == 0) {
+            if (batch_idx + 1 <= end_idx)
+            {
+                if (threadIdx.x == 0)
+                {
                     __mbarrier_init(barrier_Q, 32);
                     CUTLASS_PRAGMA_UNROLL
-                    for (int i = 0; i < 2; ++i) {
+                    for (int i = 0; i < 2; ++i)
+                    {
                         __mbarrier_init(&barriers_K0[i], 32);
                         __mbarrier_init(&barriers_K1[i], 32);
                     }
                 }
                 cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
-                launch_q_copy<T>(params, batch_idx+1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
-            } else {
+                launch_q_copy<T>(params, batch_idx + 1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
+            }
+            else
+            {
                 // Allow the next kernel (the combine kernel) to launch
                 // The next kernel MUST be the combine kernel
                 cudaTriggerProgrammaticLaunchCompletion();
@@ -1742,9 +1846,11 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     }
 }
 
-template<typename InputT, int Arch>
-void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t stream) {
-        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+template <typename InputT, int Arch>
+void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t stream)
+{
+    BOOL_SWITCH(params.is_causal, Is_causal, [&]
+                {
         using T = Traits<InputT>;
     
         auto mla_kernel = &flash_fwd_splitkv_mla_kernel<T, Is_causal>;
@@ -1798,8 +1904,7 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t str
 
         CHECK_CUDA_KERNEL_LAUNCH();
 
-        run_flash_mla_combine_kernel<InputT>(params, stream);
-    });
+        run_flash_mla_combine_kernel<InputT>(params, stream); });
 }
 
 template void run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 80>(Flash_fwd_mla_params &params, cudaStream_t stream);

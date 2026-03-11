@@ -43,7 +43,7 @@ struct Traits {
     static constexpr bool Share_Q_K_smem = true;
     static constexpr bool Is_Q_in_regs = true || Share_Q_K_smem;
 
-    static constexpr int NUM_K_BUFS = 2;
+    static constexpr int NUM_K_BUFS = 3;
 
     static_assert(std::is_same_v<InputT, cutlass::bfloat16_t> || std::is_same_v<InputT, cutlass::half_t>);
 
@@ -85,21 +85,25 @@ struct Traits {
         SmemLayoutAtom{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
-    using SmemLayoutK = decltype(tile_to_shape(
+    using SmemLayoutK_ = decltype(tile_to_shape(
         SmemLayoutAtom{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+
+    using SmemLayoutK = decltype(tile_to_shape(
+        SmemLayoutAtom{},
+        Shape<Int<kBlockN>, Int<kHeadDim>, Int<NUM_K_BUFS>>{}));
 
     // using SmemLayoutV = decltype(tile_to_shape(
     //     SmemLayoutAtom{},
     //     Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
     using SmemLayoutV = decltype(composition(
-        SmemLayoutK{},
+        SmemLayoutK_{},
         make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})
     ));	// A transposed version of SmemLayoutK
 
-    using SmemLayoutVtransposed = decltype(
-        composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
-    using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
+    // using SmemLayoutVtransposed = decltype(
+    //     composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
+    // using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
     using SmemLayoutAtomO = decltype(
         composition(Swizzle<3, 3, 3>{},
@@ -137,10 +141,7 @@ struct Traits {
 
     struct SharedMemoryPlan {
         cute::array_aligned<InputT, cosize_v<SmemLayoutQ>> smem_sQ;
-        cute::array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK0;
-        cute::array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK1;
-        cute::array_aligned<InputT, cosize_v<SmemLayoutP0>> smem_sP0;
-        cute::array_aligned<InputT, cosize_v<SmemLayoutP0>> smem_sP1;
+        cute::array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK;
         cute::array_aligned<float, kBlockM> smem_sM;
         cute::array_aligned<float, 2*kBlockM> sL_reduction_wksp;
         cute::array_aligned<float, kBlockM> smem_sScale0;
