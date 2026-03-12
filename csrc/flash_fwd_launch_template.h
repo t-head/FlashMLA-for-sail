@@ -123,6 +123,12 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
     bool cross_cut = use_cross_cut(params.seqlen_q, params.b);
 
     bool warp_interleave = params.seqlen_q >=128 && params.page_block_size == 64;
+
+    // temp to disable warp interleave for random issue.
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    if (std::string(dprops->name).find("610") != std::string::npos)
+        warp_interleave = false;
+
 // #if ACOMPUTE_VERSION==10000
     if (!is_sm89_or_newer()) {
         if (cross_cut) {
