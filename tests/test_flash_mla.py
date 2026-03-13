@@ -65,13 +65,21 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
     block_table = torch.arange(
         b * max_seqlen_pad // block_size, dtype=torch.int32
     ).view(b, max_seqlen_pad // block_size)
-    blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device=dev)
+    # blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device=dev)
+    blocked_base = torch.randn(block_table.numel(), block_size+16, h_kv, d, device=dev)
+    blocked_k = blocked_base[:,:block_size, ...]    
     # blocked_k = torch.ones(block_table.numel(), block_size, h_kv, d, device="cpu")
-    
+
     for i in range(b):
-        blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = (
-            float("nan")
-        )
+        cur_len = cache_seqlens[i].item()
+        cur_num_blocks = triton.cdiv(cur_len, block_size)
+        blocked_k[block_table[i][cur_num_blocks:]] = float("nan")
+        if cur_len % block_size != 0:
+            blocked_k[block_table[i][cur_num_blocks - 1]][cur_len % block_size:] = float("nan")
+        # blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = (
+        #     float("nan")
+        # )
+        block_table[i][cur_num_blocks:] = 2147480000
     blocked_v = blocked_k[..., :dv]
 
     torch.cuda.nvtx.range_push(case_name)
@@ -99,8 +107,10 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
             end = begin + cache_seqlens[i]
             O, LSE = scaled_dot_product_attention(
                 q[i].transpose(0, 1).to('cuda'),
-                blocked_k.view(-1, h_kv, d)[begin:end].transpose(0, 1).to('cuda'),
-                blocked_v.view(-1, h_kv, dv)[begin:end].transpose(0, 1).to('cuda'),
+                # blocked_k.view(-1, h_kv, d)[begin:end].transpose(0, 1).to('cuda'),
+                # blocked_v.view(-1, h_kv, dv)[begin:end].transpose(0, 1).to('cuda'),
+                blocked_k.reshape(-1, h_kv, d)[begin:end].transpose(0, 1).to('cuda'),
+                blocked_v.reshape(-1, h_kv, dv)[begin:end].transpose(0, 1).to('cuda'),
                 h_q=h_q,
                 h_kv=h_kv,
                 is_causal=causal,
@@ -116,7 +126,7 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, paged_bloc
         out_torch, lse_torch = ref_mla()
         diff = out_flash - out_torch
 
-        print(f'diff.max = {diff.max()}, diff.min = {diff.min()}')
+        # print(f'diff.max = {diff.max()}, diff.min = {diff.min()}')
         cal_diff(out_flash, out_torch, "out")
         cal_diff(lse_flash, lse_torch, "lse")
 

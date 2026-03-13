@@ -25,7 +25,7 @@
 
 using namespace cute;
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool USE_MMA_M8=true, typename elem_type=cutlass::half_t>
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kBlockNPagedPerAiuLoad_, bool USE_MMA_M8=true, typename elem_type=cutlass::half_t>
 struct Flash_kernel_traits {
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
@@ -77,8 +77,8 @@ struct Flash_kernel_traits {
 
     // using SmemCopyOpQt = PPU_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, true, true, 1>;
     // using SmemCopyAtomQt = Copy_Atom<SmemCopyOpQt, elem_type>;
-
-    using SmemCopyOpK = PPU_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, true, false, kHeadDim_ / kBlockKSmem>;
+    using SmemCopyOpK = PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad_, kBlockKSmem, true, false,
+                                        kBlockN_ / kBlockNPagedPerAiuLoad_ * kHeadDim_ / kBlockKSmem>;
     using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, elem_type>;
 
     // using SmemCopyOpKVt = Acompute10000_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, false, true>;
@@ -99,8 +99,8 @@ struct Flash_kernel_traits {
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
          int kHeadDimV_ = kHeadDim_,
          bool CrossCut_ = false, bool USE_MMA_M8_ = true, int AtomLayoutQ_ = kNWarps_, int AtomLayoutP_ = kNWarps_,
-         int kStages_ = 2,
-         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, USE_MMA_M8_, elem_type>>
+         int kBlockNPagedPerAiuLoad_ = kBlockN_, int kStages_ = 2,
+         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, kBlockNPagedPerAiuLoad_, USE_MMA_M8_, elem_type>>
 struct Flash_fwd_kernel_traits : public Base {
     using Element = typename Base::Element;
     using ElementAccum = typename Base::ElementAccum;
@@ -139,15 +139,15 @@ struct Flash_fwd_kernel_traits : public Base {
     // static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
     static constexpr int kSwizzleV = kBlockKSmemV == 32 ? 2 : 3;
+    static constexpr int kBlockNPagedPerAiuLoad = kBlockNPagedPerAiuLoad_;
 
 #if USE_AIU
-    using SmemCopyOpVt = PPU_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmemV, true, true, kHeadDim / kBlockKSmemV>;
+    using SmemCopyOpVt = PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmemV, true, true,
+                                         kBlockN/kBlockNPagedPerAiuLoad * kHeadDim / kBlockKSmemV>;
     using SmemCopyAtomVt = Copy_Atom<SmemCopyOpVt, elem_type>;
 #else
     using SmemCopyAtomVt = SmemCopyAtomTransposed;
 #endif
-
-
     static_assert((CrossCut && kStages==3) || kStages == 2, "kStages can be 2 or 3 if CrossCut.");
     /// only for CrossCut ///
     static_assert(!CrossCut || kNWarps % AtomLayoutQ == 0, "kNWarps must be a multiple of AtomLayoutQ if CrossCut");
@@ -198,6 +198,12 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemLayoutKstages = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
         Shape<Int<kBlockN>, Int<kHeadDim>, Int<kStages>>{}));
+
+    using SmemLayoutKPagedstages = decltype(tile_to_shape(
+        SmemLayoutAtomQ{},
+        Shape<Int<kBlockNPagedPerAiuLoad>, Int<kHeadDim>,
+        Int<kBlockN/kBlockNPagedPerAiuLoad>, Int<kStages>>{}));
+
     using SmemLayoutVstages = decltype(tile_to_shape(
         SmemLayoutAtomV{},
         Shape<Int<kBlockN>, Int<kHeadDimV>, Int<kStages>>{}));
@@ -292,20 +298,13 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
-    using GmemTiledCopyVWoAiu = decltype(
-        make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
-                        GmemLayoutAtomV{},
-                        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
 #if USE_AIU
     // static_assert(Block_K{} * sizeof(Element) % 32 == 0, "aiu_no_trans: block_k must be multiple of 32B");
     static constexpr int bits_per_aiu_Q = kBlockM * kBlockKSmem * sizeof(Element) * 8;
     using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, Element, false, kBlockM, kBlockKSmem>;
 
-    static constexpr int bits_per_aiu_K = kBlockN * kBlockKSmem * sizeof(Element) * 8;
-    using Gmem_copy_struct_K = PPU_AIU_LOAD<cute::C<bits_per_aiu_K>, Element, false, kBlockN, kBlockKSmem>;
-
-    static constexpr int bits_per_aiu_V = kBlockN * kBlockKSmemV * sizeof(Element) * 8;
-    using Gmem_copy_struct_V = PPU_AIU_LOAD<cute::C<bits_per_aiu_V>, Element, false, kBlockN, kBlockKSmemV>;
+    static constexpr int bits_per_aiu_K = kBlockNPagedPerAiuLoad * kBlockKSmem * sizeof(Element) * 8;
+    using Gmem_copy_struct_K = PPU_AIU_LOAD<cute::C<bits_per_aiu_K>, Element, false, kBlockNPagedPerAiuLoad, kBlockKSmem>;
 
     using GmemTiledCopyQ = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, Element>{},
@@ -316,19 +315,10 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_K, Element>{},
                     Layout<Shape <_1,_1>,
                            Stride<_1,_1>>{},
-                    Layout<Shape <Int<kBlockN>, Int<kBlockKSmem>>>{}));
-    using GmemTiledCopyV = decltype(
-        make_tiled_copy(Copy_Atom<Gmem_copy_struct_V, Element>{},
-                    Layout<Shape <_1,_1>,
-                           Stride<_1,_1>>{},
-                    Layout<Shape <Int<kBlockN>, Int<kBlockKSmemV>>>{}));
+                    Layout<Shape <Int<kBlockNPagedPerAiuLoad>, Int<kBlockKSmem>>>{}));
 #else
     using GmemTiledCopyQ = GmemTiledCopyQK;
     using GmemTiledCopyK = GmemTiledCopyQK;
-    using GmemTiledCopyV = decltype(
-        make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
-                        GmemLayoutAtomV{},
-                        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
 #endif
 
     using GmemTiledCopyO = decltype(

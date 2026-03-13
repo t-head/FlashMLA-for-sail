@@ -87,6 +87,55 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+template<int kPagedLoad, int UpdateSmemSize, bool ifgemm0,
+         bool A_in_regs=false, bool B_in_regs=false, typename Tensor0, typename Tensor1,
+         typename Tensor2, typename Tensor3, typename Tensor4,
+         typename TiledMma, typename TiledCopyA, typename TiledCopyB,
+         typename ThrCopyA, typename ThrCopyB>
+__forceinline__ __device__ void gemm_pagedkv(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
+                            Tensor4 const& tCsB, TiledMma tiled_mma,
+                            TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
+                            ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B) {
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
+
+    if (!B_in_regs) {
+        if (ifgemm0) {
+            for (int i = 0; i < size<1>(tCrA); ++i) {
+                auto tCsB_tile = tCsB(_, i, _);
+                Tensor tCsB_temp = make_tensor(tCsB_tile.data(), tCsB_tile.layout());
+                const int coord_h = cute::get<1>(tCsB_temp.data().coord_);
+                const int paged_idx = coord_h / kPagedLoad;
+                cute::get<1>(tCsB_temp.data().coord_) = coord_h % kPagedLoad;
+                tCsB_temp.data().ptr_ = tCsB_temp.data().ptr_  + paged_idx * UpdateSmemSize;
+                cute::copy(smem_tiled_copy_B, tCsB_temp, tCrB_copy_view(_, i, _));
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < size<2>(tCrA); ++i) {
+                auto tCsB_tile = tCsB(_, _, i);
+                Tensor tCsB_temp = make_tensor(tCsB_tile.data(), tCsB_tile.layout());
+                const int coord_h = cute::get<0>(tCsB_temp.data().coord_);
+                const int paged_idx = coord_h / kPagedLoad;
+                cute::get<0>(tCsB_temp.data().coord_) = coord_h % kPagedLoad;
+                tCsB_temp.data().ptr_ = tCsB_temp.data().ptr_ + paged_idx * UpdateSmemSize;
+                cute::copy(smem_tiled_copy_B, tCsB_temp, tCrB_copy_view(_, _, i));
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
+        }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
 
 template<bool A_in_regs=false, bool B_in_regs=false, typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,

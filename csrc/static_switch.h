@@ -40,7 +40,7 @@
     }                                      \
   }()
 
-  #define THREADS_SWITCH(BLOCKS, ...)   \
+#define THREADS_SWITCH(BLOCKS, ...)   \
   [&] {                                    \
     if (BLOCKS <= 32) {                   \
       constexpr static int kBlockM = 1;  \

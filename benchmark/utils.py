@@ -159,7 +159,7 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, ba
         if mode != "full":
             if ret.returncode == 0:
                 cycles, tc, l2, hbm, inner_cycle, duration, detail = read_cycle_from_nculog(log_file)
-                row = [case, str(cycles), str(tc), str(l2), str(hbm), str(inner_cycle), str(duration), str(cmd), str(detail)]
+                row = [case.replace(",","_"), str(cycles), str(tc), str(l2), str(hbm), str(inner_cycle), str(duration), str(cmd), str(detail)]
                 output_lines.append(row)
                 with open(f"{output_file}_{backend}.csv", "a") as f:
                     writer = csv.writer(f)

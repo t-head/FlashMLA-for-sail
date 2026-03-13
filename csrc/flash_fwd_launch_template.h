@@ -47,7 +47,8 @@ void printf_show_log(const void* kernel, Flash_fwd_params &params, const size_t 
             printf("blockM:%d, blockN:%d, threads:%d, params.num_splits:%d, block_size:%d\n",
                     Kernel_traits::kBlockM, Kernel_traits::kBlockN, Kernel_traits::kNThreads, params.num_splits, params.page_block_size);
             printf("Is_causal:%d, ngroups:%d\n", is_causal, params.ngroups);
-            printf("CrossCut:%d, USE_MMA_M8:%d, kStages:%d\n", Kernel_traits::CrossCut, Kernel_traits::USE_MMA_M8, Kernel_traits::kStages);
+            printf("CrossCut:%d, USE_MMA_M8:%d, kStages:%d, kBlockNPagedPerAiuLoad:%d\n",
+                    Kernel_traits::CrossCut, Kernel_traits::USE_MMA_M8, Kernel_traits::kStages, Kernel_traits::kBlockNPagedPerAiuLoad);
             printf("kNWarps:%d, AtomLayoutQ:%d, AtomLayoutP:%d\n", Kernel_traits::kNWarps, Kernel_traits::AtomLayoutQ, Kernel_traits::AtomLayoutP);
             printf("Is_Q_in_regs:%d, Share_Q_K_smem:%d\n", Kernel_traits::Is_Q_in_regs, Kernel_traits::Share_Q_K_smem);
             printf("seq[%d, %d], grid_n[%d, %d, %d]\n",
@@ -61,7 +62,6 @@ void printf_show_log(const void* kernel, Flash_fwd_params &params, const size_t 
 
 template<typename Kernel_traits, bool CrossCut = false>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-    //FLASH_ASSERT(params.page_block_size == Kernel_traits::kBlockN);
     //constexpr size_t smem_size = Kernel_traits::kSmemSize;
     constexpr size_t smem_size = Kernel_traits::kSmemSizeAccum;
     const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
@@ -118,8 +118,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
 template<typename T, int Headdim, int Headdim_V>
 void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
-    // constexpr static int kBlockM = 64;  // Fixed for all head dimensions
-
+    FLASH_ASSERT(params.page_block_size % 16 == 0);
     bool cross_cut = use_cross_cut(params.seqlen_q, params.b);
 
     // mtp3/5 tp4/8 seq_m is 160 or 192, blockM 256 not good.
@@ -142,10 +141,13 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
                 constexpr int kNwarps = 8;
                 constexpr int AtomLayoutQ = 4;
                 constexpr int AtomLayoutP = 1;
-                run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
-                    Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
-                    Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
-                    >, 1/*CrossCut*/>(params, stream);
+                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThankBlockN, [&] {
+                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThankBlockN ? kBlockN : 16;
+                    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                        Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                        Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP, kBlockNPagedPerAiuLoad
+                        >, 1/*CrossCut*/>(params, stream);
+                });
             } else if (params.seqlen_q <= 48) {
                 constexpr static int kBlockM = 48;
                 constexpr static int kBlockN= 64;
@@ -153,10 +155,13 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
                 constexpr int kNwarps = 12;
                 constexpr int AtomLayoutQ = 3;
                 constexpr int AtomLayoutP = 3;
-                run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
-                    Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
-                    Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
-                    >, 1/*CrossCut*/>(params, stream);
+                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThankBlockN, [&] {
+                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThankBlockN ? kBlockN : 16;
+                    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                        Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                        Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP, kBlockNPagedPerAiuLoad
+                        >, 1/*CrossCut*/>(params, stream);
+                });
             } else if (params.seqlen_q <= 64) {
                 constexpr static int kBlockM = 64;
                 constexpr static int kBlockN= 64;
@@ -164,10 +169,13 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
                 constexpr int kNwarps = 16;
                 constexpr int AtomLayoutQ = 4;
                 constexpr int AtomLayoutP = 1;
-                run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
-                    Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
-                    Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
-                    >, 1/*CrossCut*/>(params, stream);
+                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThankBlockN, [&] {
+                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThankBlockN ? kBlockN : 16;
+                    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                        Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                        Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP, kBlockNPagedPerAiuLoad
+                        >, 1/*CrossCut*/>(params, stream);
+                });
             } else if (params.seqlen_q > 64) {
                 if (warp_interleave) {
                     run_flash_splitkv_mla_kernel<T, 80>(params, stream);
@@ -179,14 +187,17 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
                 constexpr int kNwarps = 16;
                 constexpr int AtomLayoutQ = 8;
                 constexpr int AtomLayoutP = 4;
-                run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
-                    Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
-                    Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
-                    >, 1/*CrossCut*/>(params, stream);
+                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThankBlockN, [&] {
+                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThankBlockN ? kBlockN : 16;
+                    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                        Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
+                        Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP, kBlockNPagedPerAiuLoad
+                        >, 1/*CrossCut*/>(params, stream);
+                });
             }
         } else {
             constexpr bool USE_MMA_M8 = 1;
-            constexpr static int kBlockN = 16;
+            constexpr static int kBlockN = 16;  // == kBlockNPagedPerAiuLoad
             SEQLENG_SWITCH(params.seqlen_q, [&] {
                 constexpr int kNwarps = USE_MMA_M8 ? kBlockM / 8 : kBlockM / 16;
                 run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
@@ -206,14 +217,19 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
         constexpr bool USE_MMA_M8 = 0;
         constexpr static int kBlockN = 64;
         SEQLENG_SWITCH(params.seqlen_q, [&] {
-            constexpr int AtomLayoutQ = kBlockM / 16;
-            constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
-            constexpr int kStages = kBlockM <= 16 ? 3 : 2;
-            constexpr int AtomLayoutP = 1;
-            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
-                Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
-                T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP, kStages
-                >, 1/*CrossCut*/>(params, stream);
+            BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThankBlockN, [&] {
+                constexpr int kBlockNPagedPerAiuLoad = PageLargerThankBlockN ? kBlockN : 16;
+                constexpr int AtomLayoutQ = kBlockM / 16;
+                constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
+                constexpr int kStages = kBlockM <= 16 ? 3 : 2;
+                constexpr int AtomLayoutP = 1;
+                run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
+                    Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
+                    T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,
+                    kBlockNPagedPerAiuLoad, kStages
+                    >, 1/*CrossCut*/>(params, stream);
+            });
+
         });
     }
 // #endif
