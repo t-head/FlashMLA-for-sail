@@ -344,7 +344,7 @@ get_num_sm_parts(
         occupancy = block_size_m == 8 ? 7 : block_size_m == 16 ? 7 : block_size_m == 32 ? 4 : 1;
     } else {
         // btv105 small head size use corss split
-        block_size_m = num_heads_per_head_k <= 16 ? 16 : num_heads_per_head_k <= 32 ? 32 : num_heads_per_head_k >= 128 ? 128 : 64;
+        block_size_m = num_heads_per_head_k <= 16 ? 16 : num_heads_per_head_k <= 32 ? 32 : ((num_heads_per_head_k % 128 == 0) || (num_heads_per_head_k > 256)) ? 128 : 64;
         occupancy = 1;
     }
 // #endif
