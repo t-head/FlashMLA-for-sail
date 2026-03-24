@@ -29,6 +29,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     static_assert(CrossCut);
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
+    using index_t = typename Kernel_traits::index_t;
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
@@ -55,7 +56,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     const int tidx = threadIdx.x;
 
     const int m_block = blockIdx.x % (params.h_q/kBlockM);
-    const int s_q_idx = blockIdx.x / (params.h_q/kBlockM);
+    const index_t s_q_idx = blockIdx.x / (params.h_q/kBlockM);
     const int lane_idx = tidx % 32;
     const int warp_idx = cutlass::canonical_warp_idx_sync();
 
@@ -69,12 +70,12 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     #else
     const int col_in_indices = load_col_idx;
     #endif
-    int* gIndices_ptr = params.indices + (int64_t) s_q_idx * params.stride_indices_s_q + load_col_idx;   // [topk]
+    int* gIndices_ptr = params.indices + s_q_idx * params.stride_indices_s_q + load_col_idx;   // [topk]
     int nxt_token_idx = __ldg(gIndices_ptr);
 
     const int n_block_max = params.topk / kBlockN;
 
-    const int row_offset_q = s_q_idx * params.stride_q_s_q + m_block * (kBlockM * params.stride_q_h_q);
+    const index_t row_offset_q = s_q_idx * params.stride_q_s_q + m_block * (kBlockM * params.stride_q_h_q);
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
                             make_stride(params.stride_q_h_q, _1{}));
@@ -209,7 +210,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     // real tKgK= gK_base + indice_idx * 576 +  72*(threadIdx.x%8)
     int indice_idx = nxt_token_idx;
     bool is_token_valid = indice_idx >= 0 && indice_idx < params.s_kv;
-    tKgK.data() = gK_base + indice_idx * (int64_t)params.stride_kv_s_kv + (tidx%8)*8;
+    tKgK.data() = gK_base + indice_idx * (index_t)params.stride_kv_s_kv + (tidx%8)*8;
     gmem_tiled_copy_K.pred = is_token_valid;
     cute::copy(gmem_tiled_copy_K, tKgK, tKsK);
 
@@ -246,7 +247,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
             auto tKsK_current = kv_store_num % 2 == 0 ? tKsK : tKsK_double;
             int indice_idx = nxt_token_idx;
             bool is_token_valid = indice_idx >= 0 && indice_idx < params.s_kv;
-            tKgK.data() = gK_base + indice_idx * (int64_t)params.stride_kv_s_kv + (tidx%8)*8;
+            tKgK.data() = gK_base + indice_idx * (index_t)params.stride_kv_s_kv + (tidx%8)*8;
 
             gmem_tiled_copy_K.pred = is_token_valid;
             cute::copy(gmem_tiled_copy_K, tKgK, tKsK_current);
@@ -315,8 +316,8 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
 
     cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 
-    const int row_offset_o = s_q_idx * (params.h_q * kHeadDimV) + m_block * (kBlockM * kHeadDimV);
-    const int row_offset_lse = s_q_idx * params.h_q  + m_block * kBlockM;
+    const index_t row_offset_o = s_q_idx * (params.h_q * kHeadDimV) + m_block * (kBlockM * kHeadDimV);
+    const index_t row_offset_lse = s_q_idx * params.h_q  + m_block * kBlockM;
     Tensor gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.out) + row_offset_o),
                             Shape<Int<kBlockM>, Int<kHeadDimV>>{},
                             make_stride(kHeadDimV, _1{}));
