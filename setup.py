@@ -150,7 +150,7 @@ setup(
         "local_scheme": custom_local_scheme,
         "version_scheme": custom_version_scheme,
     },
-    setup_requires=["setuptools_scm"],
+    setup_requires=["setuptools-scm==9.2.2"],
     packages=find_packages(include=['flash_mla']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
