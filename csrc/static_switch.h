@@ -26,6 +26,20 @@
     }                                           \
   }()
 
+#define SEQLENG_SWITCH_ALIGN(SEQLENG, ...)   \
+  [&] {                                    \
+    if (SEQLENG <= 16) {                  \
+      constexpr static int kBlockM = 16;  \
+      return __VA_ARGS__();                \
+    } else if (SEQLENG <= 32) {            \
+      constexpr static int kBlockM = 32;  \
+      return __VA_ARGS__();                \
+    } else {                              \
+      constexpr static int kBlockM = 64;  \
+      return __VA_ARGS__();               \
+    }                                      \
+  }()
+
 #define SEQLENG_SWITCH(SEQLENG, ...)   \
   [&] {                                    \
     if (SEQLENG <= 16) {                  \
@@ -34,6 +48,9 @@
     } else if (SEQLENG <= 32) {            \
       constexpr static int kBlockM = 32;  \
       return __VA_ARGS__();                \
+    } else if (SEQLENG <= 48) {            \
+      constexpr static int kBlockM = 48;  \
+      return __VA_ARGS__();               \
     } else {                              \
       constexpr static int kBlockM = 64;  \
       return __VA_ARGS__();               \

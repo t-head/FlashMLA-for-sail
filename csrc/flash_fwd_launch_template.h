@@ -122,7 +122,7 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
     bool cross_cut = use_cross_cut(params.seqlen_q, params.b);
 
     // mtp3/5 tp4/8 seq_m is 160 or 192, blockM 256 not good.
-    bool warp_interleave = ((params.seqlen_q % 128 == 0) || (params.seqlen_q == 96) || (params.seqlen_q > 256)) && params.page_block_size == 64;
+    bool warp_interleave = ((params.seqlen_q % 128 == 0) || (params.seqlen_q == 96) || (params.seqlen_q == 80) || (params.seqlen_q > 256)) && params.page_block_size == 64;
     // temp to disable warp interleave for random issue.
     auto dprops = at::cuda::getCurrentDeviceProperties();
     if (std::string(dprops->name).find("610") != std::string::npos)
@@ -197,7 +197,7 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
         } else {
             constexpr bool USE_MMA_M8 = 1;
             constexpr static int kBlockN = 16;  // == kBlockNPagedPerAiuLoad
-            SEQLENG_SWITCH(params.seqlen_q, [&] {
+            SEQLENG_SWITCH_ALIGN(params.seqlen_q, [&] {
                 constexpr int kNwarps = USE_MMA_M8 ? kBlockM / 8 : kBlockM / 16;
                 run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
                     Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
@@ -212,6 +212,7 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
             run_flash_splitkv_mla_kernel<T, 89>(params, stream);
             return;
         }
+
         FLASH_ASSERT(cross_cut);
         constexpr bool USE_MMA_M8 = 0;
         constexpr static int kBlockN = 64;
@@ -221,14 +222,13 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t
                 constexpr int AtomLayoutQ = kBlockM / 16;
                 constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
                 constexpr int kStages = kBlockM <= 16 ? 3 : 2;
-                constexpr int AtomLayoutP = 1;
+                constexpr int AtomLayoutP = kBlockM == 48 ? 3 : 1;
                 run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
                     Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
                     T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,
                     kBlockNPagedPerAiuLoad, kStages
                     >, 1/*CrossCut*/>(params, stream);
             });
-
         });
     }
 // #endif
