@@ -338,17 +338,32 @@ struct SoftmaxBetweenWarps {
                     warp_id / AtomLayoutQ /*warp_id_n*/);
 
             }
-            #pragma unroll
-            for (int mi = 0; mi < kNRowsQ; ++mi) {
-                float scores_max_cur = !Check_inf
-                    ? row_max(mi)
-                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
-                scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
-                row_sum(mi) *= scores_scale(mi);
-            }
-            if constexpr (StoreScalesTSM) {
+
+            if constexpr (!StoreScalesTSM) {
+                // use fa4 for AtomLayoutP == AtomLayoutQ.
                 #pragma unroll
                 for (int mi = 0; mi < kNRowsQ; ++mi) {
+                    float scores_max_cur = !Check_inf
+                        ? row_max(mi)
+                        : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                    // scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                    float mid_scale = (scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2;
+                    if (mid_scale >= -8.0) {
+                        row_max(mi) = (row_max(mi) == -INFINITY) ? 0.0f : scores_max_prev(mi);
+                        scores_scale(mi) = 1.0f;
+                    } else {
+                        scores_scale(mi) = exp2f(mid_scale);
+                        row_sum(mi) *= scores_scale(mi);
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int mi = 0; mi < kNRowsQ; ++mi) {
+                    float scores_max_cur = !Check_inf
+                        ? row_max(mi)
+                        : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                    scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                    row_sum(mi) *= scores_scale(mi);
                     const int row_idx = SFT_ROW_IDX2(mi, row_idx_offsetQ, warp_row_strideQ, MMA_ATOM_K_M);
                     smem_row_scale(row_idx) = scores_scale(mi);
                 }
@@ -366,11 +381,22 @@ struct SoftmaxBetweenWarps {
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
         static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRowsP);
         if constexpr (!StoreScalesTSM) {
+            bool thread_need_rescale = false;
             #pragma unroll
-            for (int mi = 0; mi < kNRowsQ; ++mi) {
+            for (int mi = 0; mi < size(scores_scale); ++mi) {
+                if (scores_scale(mi) < 1.0f) {
+                    thread_need_rescale = true;
+                    break;
+                }
+            }
+            bool warp_need_rescale = __any_sync(0xffffffff, thread_need_rescale);
+            if (warp_need_rescale) {
                 #pragma unroll
-                for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
-                    acc_o_rowcol(mi, ni) *= scores_scale(mi);
+                for (int mi = 0; mi < kNRowsQ; ++mi) {
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+                        acc_o_rowcol(mi, ni) *= scores_scale(mi);
+                    }
                 }
             }
         } else {
@@ -411,10 +437,12 @@ struct SoftmaxBetweenWarps {
             #pragma unroll
             for (int mi = 0; mi < kNRowsQ; ++mi) {
                 const int row_idx = SFT_ROW_IDX2(mi, row_idx_offsetQ, warp_row_strideQ, MMA_ATOM_K_M);
-                smem_row_scale(row_idx) = scores_scale(mi); // inv_sum
+                if (warp_id / AtomLayoutQ == 0) {
+                    smem_row_scale(row_idx) = scores_scale(mi); // inv_sum
+                }
             }
         }
-        };
+    };
 
 
     template<bool Is_dropout=false, bool Split=false, typename Tensor0>
