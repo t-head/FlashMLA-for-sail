@@ -22,6 +22,7 @@
 namespace flash {
 using namespace cute;
 
+#define DSA_SIM_AIU 1
 template<typename Kernel_traits, bool Is_causal = false, bool CrossCut = true>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
 flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams params) {
@@ -43,7 +44,12 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     constexpr int MMA_ATOM_K_M = Kernel_traits::USE_MMA_M8 ? 1 : 2;
     constexpr int MMA_ATOM_M = USE_MMA_M8 ? 8 : 16;
 
+#if DSA_SIM_AIU
+    using KVCacheGmem = KVCacheGmemBf16SimAIU<Element, kBlockN, Kernel_traits::kNThreads>;
+    using SmemLayoutKSim = typename KVCacheGmem::SmemLayoutKSim;
+#else
     using KVCacheGmem = KVCacheGmemBf16<Element, kBlockN, Kernel_traits::kNThreads>;
+#endif
     using SmemLayoutKNoAiu = typename KVCacheGmem::SmemLayoutK;
     using GmemTiledCopyKNoAiu = typename KVCacheGmem::GmemTiledCopy;
     using SmemLayoutVtNoAiu = typename KVCacheGmem::SmemLayoutVtransposed;
@@ -95,10 +101,16 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)), typename Kernel_traits::SmemLayoutQ{});
 
     Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), SmemLayoutKNoAiu{});
+#if DSA_SIM_AIU
+    Tensor sKSim = make_tensor(sK.data(), SmemLayoutKSim{});
+#endif
     Tensor sVt = make_tensor(sK.data(), SmemLayoutVtNoAiu{});
     Tensor sVtNoSwizzle = make_tensor(sK.data(), SmemLayoutVtNoSwizzle{}); // only for layout
 
     Tensor sK_double = make_tensor(sK.data() + size(sK), SmemLayoutKNoAiu{});
+#if DSA_SIM_AIU
+    Tensor sKSim_double = make_tensor(sK_double.data(), SmemLayoutKSim{});
+#endif
     Tensor sVt_double = make_tensor(sK_double.data(), SmemLayoutVtNoAiu{});
 
     Tensor sP = make_tensor(sK_double.data() + size(sK_double), typename Kernel_traits::SmemLayoutP{});
@@ -115,13 +127,27 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     GmemTiledCopyKNoAiu gmem_tiled_copy_K;
 
     auto gmem_thr_copy_Q = gmem_tiled_copy_Q.get_thread_slice(tidx);
+#if DSA_SIM_AIU && (ACOMPUTE_VERSION ==10000)
+    int cross_tid_h = (tidx & 0xFFFFFFF8) >> 3;
+    int cross_tid_l = tidx & 0x7;
+    int cross_bias = (cross_tid_l / 2 == 1) ? 2 : ((cross_tid_l / 2 == 2) ? 1 : cross_tid_l / 2);
+    cross_tid_h = (cross_tid_h & 0xFFFFFFFC) | (((cross_tid_h & 0x3) + cross_bias) & 0x3);
+    int sim_cross_tid = (cross_tid_h << 3) | cross_tid_l;
+    auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(sim_cross_tid);
+#else
     auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(tidx);
+#endif
 
     Tensor tQgQ = gmem_thr_copy_Q.partition_S(make_mix_tensor_like(gQ));
     Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
     Tensor tKgK = gmem_thr_copy_K.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K)
+#if DSA_SIM_AIU
+    Tensor tKsK = gmem_thr_copy_K.partition_D(sKSim);
+    Tensor tKsK_double = gmem_thr_copy_K.partition_D(sKSim_double);
+#else
     Tensor tKsK = gmem_thr_copy_K.partition_D(sK);
     Tensor tKsK_double = gmem_thr_copy_K.partition_D(sK_double);
+#endif
 
     typename Kernel_traits::TiledMmaS tiled_mma_s;
     auto thr_mma_s = tiled_mma_s.get_thread_slice(tidx);
@@ -172,6 +198,17 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     }
 
     // KV not use AIU copy
+#if DSA_SIM_AIU
+    auto smem_tiled_copy_K = make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomK{}, tiled_mma_s);
+    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(warp_idx * 32);
+    auto tSsK = smem_thr_copy_K.partition_S(make_mix_tensor_like(sK));
+    auto tSsK_double = smem_thr_copy_K.partition_S(make_mix_tensor_like(sK_double));
+
+    auto smem_tiled_copy_V = make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomV{}, tiled_mma_o);
+    auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(warp_idx * 32);
+    auto tOsVt = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt));
+    auto tOsVt_double = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt_double));
+#else
     auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_s);
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
     auto tSsK = smem_thr_copy_K.partition_S(sK);
@@ -181,11 +218,10 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
     auto tOsVt = smem_thr_copy_V.partition_S(sVt);
     auto tOsVt_double = smem_thr_copy_V.partition_S(sVt_double);
+#endif
 
-    // Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
     Tensor cK = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
     Tensor tKcK = gmem_thr_copy_Q.partition_S(cK);   // (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
-    // Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
     Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK)));
 
     auto smem_tiled_copy_S = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
@@ -681,7 +717,12 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     const int s_q_idx = m_block / cute::ceil_div(params.ngroups, kBlockM);
     const int row_base = h_k_idx * kBlockM + s_q_idx * params.ngroups;
 
+#if DSA_SIM_AIU
+    using KVCacheGmem = KVCacheGmemBf16SimAIU<Element, kBlockN, Kernel_traits::kNThreads>;
+    using SmemLayoutKSim = typename KVCacheGmem::SmemLayoutKSim;
+#else
     using KVCacheGmem = KVCacheGmemBf16<Element, kBlockN, Kernel_traits::kNThreads>;
+#endif
     using SmemLayoutKNoAiu = typename KVCacheGmem::SmemLayoutK;
     using GmemTiledCopyKNoAiu = typename KVCacheGmem::GmemTiledCopy;
     using SmemLayoutVtNoAiu = typename KVCacheGmem::SmemLayoutVtransposed;
@@ -728,11 +769,17 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename Kernel_traits::SmemLayoutQ{});
     Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), SmemLayoutKNoAiu{});
+#if DSA_SIM_AIU
+    Tensor sKSim = make_tensor(sK.data(), SmemLayoutKSim{});
+#endif
     Tensor sVt = make_tensor(sK.data(), SmemLayoutVtNoAiu{});
     Tensor sVtNoSwizzle = make_tensor(sK.data(), SmemLayoutVtNoSwizzle{});
 
     // double shared memory for k/v cache.
     Tensor sK_double = make_tensor(sK.data() + size(sK), SmemLayoutKNoAiu{});
+#if DSA_SIM_AIU
+    Tensor sKSim_double = make_tensor(sK_double.data(), SmemLayoutKSim{});
+#endif
     Tensor sVt_double = make_tensor(sK_double.data(), SmemLayoutVtNoAiu{});
 
     Tensor sP = make_tensor(sK_double.data() + size(sK_double), typename Kernel_traits::SmemLayoutP{});
@@ -820,6 +867,17 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     Tensor tOsP = smem_thr_copy_P.partition_S(sP);
 
     // KV not use AIU copy
+#if DSA_SIM_AIU
+    auto smem_tiled_copy_K = make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomK{}, tiled_mma_s);
+    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(warp_idx * 32);
+    auto tSsK = smem_thr_copy_K.partition_S(make_mix_tensor_like(sK));
+    auto tSsK_double = smem_thr_copy_K.partition_S(make_mix_tensor_like(sK_double));
+
+    auto smem_tiled_copy_V = make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomV{}, tiled_mma_o);
+    auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(warp_idx * 32);
+    auto tOsVt = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt));
+    auto tOsVt_double = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt_double));
+#else
     auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_s);
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
     auto tSsK = smem_thr_copy_K.partition_S(sK);
@@ -829,12 +887,27 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
     auto tOsVt = smem_thr_copy_V.partition_S(sVt);
     auto tOsVt_double = smem_thr_copy_V.partition_S(sVt_double);
+#endif
 
     GmemTiledCopyKNoAiu gmem_tiled_copy_K;
+#if DSA_SIM_AIU && (ACOMPUTE_VERSION ==10000)
+    int cross_tid_h = (tidx & 0xFFFFFFF8) >> 3;
+    int cross_tid_l = tidx & 0x7;
+    int cross_bias = (cross_tid_l / 2 == 1) ? 2 : ((cross_tid_l / 2 == 2) ? 1 : cross_tid_l / 2);
+    cross_tid_h = (cross_tid_h & 0xFFFFFFFC) | (((cross_tid_h & 0x3) + cross_bias) & 0x3);
+    int sim_cross_tid = (cross_tid_h << 3) | cross_tid_l;
+    auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(sim_cross_tid);
+#else
     auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(tidx);
+#endif
     Tensor tKgK = gmem_thr_copy_K.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K)
+#if DSA_SIM_AIU
+    Tensor tKsK = gmem_thr_copy_K.partition_D(sKSim);
+    Tensor tKsK_double = gmem_thr_copy_K.partition_D(sKSim_double);
+#else
     Tensor tKsK = gmem_thr_copy_K.partition_D(sK);
     Tensor tKsK_double = gmem_thr_copy_K.partition_D(sK_double);
+#endif
 
     int n_block = n_block_min;
     // use kv_block_num to decide number.

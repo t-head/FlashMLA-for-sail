@@ -109,6 +109,53 @@ struct KVCacheGmemBf16 {
         GmemLayoutAtom{}, Layout<Shape<_1, _8>>{}));
 };
 
+template <typename ElementKVCache, int kBlockN, int kNThreads>
+struct KVCacheGmemBf16SimAIU {
+    using index_t = int64_t;
+    static constexpr int kBlockKSmem = 64;
+    static constexpr int kSwizzle = 3;
+    static constexpr int kHeadDim = 576;
+    static constexpr int kHeadDimV = 512;
+    static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(ElementKVCache);
+    static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
+
+#if ACOMPUTE_VERSION == 10000
+    using SmemLayoutAtomKSim = decltype(tile_to_shape(
+        composition(Swizzle<1, 3, 3>{}, Layout<Shape<_8, _16>, Stride<_16, _1>>{}),
+        Shape<Int<kBlockN>, Int<kBlockKSmem>>{}));
+    using SmemLayoutAtomK = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>;
+#else
+    using SmemLayoutAtomKSim = decltype(composition(
+        Swizzle<kSwizzle, 3, 3>{},
+        Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
+    using SmemLayoutAtomK = decltype(composition(
+        Swizzle<kSwizzle, 3, 3>{},
+        Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
+#endif
+
+    using SmemLayoutKSim = decltype(tile_to_shape(SmemLayoutAtomKSim{},
+        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+    using SmemLayoutK = decltype(tile_to_shape(SmemLayoutAtomK{},
+        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+    using SmemLayoutV = decltype(tile_to_shape(SmemLayoutAtomK{},
+        Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
+    using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{},
+        make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
+    using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
+
+    using SmemCopyOpK = PPU_TSM_LD_SWZL<ElementKVCache, kBlockN, kBlockKSmem, true, false, kHeadDim / kBlockKSmem>;
+    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, ElementKVCache>;
+    using SmemCopyOpV = PPU_TSM_LD_SWZL<ElementKVCache, kBlockN, kBlockKSmem, true, true, kHeadDimV / kBlockKSmem>;
+    using SmemCopyAtomV = Copy_Atom<SmemCopyOpV, ElementKVCache>;
+
+    using GmemLayoutAtom = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>,
+        Int<kGmemThreadsPerRow>>, Stride<Int<kGmemThreadsPerRow>, _1>>;
+    using Gmem_copy_struct = SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>;
+    using GmemTiledCopy = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, ElementKVCache>{},
+        GmemLayoutAtom{}, Layout<Shape<_1, _8>, Stride<_8, _1>>{}));
+};
+
 template <int kBlockN, int kNThreads>
 struct KVCacheGmemFP8 {
     using ElementKVCache = cutlass::float_e4m3_t;
