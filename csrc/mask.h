@@ -116,14 +116,14 @@ __forceinline__ __device__ void apply_indices_mask(Tensor0 &tensor_, Tensor1 &sm
         #pragma unroll
         for (int j = 0; j < size<1, 0>(tensor); ++j) {
 #if ACOMPUTE_VERSION ==10000
-            const int load_col_idx = warpN_idx * 16 + (lane_id % 4) + nj * 16 + j * 4;
+            // const int load_col_idx = warpN_idx * 16 + (lane_id % 4) + nj * 16 + j * 4;
             // ==> (warp_idx / AtomLayoutQ) * MMA_N_S * 16  + nj * 16 + (lane_id % 4) + j * 4
             // const int col_x = warpN_idx + nj;
             // const int col_y = j
             // const int col_z = lane_id % 4
             // (col_x, col_y, col_z) -> (col_z, col_x, col_y) = (warpN_idx + nj, j, lane_id % 4)
             // const int col_in_indices = col_nj + j;
-            // const int col_in_indices = col;
+            // const int col_in_indices = load_col_idx;
             // const int col_in_indices = (col%8)*8 + col/8;
             const int col_in_indices = (lane_id % 4) * 16 + warpN_idx *4 + nj * 4 + j;
             // const int col_in_indices = (load_col_idx % 4) * 16 + (load_col_idx / 16) * 4 + (load_col_idx % 16) / 4;

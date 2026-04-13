@@ -346,17 +346,32 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, cudaStream_t strea
     FLASH_ASSERT(params.h == 1);
     FLASH_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
 
-    constexpr bool USE_MMA_M8 = 0;
-    constexpr static int kBlockN = 64;
-    // SEQLENG_SWITCH(params.seqlen_q, [&] {
-        constexpr int kBlockM = 64;
-        constexpr int AtomLayoutQ = kBlockM / 16;
-        constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
-        constexpr int AtomLayoutP = 1;
-        run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
-            576, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
-            T, 512, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
-            >, IsFP8>(params, stream);
-    // });
+    if constexpr (IsFP8) {
+        constexpr bool USE_MMA_M8 = 0;
+        constexpr static int kBlockN = 64;
+        constexpr static int kBlockM = 64;
+        // TODO: kBlockM=16&32 is not supported for IsFP8. 
+        // SEQLENG_SWITCH_ALIGN(params.seqlen_q, [&] {
+            constexpr int AtomLayoutQ = kBlockM / 16;
+            constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
+            constexpr int AtomLayoutP = 1;
+            run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
+                576, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
+                T, 512, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                >, IsFP8>(params, stream);
+        // });
+    } else {
+        constexpr bool USE_MMA_M8 = 0;
+        constexpr static int kBlockN = 64;
+        SEQLENG_SWITCH_ALIGN(params.seqlen_q, [&] {
+            constexpr int AtomLayoutQ = kBlockM / 16;
+            constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
+            constexpr int AtomLayoutP = 1;
+            run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
+                576, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
+                T, 512, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                >, IsFP8>(params, stream);
+        });
+    }
 
 }

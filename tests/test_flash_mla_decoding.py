@@ -286,7 +286,7 @@ def main(torch_dtype):
         for s_k in [20, 140, 4096]
         for is_varlen in [False, True]
         for is_causal in [False, True]
-        for h_q in [128, 64, 32, 16, 8]
+        for h_q in [128, 64, 32, 16, 8, 4]
         for (is_fp8, topk) in [
             (False, None),
             (False, 128), # ppu1.0
@@ -299,11 +299,12 @@ def main(torch_dtype):
 
     corner_cases = [
         # Cases where all topk indices are invalid
-        TestParam(128, 2, 4096, is_varlen=True, is_causal=False, is_fp8=True, topk=topk, test_performance=False, is_all_indices_invalid=True)
+        TestParam(128, 2, 4096, is_varlen=True, is_causal=False, is_fp8=True, topk=topk, test_performance=False, is_all_indices_invalid=True, h_q=h_q)
         for topk in [128, 2048, 4096]
+        for h_q in [128, 64, 32, 16, 8]
     ] + [
         # Cases where some kv cache have zero length
-        TestParam(128, 2, 4096, is_varlen=True, is_causal=is_causal, is_fp8=is_fp8, topk=topk, test_performance=False, have_zero_seqlen_k=True)
+        TestParam(128, 2, 4096, is_varlen=True, is_causal=is_causal, is_fp8=is_fp8, topk=topk, test_performance=False, have_zero_seqlen_k=True, h_q=h_q)
         for (is_causal, is_fp8, topk) in [
             (False, False, None),
             (True, False, None),
@@ -312,6 +313,7 @@ def main(torch_dtype):
             (False, True, 128),
             (False, True, 2048),
         ]
+        for h_q in [128, 64, 32, 16, 8]
     ]
 
     performance_cases = [

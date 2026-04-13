@@ -727,29 +727,52 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     using GmemTiledCopyKNoAiu = typename KVCacheGmem::GmemTiledCopy;
     using SmemLayoutVtNoAiu = typename KVCacheGmem::SmemLayoutVtransposed;
     using SmemLayoutVtNoSwizzle = typename KVCacheGmem::SmemLayoutVtransposedNoSwizzle;
+    constexpr int RowsPerGmem = Kernel_traits::kNThreads / KVCacheGmem::kGmemThreadsPerRow;
+    static_assert(RowsPerGmem % 16 == 0 && kBlockN % RowsPerGmem == 0);
+    // 4warps: 16; 8warps: 32; 16 warps: 64
+    constexpr int indices_per_load = kBlockN / RowsPerGmem;
+    // kBlockN64: 1; kBlockN32: 2; kBlockN16: 16
+
 
     if (row_base >= params.seqlen_q) return;
     // never has n_block_min >= n_block_max in tile scheduler mode
     assert(n_block_min < n_block_max);
 
-    const int load_col_idx = tidx/8; //warp_idx * 4 + lane_idx/8; // tidx/8,  0~64
-    // 16 warps:[0 1 2 3], [5 6 7 8], ....,
+    const int load_col_idx = tidx/8; // + v * RowsPerGmem; // tidx/8,  0~64
+    // One warps:[0 1 2 3], [5 6 7 8], ...., -> [0 16 32 48], [1 17 33 49]
     // col = col_x * 16 + col_y * 4 + col_z; -> col_in_indices = col_z * 16 + col_x * 4 + col_y;
     // (col_x, col_y, col_z) = (col_load / 16, (col_load % 16) / 4, col_load % 4)
-    //  tidx / 128, ((tidx % 128)/ 32, (tidx % 32)/ 8 -> warp_idx/4, warp_idx%4,  lane_idx/8
+    // -> (warp_idx/4 + v * RowsPerGmem/16, warp_idx%4, lane_idx/8)
+    // convert to: col_in_indices = lane_idx/8 * 16 + warp_idx + v * RowsPerGmem/4
 #if ACOMPUTE_VERSION ==10000
     // const int col_in_indices = ((load_col_idx)% 8)*8 + (load_col_idx)/8;
-    const int col_in_indices = (lane_idx/8) * 16 + warp_idx;
+    const int col_in_indices = (lane_idx/8) * 16 + warp_idx; // + v * RowsPerGmem/4
     // const int col_in_indices1 = (load_col_idx % 4) * 16 + (load_col_idx / 16) * 4 + (load_col_idx % 16) / 4;
     // const int col_in_indices = load_col_idx;
 #else
-    const int col_in_indices = load_col_idx;
+    const int col_in_indices = load_col_idx; // + v * RowsPerGmem;
 #endif
     int* gIndices_ptr = params.indices_ptr + batch_id * params.indices_batch_stride
                       + s_q_idx * params.indices_row_stride + load_col_idx; // (topk) : (1)
 
-    #define LOAD_TOKEN_INDEX(block_idx) __ldg((gIndices_ptr + (block_idx) * kBlockN))
-    int nxt_token_idx = LOAD_TOKEN_INDEX(n_block_min);
+    // #define LOAD_TOKEN_INDEX(block_idx) __ldg((gIndices_ptr + (block_idx) * kBlockN))
+    // int nxt_token_idx; // = LOAD_TOKEN_INDEX(n_block_min);
+    
+    int nxt_token_idx1[indices_per_load];
+    
+    auto token_idx_update = [&](const int block_idx_load){
+        // nxt_token_idx = __ldg((gIndices_ptr + (block_idx_load) * kBlockN));
+        #pragma unroll
+        for (int v = 0; v < indices_per_load; v++) {
+            nxt_token_idx1[v] = __ldg((gIndices_ptr
+                // + v * (Kernel_traits::kNThreads / KVCacheGmem::kGmemThreadsPerRow)
+                + v * RowsPerGmem
+                + (block_idx_load) * kBlockN));
+        }
+    };
+    
+    token_idx_update(n_block_min);
+
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
@@ -917,23 +940,37 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     Element *gK_base = reinterpret_cast<Element *>(params.k_ptr)
           + (bidh / params.h_h_k_ratio) * params.k_head_stride;
 
-    int token_index = nxt_token_idx;
-    bool is_token_valid = token_index >= 0;
-    int block_index = token_index/params.page_block_size;
-    int rel_idx_in_block = (token_index+params.page_block_size) % params.page_block_size;
-    tKgK.data() = gK_base + (int64_t) block_index * params.k_batch_stride
-                          + rel_idx_in_block * params.k_row_stride
-                          + (tidx%8)*8;
+    static_assert(indices_per_load == size<1>(tKgK));
+    auto KV_load = [&](){
+        // auto tKsK_current = kv_store_num % 2 == 0 ? tKsK : tKsK_double;
+        #pragma unroll
+        for (int v = 0; v < indices_per_load; v++) {
+            auto tKgK_current = tKgK(_, v, _);
+            auto tKsK_current = kv_store_num % 2 == 0 ? tKsK(_, v, _) : tKsK_double(_, v, _);
+            int token_index = nxt_token_idx1[v];
+            bool is_token_valid = token_index >= 0;
+            int block_index = token_index/params.page_block_size;
+            int rel_idx_in_block = (token_index+params.page_block_size) % params.page_block_size;
+            tKgK_current.data() = gK_base + (int64_t) block_index * params.k_batch_stride
+                        + rel_idx_in_block * params.k_row_stride + (tidx%8)*8;
+            gmem_tiled_copy_K.pred = is_token_valid;
+            cute::copy(gmem_tiled_copy_K, tKgK_current, tKsK_current);
+#if ACOMPUTE_VERSION ==10000
+            smem_valid_indices(kv_store_num%2, col_in_indices + v * RowsPerGmem / 4) = is_token_valid;                
+# else
+            smem_valid_indices(kv_store_num%2, col_in_indices + v * RowsPerGmem) = is_token_valid;                
+#endif
+        }
+        cute::cp_async_fence();
+        kv_store_num++;
+    };
 
-    gmem_tiled_copy_K.pred = is_token_valid;
-    cute::copy(gmem_tiled_copy_K, tKgK, tKsK);
-    smem_valid_indices(kv_store_num%2, col_in_indices) = is_token_valid;
+    KV_load();
 
     if (n_block < n_block_max - 1) {
-        nxt_token_idx = LOAD_TOKEN_INDEX(n_block+1);
+        // nxt_token_idx = LOAD_TOKEN_INDEX(n_block+1);
+        token_idx_update(n_block+1);
     }
-    kv_store_num++;
-    cute::cp_async_fence();
 
     if (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
         flash::cp_async_wait<1>();
@@ -955,26 +992,11 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
         __syncthreads();
 
         if (n_block < n_block_max -1) { // doble buffer for next part
-            auto tKsK_current = kv_store_num % 2 == 0 ? tKsK : tKsK_double;
-
-            int token_index = nxt_token_idx;
-            bool is_token_valid = token_index >= 0;
-
-            int block_index = token_index/params.page_block_size;
-            int rel_idx_in_block = (token_index+params.page_block_size) % params.page_block_size;
-            tKgK.data() = gK_base + (int64_t) block_index * params.k_batch_stride
-                        + rel_idx_in_block * params.k_row_stride
-                        + (tidx%8)*8;
-
-            gmem_tiled_copy_K.pred = is_token_valid;
-            cute::copy(gmem_tiled_copy_K, tKgK, tKsK_current);
-            smem_valid_indices(kv_store_num%2, col_in_indices) = is_token_valid;
-
+            KV_load();
             if (n_block < n_block_max - 2) {
-                nxt_token_idx = LOAD_TOKEN_INDEX(n_block+2);
+                // nxt_token_idx = LOAD_TOKEN_INDEX(n_block+2);
+                token_idx_update(n_block+2);
             }
-            cute::cp_async_fence();
-            kv_store_num++;
         }
 
         // determine use kv buffer 0 or 1
@@ -1050,6 +1072,7 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
     int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
 
 #pragma unroll 1
+// #pragma clang loop licm(disable)
     for (int batch_id = begin_idx; batch_id <= end_idx; ++batch_id) {
         const int n_split_idx = batch_id == begin_idx ? begin_n_split_idx : 0;
         const int seqlen_k = params.topk;
