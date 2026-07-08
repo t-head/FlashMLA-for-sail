@@ -225,7 +225,7 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_qkt_gemm(
     Tensor<Engine1, Layout1> &sKV0, // (BLOCK_N, HEAD_DIM_K)
     Tensor<Engine1, Layout1> &sKV1, // (BLOCK_N, HEAD_DIM_K)
     Tensor<Engine2, Layout2> &rP,   // ((2, 2, 8), 1, 1)
-    Tensor<Engine3, Layout3> &rQ8,  // The 8-th tile of Q. We store it separately to leave some room for storing sP1
+    Tensor<Engine3, Layout3> &rQ8,  // The last tile of Q. We store it separately to leave some room for storing sP1
     __mbarrier_t *barriers,
     bool &cur_phase,
     int idx_in_warpgroup,
@@ -243,9 +243,9 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_qkt_gemm(
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename T::SmemCopyAtomQ{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(warp_idx * 32);
 
-    Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _); // (BLOCK_SIZE_M, 64, 9)
-    Tensor sKV0_tiled = flat_divide(sKV0, Shape<Int<T::kBlockN>, _64>{})(_, _, _0{}, _);  // (BLOCK_N, 64, 9)
-    Tensor sKV1_tiled = flat_divide(sKV1, Shape<Int<T::kBlockN>, _64>{})(_, _, _0{}, _);  // (BLOCK_N, 64, 9)
+    Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _); // (BLOCK_SIZE_M, 64, NUM_TILES)
+    Tensor sKV0_tiled = flat_divide(sKV0, Shape<Int<T::kBlockN>, _64>{})(_, _, _0{}, _);  // (BLOCK_N, 64, NUM_TILES)
+    Tensor sKV1_tiled = flat_divide(sKV1, Shape<Int<T::kBlockN>, _64>{})(_, _, _0{}, _);  // (BLOCK_N, 64, NUM_TILES)
     Tensor thr_mma_sQ_tiled = smem_thr_copy_Q.partition_S(make_mix_tensor_like(sQ_tiled));
 #if DSA_SIM_AIU
     Tensor thr_mma_sKV0_tiled = smem_thr_copy_K.partition_S(make_mix_tensor_like(sKV0_tiled));
@@ -256,7 +256,7 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_qkt_gemm(
 #endif
 
     #define QKT_GEMM_ONE_TILE(TILE_IDX) \
-        if constexpr(TILE_IDX == 8) { \
+        if constexpr(TILE_IDX == T::NUM_TILES - 1) { \
             qkt_gemm_one_tile_rQ(tiled_mma, smem_tiled_copy_K, smem_thr_copy_K, \
                     rQ8, sKV1_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV1_tiled(_, _, _, Int<TILE_IDX>{}), \
                     rP, idx_in_warpgroup); \
@@ -286,7 +286,7 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(2);
         QKT_GEMM_ONE_TILE(3);
     } else if constexpr (PHASE_IDX == 1) {
-        // In PHASE-1, warpgroup 1 calculates Q K^T for all the 9 tiles
+        // In PHASE-1, warpgroup 1 calculates Q K^T for all the NUM_TILES tiles
         while (!cutlass::arch::test_wait(&barriers[1], cur_phase, 1)) {
             kernel_sleep_ns();
         };
@@ -295,7 +295,9 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(5);
         QKT_GEMM_ONE_TILE(6);
         QKT_GEMM_ONE_TILE(7);
-        QKT_GEMM_ONE_TILE(8);
+        if constexpr (T::NUM_TILES > 8) {
+            QKT_GEMM_ONE_TILE(8);
+        }
 
         while (!cutlass::arch::test_wait(&barriers[0], cur_phase, 1)) {
             kernel_sleep_ns();
@@ -306,7 +308,7 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(3);
         cur_phase = (cur_phase + 1) & 1;
     } else {
-        // In PHASE-2, warpgroup 0 calculates Q K^T for the last 5 tiles
+        // In PHASE-2, warpgroup 0 calculates Q K^T for the last (NUM_TILES - 4) tiles
         static_assert(PHASE_IDX == 2);
 
         while (!cutlass::arch::test_wait(&barriers[1], cur_phase, 1)) {
@@ -317,7 +319,9 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(5);
         QKT_GEMM_ONE_TILE(6);
         QKT_GEMM_ONE_TILE(7);
-        QKT_GEMM_ONE_TILE(8);
+        if constexpr (T::NUM_TILES > 8) {
+            QKT_GEMM_ONE_TILE(8);
+        }
         cur_phase = (cur_phase + 1) & 1;
     }
 }
@@ -402,315 +406,267 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_pv_gemm_remoteP(
     gemm(rO, rP_copy_view, rVt_copy_view, tiled_mma);
 }
 
-#if ACOMPUTE_VERSION == 10000
 template<
     typename T,
     bool DO_OOB_FILLING,
-    // typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
     typename Engine3, typename Layout3,
     typename Engine4, typename Layout4
 >
 __forceinline__ __device__ auto wg0_bunch_0(
-    // Tensor<Engine0, Layout0> &rPb,	// ((2, 2, 8), 1, 1)
-    Tensor<Engine1, Layout1> &rP0,	// ((2, 2, 8), 1, 1)
-    Tensor<Engine2, Layout2> &rO0,	// ((2, 2, 32), 1, 1)
-    Tensor<Engine3, Layout3> &sScale0,	// (BLOCK_SIZE_M)
-    Tensor<Engine4, Layout4> &sM,	// (BLOCK_SIZE_M)
+    Tensor<Engine1, Layout1> &rP0,
+    Tensor<Engine2, Layout2> &rO0,
+    Tensor<Engine3, Layout3> &sScale0,
+    Tensor<Engine4, Layout4> &sM,
     float rL[2],
     int rRightBorderForQSeq[2],
     float scale_softmax_log2,
     int start_token_idx,
     int idx_in_warpgroup
 ) {
-
-    // This piece of code is tightly coupled [Accumulate's layout](https://docs.nvidia.com/cuda/parallel-thread-execution/_images/wgmma-64N16-D.png)
-    CUTLASS_PRAGMA_UNROLL
-    for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
-        int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
-        // Mask, and get row-wise max
-        float cur_max = MAX_INIT_VAL;
+    if constexpr (T::Arch_value == 80) {
+        // This piece of code is tightly coupled [Accumulate's layout](https://docs.nvidia.com/cuda/parallel-thread-execution/_images/wgmma-64N16-D.png)
         CUTLASS_PRAGMA_UNROLL
-        for (int i = local_row_idx ? 4 : 0; i < size(rP0); i += 8) {
-            if constexpr (DO_OOB_FILLING) {
-                int token_idx = start_token_idx + (i/8)*16 + idx_in_warpgroup%4;
-                rP0(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP0(i) : MAX_INIT_VAL;
-                rP0(i+1) = token_idx+4 < rRightBorderForQSeq[local_row_idx] ? rP0(i+1) : MAX_INIT_VAL;
-                rP0(i+2) = token_idx+8 < rRightBorderForQSeq[local_row_idx] ? rP0(i+2) : MAX_INIT_VAL;
-                rP0(i+3) = token_idx+12 < rRightBorderForQSeq[local_row_idx] ? rP0(i+3) : MAX_INIT_VAL;
+        for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+            int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+            // Mask, and get row-wise max
+            float cur_max = MAX_INIT_VAL;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = local_row_idx ? 4 : 0; i < size(rP0); i += 8) {
+                if constexpr (DO_OOB_FILLING) {
+                    int token_idx = start_token_idx + (i/8)*16 + idx_in_warpgroup%4;
+                    rP0(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP0(i) : MAX_INIT_VAL;
+                    rP0(i+1) = token_idx+4 < rRightBorderForQSeq[local_row_idx] ? rP0(i+1) : MAX_INIT_VAL;
+                    rP0(i+2) = token_idx+8 < rRightBorderForQSeq[local_row_idx] ? rP0(i+2) : MAX_INIT_VAL;
+                    rP0(i+3) = token_idx+12 < rRightBorderForQSeq[local_row_idx] ? rP0(i+3) : MAX_INIT_VAL;
+                }
+                cur_max = max(cur_max, max(max(rP0(i), rP0(i+1)), max(rP0(i+2), rP0(i+3))));
             }
-            cur_max = max(cur_max, max(max(rP0(i), rP0(i+1)), max(rP0(i+2), rP0(i+3))));
+
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+
+            // Update sM and sL
+            cur_max *= scale_softmax_log2;
+            float new_max = max(sM(row_idx), cur_max);
+            float scale_for_old = exp2f(sM(row_idx) - new_max);
+
+            __syncwarp(); // Make sure all reads have finished before updating sM
+
+            if (idx_in_warpgroup % 4 == 0)
+            {
+                sScale0(row_idx) = scale_for_old;
+                sM(row_idx) = new_max;
+            }
+
+            // Scale, exp, and get row-wise expsum
+            float cur_sum = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = local_row_idx ? 4 : 0; i < size(rP0); i += 8) {
+                rP0(i) = exp2f(rP0(i)*scale_softmax_log2 - new_max);
+                rP0(i+1) = exp2f(rP0(i+1)*scale_softmax_log2 - new_max);
+                rP0(i+2) = exp2f(rP0(i+2)*scale_softmax_log2 - new_max);
+                rP0(i+3) = exp2f(rP0(i+3)*scale_softmax_log2 - new_max);
+                cur_sum += (rP0(i) + rP0(i+1) + rP0(i+2) + rP0(i+3));
+            }
+
+            rL[local_row_idx] = rL[local_row_idx]*scale_for_old + cur_sum;
         }
 
-        cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
-        cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
-
-        // Update sM and sL
-        cur_max *= scale_softmax_log2;
-        float new_max = max(sM(row_idx), cur_max);
-        float scale_for_old = exp2f(sM(row_idx) - new_max);
-
-        __syncwarp(); // Make sure all reads have finished before updating sM
-
-        if (idx_in_warpgroup % 4 == 0)
-        {
-            sScale0(row_idx) = scale_for_old;
-            sM(row_idx) = new_max;
-        }
-
-        // Scale, exp, and get row-wise expsum
-        float cur_sum = 0;
+        return convert_acc<typename T::InputT>(rP0);
+    } else {
+        Tensor rPb = make_tensor<typename T::InputT>(Shape<Shape<_2, _2, _2>, _1, _2>{});
         CUTLASS_PRAGMA_UNROLL
-        for (int i = local_row_idx ? 4 : 0; i < size(rP0); i += 8) {
-            rP0(i) = exp2f(rP0(i)*scale_softmax_log2 - new_max);
-            rP0(i+1) = exp2f(rP0(i+1)*scale_softmax_log2 - new_max);
-            rP0(i+2) = exp2f(rP0(i+2)*scale_softmax_log2 - new_max);
-            rP0(i+3) = exp2f(rP0(i+3)*scale_softmax_log2 - new_max);
-            cur_sum += (rP0(i) + rP0(i+1) + rP0(i+2) + rP0(i+3));
+        for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+            int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+
+            // Mask, and get row-wise max
+            float cur_max = MAX_INIT_VAL;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
+                if constexpr (DO_OOB_FILLING) {
+                    int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
+                    rP0(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP0(i) : MAX_INIT_VAL;
+                    rP0(i+1) = token_idx+1 < rRightBorderForQSeq[local_row_idx] ? rP0(i+1) : MAX_INIT_VAL;
+                }
+                cur_max = max(cur_max, max(rP0(i), rP0(i+1)));
+            }
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+
+            // Update sM and sL
+            cur_max *= scale_softmax_log2;
+            float new_max = max(sM(row_idx), cur_max);
+            float scale_for_old = exp2f(sM(row_idx) - new_max);
+            __syncwarp();   // Make sure all reads have finished before updating sM
+            if (idx_in_warpgroup%4 == 0) {
+                sScale0(row_idx) = scale_for_old;
+                sM(row_idx) = new_max;
+            }
+
+            // Scale, exp, and get row-wise expsum
+            float cur_sum = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
+                rP0(i) = exp2f(rP0(i)*scale_softmax_log2 - new_max);
+                rP0(i+1) = exp2f(rP0(i+1)*scale_softmax_log2 - new_max);
+                rPb(i) = (typename T::InputT)rP0(i);
+                rPb(i+1) = (typename T::InputT)rP0(i+1);
+                cur_sum += rP0(i) + rP0(i+1);
+            }
+            rL[local_row_idx] = rL[local_row_idx]*scale_for_old + cur_sum;
         }
-
-        rL[local_row_idx] = rL[local_row_idx]*scale_for_old + cur_sum;
+        return rPb;
     }
-
-    return convert_acc<typename T::InputT>(rP0);
 }
-
 template<
     typename T,
     bool IS_BLK0_LAST,
     bool IS_BLK1_LAST,
     bool IS_BLK2_LAST,
-    // typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
     typename Engine3, typename Layout3,
     typename Engine4, typename Layout4,
     typename Engine5, typename Layout5>
 __forceinline__ __device__ auto wg1_bunch_0(
-    // Tensor<Engine0, Layout0> &rP1b,	// ((2, 2, 8), 1, 1)
-    Tensor<Engine1, Layout1> &sScale1, // (BLOCK_SIZE_M)
-    Tensor<Engine2, Layout2> &rO1,     // ((2, 2, 32), 1, 1)
-    Tensor<Engine3, Layout3> &sM,      // (BLOCK_SIZE_M)
+    Tensor<Engine1, Layout1> &sScale1,
+    Tensor<Engine2, Layout2> &rO1,
+    Tensor<Engine3, Layout3> &sM,
     float rL[2],
     int rRightBorderForQSeq[2],
-    Tensor<Engine4, Layout4> const &sScale0, // (BLOCK_SIZE_M)
-    Tensor<Engine5, Layout5> &rP1,           // ((2, 2, 8), 1, 1)
+    Tensor<Engine4, Layout4> const &sScale0,
+    Tensor<Engine5, Layout5> &rP1,
     float scale_softmax_log2,
     int start_token_idx,
     int idx_in_warpgroup)
 {
-    CUTLASS_PRAGMA_UNROLL
-    for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx)
-    {
-        int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
-
-        // Mask, and get row-wise max
-        float cur_max = MAX_INIT_VAL;
+    if constexpr (T::Arch_value == 80) {
         CUTLASS_PRAGMA_UNROLL
-        for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8)
+        for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx)
         {
-            if constexpr (IS_BLK1_LAST || IS_BLK2_LAST)
-            {
-                // Need to apply the mask when either this block is the last one, or
-                // the next block is the last one (because of the causal mask)
-                // int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
-                int token_idx = start_token_idx + (i / 8) * 16 + idx_in_warpgroup % 4;
-                rP1(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP1(i) : MAX_INIT_VAL;
-                rP1(i + 1) = token_idx + 4 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 1) : MAX_INIT_VAL;
-                rP1(i + 2) = token_idx + 8 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 2) : MAX_INIT_VAL;
-                rP1(i + 3) = token_idx + 12 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 3) : MAX_INIT_VAL;
-            }
-            else if constexpr (IS_BLK0_LAST)
-            {
-                rP1(i) = rP1(i + 1) = rP1(i + 2) = rP1(i + 3) = MAX_INIT_VAL;
-            }
-            cur_max = max(cur_max, max(max(rP1(i), rP1(i + 1)), max(rP1(i + 2), rP1(i + 3))));
-        }
-        cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
-        cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+            int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
 
-        cur_max *= scale_softmax_log2;
-
-        float old_max = sM(row_idx);
-        float new_max = max(old_max, cur_max);
-        float scale_for_old = exp2f(old_max - new_max);
-
-        __syncwarp();
-        if (idx_in_warpgroup % 4 == 0)
-        {
-            sM(row_idx) = new_max;
-            sScale1(row_idx) = scale_for_old;
-        }
-
-        // Scale, exp, and get row-wise expsum
-        float cur_sum = 0;
-        if constexpr (!IS_BLK0_LAST)
-        {
+            // Mask, and get row-wise max
+            float cur_max = MAX_INIT_VAL;
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8)
             {
-                rP1(i) = exp2f(rP1(i) * scale_softmax_log2 - new_max);
-                rP1(i + 1) = exp2f(rP1(i + 1) * scale_softmax_log2 - new_max);
-                rP1(i + 2) = exp2f(rP1(i + 2) * scale_softmax_log2 - new_max);
-                rP1(i + 3) = exp2f(rP1(i + 3) * scale_softmax_log2 - new_max);
-                cur_sum += (rP1(i) + rP1(i + 1) + rP1(i + 2) + rP1(i + 3));
+                if constexpr (IS_BLK1_LAST || IS_BLK2_LAST)
+                {
+                    // Need to apply the mask when either this block is the last one, or
+                    // the next block is the last one (because of the causal mask)
+                    // int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
+                    int token_idx = start_token_idx + (i / 8) * 16 + idx_in_warpgroup % 4;
+                    rP1(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP1(i) : MAX_INIT_VAL;
+                    rP1(i + 1) = token_idx + 4 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 1) : MAX_INIT_VAL;
+                    rP1(i + 2) = token_idx + 8 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 2) : MAX_INIT_VAL;
+                    rP1(i + 3) = token_idx + 12 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 3) : MAX_INIT_VAL;
+                }
+                else if constexpr (IS_BLK0_LAST)
+                {
+                    rP1(i) = rP1(i + 1) = rP1(i + 2) = rP1(i + 3) = MAX_INIT_VAL;
+                }
+                cur_max = max(cur_max, max(max(rP1(i), rP1(i + 1)), max(rP1(i + 2), rP1(i + 3))));
             }
-        }
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
 
-        // Scale O
-        float cur_scale_for_o1 = scale_for_old * sScale0(row_idx);
+            cur_max *= scale_softmax_log2;
 
-        // Update rL
-        rL[local_row_idx] = rL[local_row_idx]*cur_scale_for_o1 + cur_sum;
-    }
+            float old_max = sM(row_idx);
+            float new_max = max(old_max, cur_max);
+            float scale_for_old = exp2f(old_max - new_max);
 
-    return convert_acc<typename T::InputT>(rP1);
-}
-#else
-template <
-    typename T,
-    bool DO_OOB_FILLING,
-    typename Engine0, typename Layout0,
-    typename Engine1, typename Layout1,
-    typename Engine2, typename Layout2,
-    typename Engine3, typename Layout3,
-    typename Engine4, typename Layout4>
-__forceinline__ __device__ void wg0_bunch_0(
-    Tensor<Engine0, Layout0> &rPb,	// ((2, 2, 8), 1, 1)
-    Tensor<Engine1, Layout1> &rP0,     // ((2, 2, 8), 1, 1)
-    Tensor<Engine2, Layout2> &rO0,     // ((2, 2, 32), 1, 1)
-    Tensor<Engine3, Layout3> &sScale0, // (BLOCK_SIZE_M)
-    Tensor<Engine4, Layout4> &sM,      // (BLOCK_SIZE_M)
-    float rL[2],
-    int rRightBorderForQSeq[2],
-    float scale_softmax_log2,
-    int start_token_idx,
-    int idx_in_warpgroup)
-{
-     // This piece of code is tightly coupled [Accumulate's layout](https://docs.nvidia.com/cuda/parallel-thread-execution/_images/wgmma-64N16-D.png)
-    CUTLASS_PRAGMA_UNROLL
-    for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
-        int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
-
-        // Mask, and get row-wise max
-        float cur_max = MAX_INIT_VAL;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
-            if constexpr (DO_OOB_FILLING) {
-                int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
-                rP0(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP0(i) : MAX_INIT_VAL;
-                rP0(i+1) = token_idx+1 < rRightBorderForQSeq[local_row_idx] ? rP0(i+1) : MAX_INIT_VAL;
+            __syncwarp();
+            if (idx_in_warpgroup % 4 == 0)
+            {
+                sM(row_idx) = new_max;
+                sScale1(row_idx) = scale_for_old;
             }
-            cur_max = max(cur_max, max(rP0(i), rP0(i+1)));
-        }
-        cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
-        cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
 
-        // Update sM and sL
-        cur_max *= scale_softmax_log2;
-        float new_max = max(sM(row_idx), cur_max);
-        float scale_for_old = exp2f(sM(row_idx) - new_max);
-        __syncwarp();   // Make sure all reads have finished before updating sM
-        if (idx_in_warpgroup%4 == 0) {
-            sScale0(row_idx) = scale_for_old;
-            sM(row_idx) = new_max;
-        }
-
-        // Scale, exp, and get row-wise expsum
-        float cur_sum = 0;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
-            rP0(i) = exp2f(rP0(i)*scale_softmax_log2 - new_max);
-            rP0(i+1) = exp2f(rP0(i+1)*scale_softmax_log2 - new_max);
-            rPb(i) = (typename T::InputT)rP0(i);
-            rPb(i+1) = (typename T::InputT)rP0(i+1);
-            cur_sum += rP0(i) + rP0(i+1);
-        }
-        rL[local_row_idx] = rL[local_row_idx]*scale_for_old + cur_sum;
-    }
-}
-
-template <
-    typename T,
-    bool IS_BLK0_LAST,
-    bool IS_BLK1_LAST,
-    bool IS_BLK2_LAST,
-    typename Engine0, typename Layout0,
-    typename Engine1, typename Layout1,
-    typename Engine2, typename Layout2,
-    typename Engine3, typename Layout3,
-    typename Engine4, typename Layout4,
-    typename Engine5, typename Layout5>
-__forceinline__ __device__ auto wg1_bunch_0(
-    Tensor<Engine0, Layout0> &rP1b,	// ((2, 2, 8), 1, 1)
-    Tensor<Engine1, Layout1> &sScale1, // (BLOCK_SIZE_M)
-    Tensor<Engine2, Layout2> &rO1,     // ((2, 2, 32), 1, 1)
-    Tensor<Engine3, Layout3> &sM,      // (BLOCK_SIZE_M)
-    float rL[2],
-    int rRightBorderForQSeq[2],
-    Tensor<Engine4, Layout4> const &sScale0, // (BLOCK_SIZE_M)
-    Tensor<Engine5, Layout5> &rP1,           // ((2, 2, 8), 1, 1)
-    float scale_softmax_log2,
-    int start_token_idx,
-    int idx_in_warpgroup)
-{
-    CUTLASS_PRAGMA_UNROLL
-    for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
-        int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
-
-        // Mask, and get row-wise max
-        float cur_max = MAX_INIT_VAL;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
-            if constexpr (IS_BLK1_LAST || IS_BLK2_LAST) {
-                // Need to apply the mask when either this block is the last one, or
-                // the next block is the last one (because of the causal mask)
-                int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
-                rP1(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP1(i) : MAX_INIT_VAL;
-                rP1(i+1) = token_idx+1 < rRightBorderForQSeq[local_row_idx] ? rP1(i+1) : MAX_INIT_VAL;
-
-            } else if constexpr (IS_BLK0_LAST) {
-                rP1(i) = rP1(i+1) = MAX_INIT_VAL;
+            // Scale, exp, and get row-wise expsum
+            float cur_sum = 0;
+            if constexpr (!IS_BLK0_LAST)
+            {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8)
+                {
+                    rP1(i) = exp2f(rP1(i) * scale_softmax_log2 - new_max);
+                    rP1(i + 1) = exp2f(rP1(i + 1) * scale_softmax_log2 - new_max);
+                    rP1(i + 2) = exp2f(rP1(i + 2) * scale_softmax_log2 - new_max);
+                    rP1(i + 3) = exp2f(rP1(i + 3) * scale_softmax_log2 - new_max);
+                    cur_sum += (rP1(i) + rP1(i + 1) + rP1(i + 2) + rP1(i + 3));
+                }
             }
-            cur_max = max(cur_max, max(rP1(i), rP1(i+1)));
+
+            // Scale O
+            float cur_scale_for_o1 = scale_for_old * sScale0(row_idx);
+
+            // Update rL
+            rL[local_row_idx] = rL[local_row_idx]*cur_scale_for_o1 + cur_sum;
         }
 
-        cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
-        cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
-        cur_max *= scale_softmax_log2;
+        return convert_acc<typename T::InputT>(rP1);
+    } else {
+        Tensor rP1b = make_tensor<typename T::InputT>(Shape<Shape<_2, _2, _2>, _1, _2>{});
+        CUTLASS_PRAGMA_UNROLL
+        for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+            int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
 
-
-        float old_max = sM(row_idx);
-        float new_max = max(old_max, cur_max);
-        float scale_for_old = exp2f(old_max - new_max);
-        __syncwarp();
-        if (idx_in_warpgroup%4 == 0) {
-            sM(row_idx) = new_max;
-            sScale1(row_idx) = scale_for_old;
-        }
-
-        // Scale, exp, and get row-wise expsum
-        float cur_sum = 0;
-        if constexpr (!IS_BLK0_LAST) {
+            // Mask, and get row-wise max
+            float cur_max = MAX_INIT_VAL;
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
-                rP1(i) = exp2f(rP1(i)*scale_softmax_log2 - new_max);
-                rP1(i+1) = exp2f(rP1(i+1)*scale_softmax_log2 - new_max);
-                rP1b(i) = (typename T::InputT)rP1(i);
-                rP1b(i+1) = (typename T::InputT)rP1(i+1);
-                cur_sum += rP1(i) + rP1(i+1);
+                if constexpr (IS_BLK1_LAST || IS_BLK2_LAST) {
+                    // Need to apply the mask when either this block is the last one, or
+                    // the next block is the last one (because of the causal mask)
+                    int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
+                    rP1(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP1(i) : MAX_INIT_VAL;
+                    rP1(i+1) = token_idx+1 < rRightBorderForQSeq[local_row_idx] ? rP1(i+1) : MAX_INIT_VAL;
+
+                } else if constexpr (IS_BLK0_LAST) {
+                    rP1(i) = rP1(i+1) = MAX_INIT_VAL;
+                }
+                cur_max = max(cur_max, max(rP1(i), rP1(i+1)));
             }
+
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+            cur_max *= scale_softmax_log2;
+
+            float old_max = sM(row_idx);
+            float new_max = max(old_max, cur_max);
+            float scale_for_old = exp2f(old_max - new_max);
+            __syncwarp();
+            if (idx_in_warpgroup%4 == 0) {
+                sM(row_idx) = new_max;
+                sScale1(row_idx) = scale_for_old;
+            }
+
+            // Scale, exp, and get row-wise expsum
+            float cur_sum = 0;
+            if constexpr (!IS_BLK0_LAST) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
+                    rP1(i) = exp2f(rP1(i)*scale_softmax_log2 - new_max);
+                    rP1(i+1) = exp2f(rP1(i+1)*scale_softmax_log2 - new_max);
+                    rP1b(i) = (typename T::InputT)rP1(i);
+                    rP1b(i+1) = (typename T::InputT)rP1(i+1);
+                    cur_sum += rP1(i) + rP1(i+1);
+                }
+            }
+
+            // Scale O
+            float cur_scale_for_o1 = scale_for_old * sScale0(row_idx);
+
+            // Update rL
+            rL[local_row_idx] = rL[local_row_idx]*cur_scale_for_o1 + cur_sum;
         }
-
-        // Scale O
-        float cur_scale_for_o1 = scale_for_old * sScale0(row_idx);
-
-        // Update rL
-        rL[local_row_idx] = rL[local_row_idx]*cur_scale_for_o1 + cur_sum;
+        return rP1b;
     }
 }
-#endif
 
 template<
     typename T,
@@ -787,23 +743,24 @@ __forceinline__ __device__ void wg0_scale_rP0(
         int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
         float scale_factor = sScale1(row_idx);
         CUTLASS_PRAGMA_UNROLL
-#if ACOMPUTE_VERSION == 10000
-        for (int i = local_row_idx ? 4 : 0; i < size(rP0); i += 8) {
-            rPb(i) = (typename T::InputT)(rP0(i)*scale_factor);
-            rPb(i+1) = (typename T::InputT)(rP0(i+1)*scale_factor);
-            rPb(i+2) = (typename T::InputT)(rP0(i+2)*scale_factor);
-            rPb(i+3) = (typename T::InputT)(rP0(i+3)*scale_factor);
+        if constexpr (T::Arch_value == 80) {
+            for (int i = local_row_idx ? 4 : 0; i < size(rP0); i += 8) {
+                rPb(i) = (typename T::InputT)(rP0(i)*scale_factor);
+                rPb(i+1) = (typename T::InputT)(rP0(i+1)*scale_factor);
+                rPb(i+2) = (typename T::InputT)(rP0(i+2)*scale_factor);
+                rPb(i+3) = (typename T::InputT)(rP0(i+3)*scale_factor);
+            }
+        } else {
+            for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
+                rPb(i) = (typename T::InputT)(rP0(i)*scale_factor);
+                rPb(i+1) = (typename T::InputT)(rP0(i+1)*scale_factor);
+            }
         }
-#else
-        for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
-            rPb(i) = (typename T::InputT)(rP0(i)*scale_factor);
-            rPb(i+1) = (typename T::InputT)(rP0(i+1)*scale_factor);
-        }
-#endif
     }
 }
 
 template<
+    typename T,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1
 >
@@ -818,25 +775,26 @@ __forceinline__ __device__ void wg0_rescale_rO0(
         int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
         float scale_factor = sScale1(row_idx);
         CUTLASS_PRAGMA_UNROLL
-#if ACOMPUTE_VERSION == 10000
-        for (int i = local_row_idx ? 4 : 0; i < size(rO0); i += 8) {
-            rO0(i) *= scale_factor;
-            rO0(i+1) *= scale_factor;
-            rO0(i+2) *= scale_factor;
-            rO0(i+3) *= scale_factor;
+        if constexpr (T::Arch_value == 80) {
+            for (int i = local_row_idx ? 4 : 0; i < size(rO0); i += 8) {
+                rO0(i) *= scale_factor;
+                rO0(i+1) *= scale_factor;
+                rO0(i+2) *= scale_factor;
+                rO0(i+3) *= scale_factor;
+            }
+        } else {
+            for (int i = local_row_idx ? 2 : 0; i < size(rO0); i += 4) {
+                rO0(i) = rO0(i)*scale_factor;
+                rO0(i+1) = rO0(i+1)*scale_factor;
+            }
         }
-#else
-        for (int i = local_row_idx ? 2 : 0; i < size(rO0); i += 4) {
-            rO0(i) = rO0(i)*scale_factor;
-            rO0(i+1) = rO0(i+1)*scale_factor;
-        }
-#endif
         rL[local_row_idx] *= scale_factor;
     }
 
 }
 
 template<
+    typename T,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2
@@ -852,23 +810,24 @@ __forceinline__ __device__ void wg1_scale0_rO1(
         int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
         float scale_factor = sScale0(row_idx) * sScale1(row_idx);
         CUTLASS_PRAGMA_UNROLL
-#if ACOMPUTE_VERSION == 10000
-        for (int i = local_row_idx ? 4 : 0; i < size(rO1); i += 8) {
-            rO1(i) *= scale_factor;
-            rO1(i+1) *= scale_factor;
-            rO1(i+2) *= scale_factor;
-            rO1(i+3) *= scale_factor;
+        if constexpr (T::Arch_value == 80) {
+            for (int i = local_row_idx ? 4 : 0; i < size(rO1); i += 8) {
+                rO1(i) *= scale_factor;
+                rO1(i+1) *= scale_factor;
+                rO1(i+2) *= scale_factor;
+                rO1(i+3) *= scale_factor;
+            }
+        } else {
+            for (int i = local_row_idx ? 2 : 0; i < size(rO1); i += 4) {
+                rO1(i) = (rO1(i)*scale_factor);
+                rO1(i+1) = (rO1(i+1)*scale_factor);
+            }
         }
-#else
-        for (int i = local_row_idx ? 2 : 0; i < size(rO1); i += 4) {
-            rO1(i) = (rO1(i)*scale_factor);
-            rO1(i+1) = (rO1(i+1)*scale_factor);
-        }
-#endif
     }
 }
 
 template<
+    typename T,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1
 >
@@ -882,19 +841,19 @@ __forceinline__ __device__ void wg0_scale0_rO0(
         int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
         float scale_factor = sScale0[row_idx];
         CUTLASS_PRAGMA_UNROLL
-#if ACOMPUTE_VERSION == 10000
-        for (int i = local_row_idx ? 4 : 0; i < size(rO0); i += 8) {
-            rO0(i) *= scale_factor;
-            rO0(i+1) *= scale_factor;
-            rO0(i+2) *= scale_factor;
-            rO0(i+3) *= scale_factor;
+        if constexpr (T::Arch_value == 80) {
+            for (int i = local_row_idx ? 4 : 0; i < size(rO0); i += 8) {
+                rO0(i) *= scale_factor;
+                rO0(i+1) *= scale_factor;
+                rO0(i+2) *= scale_factor;
+                rO0(i+3) *= scale_factor;
+            }
+        } else {
+            for (int i = local_row_idx ? 2 : 0; i < size(rO0); i += 4) {
+                rO0(i) *= scale_factor;
+                rO0(i+1) *= scale_factor;
+            }
         }
-#else
-        for (int i = local_row_idx ? 2 : 0; i < size(rO0); i += 4) {
-            rO0(i) *= scale_factor;
-            rO0(i+1) *= scale_factor;
-        }
-#endif
     }
 }
 
@@ -926,11 +885,11 @@ __forceinline__ __device__ void dsa_store_o(
 
     CUTLASS_PRAGMA_UNROLL
     for (int idx = 0; idx < size(rO); ++idx) {
-#if ACOMPUTE_VERSION == 10000
-        rOb(idx) = (ElementO)(rO(idx) / rL[(idx / 4) % 2]);
-#else
-        rOb(idx) = (InputT)(rO(idx) / rL[idx%4 >= 2]);
-#endif
+        if constexpr (T::Arch_value == 80) {
+            rOb(idx) = (ElementO)(rO(idx) / rL[(idx / 4) % 2]);
+        } else {
+            rOb(idx) = (InputT)(rO(idx) / rL[idx%4 >= 2]);
+        }
     }
 
     Tensor sMyOutputBuf = local_tile(sOutputBuf, Shape<_128, _256>{}, make_coord(_0{}, warpgroup_idx));
@@ -947,7 +906,7 @@ __forceinline__ __device__ void dsa_store_o(
     __syncthreads();
 
     // tsm->global
-    const int64_t row_offset_o = m_block_idx * T::kBlockM * T::kHeadDimV;
+    const int64_t row_offset_o = (int64_t)m_block_idx * T::kBlockM * T::kHeadDimV;
 
     using GmemTiledCopyO = typename T::GmemTiledCopyO;
     GmemTiledCopyO gmem_tiled_copy_O;
@@ -984,8 +943,8 @@ __forceinline__ __device__ void launch_q_dsa_prefill_wg(
 ) {
     using Element = T::InputT;
     const int m_block = m_block_idx % (params.h_q / T::kBlockM);
-    const int s_q_idx = m_block_idx / (params.h_q / T::kBlockM);
-    const int row_offset_q = s_q_idx * params.stride_q_s_q + m_block * (T::kBlockM * params.stride_q_h_q);
+    const int64_t s_q_idx = m_block_idx / (params.h_q / T::kBlockM);
+    const int64_t row_offset_q = s_q_idx * params.stride_q_s_q + m_block * (T::kBlockM * params.stride_q_h_q);
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q) + row_offset_q),
                             Shape<Int<T::kBlockM>, Int<T::kHeadDim>>{},
                             make_stride(params.stride_q_h_q, _1{}));
@@ -994,11 +953,11 @@ __forceinline__ __device__ void launch_q_dsa_prefill_wg(
 
     Tensor tQgQ = gmem_thr_copy_Q.partition_S(make_mix_tensor_like(gQ));
 
-#if ACOMPUTE_VERSION == 10000
-    gmem_tiled_copy_Q.desc_ = AiuDesc{nullptr, T::kBlockM, params.stride_q_h_q, T::kBlockM, T::kBlockKSmem, 0};
-#else
-    gmem_tiled_copy_Q.desc_.init(nullptr, T::kBlockM, params.d_qk, params.stride_q_h_q);
-#endif
+    if constexpr (T::Arch_value == 80) {
+        gmem_tiled_copy_Q.desc_ = AiuDesc{nullptr, T::kBlockM, params.stride_q_h_q, T::kBlockM, T::kBlockKSmem, 0};
+    } else {
+        gmem_tiled_copy_Q.desc_.init(nullptr, T::kBlockM, params.d_qk, params.stride_q_h_q);
+    }
     Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
 
     if (warp_idx == 0) {
@@ -1070,8 +1029,8 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
 #endif
     float rL[2],
     int rRightBorderForQSeq[2],
-    __mbarrier_t barriers_K0[9],
-    __mbarrier_t barriers_K1[9],
+    __mbarrier_t barriers_K0[T::kHeadDim/256],
+    __mbarrier_t barriers_K1[T::kHeadDim/256],
     bool &cur_phase_K0,
     const SparsePrefillParams &params,
     int* gIndices_ptr,
@@ -1096,11 +1055,16 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
     auto nxt_sK1 = cur_sK0;
 #if DSA_SIM_AIU
     auto nxt_sKSim1 = cur_sKSim0;
-    int cross_tid_h = (idx_in_warpgroup & 0xFFFFFFF8) >> 3;
-    int cross_tid_l = idx_in_warpgroup & 0x7;
-    int cross_bias = (cross_tid_l / 2 == 1) ? 2 : ((cross_tid_l / 2 == 2) ? 1 : cross_tid_l / 2);
-    cross_tid_h = (cross_tid_h & 0xFFFFFFFC) | (((cross_tid_h & 0x3) + cross_bias) & 0x3);
-    int sim_cross_tid = (cross_tid_h << 3) | cross_tid_l;
+    int sim_cross_tid;
+    if constexpr (T::Arch_value == 80) {
+        int cross_tid_h = (idx_in_warpgroup & 0xFFFFFFF8) >> 3;
+        int cross_tid_l = idx_in_warpgroup & 0x7;
+        int cross_bias = (cross_tid_l / 2 == 1) ? 2 : ((cross_tid_l / 2 == 2) ? 1 : cross_tid_l / 2);
+        cross_tid_h = (cross_tid_h & 0xFFFFFFFC) | (((cross_tid_h & 0x3) + cross_bias) & 0x3);
+        sim_cross_tid = (cross_tid_h << 3) | cross_tid_l;
+    } else {
+        sim_cross_tid = idx_in_warpgroup;
+    }
 #endif
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
@@ -1120,16 +1084,11 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
         }
     }
     // Calc P0 = softmax(P0)
-#if ACOMPUTE_VERSION == 10000
     Tensor rPb = wg0_bunch_0< T, IS_BLK0_LAST || IS_BLK1_LAST > (rP0, rO0, sScale0, sM, rL, rRightBorderForQSeq, params.sm_scale_div_log2, start_token_idx, idx_in_warpgroup);
-#else
-    Tensor rPb = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _2>{});
-    wg0_bunch_0< T, IS_BLK0_LAST || IS_BLK1_LAST > (rPb, rP0, rO0, sScale0, sM, rL, rRightBorderForQSeq, params.sm_scale_div_log2, start_token_idx, idx_in_warpgroup);
-#endif
     NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale0Ready);
 
     // Issue rO0 += rPb @ sV0L
-    wg0_scale0_rO0(rO0, sScale0, idx_in_warpgroup);
+    wg0_scale0_rO0<T>(rO0, sScale0, idx_in_warpgroup);
     dsa_warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV0L, rO0, idx_in_warpgroup, wg_idx);
 
     // Wait for warpgroup 1, rescale P0, notify warpgroup 1
@@ -1161,7 +1120,7 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
     if constexpr (!IS_BLK0_LAST)
     {
         NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
-        wg0_rescale_rO0(rO0, sScale1, rL, idx_in_warpgroup);
+        wg0_rescale_rO0<T>(rO0, sScale1, rL, idx_in_warpgroup);
         dsa_warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup, wg_idx);
     }
 
@@ -1240,8 +1199,8 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
 #endif
     float rL[2],
     int rRightBorderForQSeq[2],
-    __mbarrier_t barriers_K0[9],
-    __mbarrier_t barriers_K1[9],
+    __mbarrier_t barriers_K0[T::kHeadDim/256],
+    __mbarrier_t barriers_K1[T::kHeadDim/256],
     bool &cur_phase_K1,
     const SparsePrefillParams &params,
     int* gIndices_ptr,
@@ -1265,11 +1224,16 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
     Tensor sV1R = get_half_V<T, 1>(cur_sK1);
 #if DSA_SIM_AIU
     auto nxt_sKSim0 = cur_sKSim1;
-    int cross_tid_h = (idx_in_warpgroup & 0xFFFFFFF8) >> 3;
-    int cross_tid_l = idx_in_warpgroup & 0x7;
-    int cross_bias = (cross_tid_l / 2 == 1) ? 2 : ((cross_tid_l / 2 == 2) ? 1 : cross_tid_l / 2);
-    cross_tid_h = (cross_tid_h & 0xFFFFFFFC) | (((cross_tid_h & 0x3) + cross_bias) & 0x3);
-    int sim_cross_tid = (cross_tid_h << 3) | cross_tid_l;
+    int sim_cross_tid;
+    if constexpr (T::Arch_value == 80) {
+        int cross_tid_h = (idx_in_warpgroup & 0xFFFFFFF8) >> 3;
+        int cross_tid_l = idx_in_warpgroup & 0x7;
+        int cross_bias = (cross_tid_l / 2 == 1) ? 2 : ((cross_tid_l / 2 == 2) ? 1 : cross_tid_l / 2);
+        cross_tid_h = (cross_tid_h & 0xFFFFFFFC) | (((cross_tid_h & 0x3) + cross_bias) & 0x3);
+        sim_cross_tid = (cross_tid_h << 3) | cross_tid_l;
+    } else {
+        sim_cross_tid = idx_in_warpgroup;
+    }
 #endif
 
     // Wait for rO1 += rP1b @ sV1R, launch TMA for the next V1R
@@ -1284,7 +1248,7 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
         Tensor tKsK1 = gmem_thr_copy_K.partition_D(nxt_sK1);
 #endif
-        launch_kv_tiles_dsa_wg<4, 9>(tiled_copy, tKgK, tKsK1, &barriers_K1[1]);
+        launch_kv_tiles_dsa_wg<4, T::NUM_TILES>(tiled_copy, tKgK, tKsK1, &barriers_K1[1]);
         if (nxt_block1 < end_block_idx) {
             nxt_token_idx1 = __ldg(gIndices_ptr + nxt_block1 * T::kBlockN);
         }
@@ -1292,12 +1256,7 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
     // Wait for rP1 and warpgroup 0, run bunch 1, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
 
-#if ACOMPUTE_VERSION == 10000
     Tensor rP1b = wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(sScale1, rO1, sM, rL, rRightBorderForQSeq, sScale0, rP1, params.sm_scale_div_log2, start_token_idx+T::kBlockN, idx_in_warpgroup);
-#else
-    Tensor rP1b = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _2>{});
-    wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(rP1b, sScale1, rO1, sM, rL, rRightBorderForQSeq, sScale0, rP1, params.sm_scale_div_log2, start_token_idx+T::kBlockN, idx_in_warpgroup);
-#endif
     NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
     // Save rPb to sP, and issue rO1 += rP1b @ sV1R
@@ -1306,7 +1265,7 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
         save_rP1_to_sP<T>(rP1b, sP1, idx_in_warpgroup);
     }
 
-    wg1_scale0_rO1(rO1, sScale0, sScale1, idx_in_warpgroup);
+    wg1_scale0_rO1<T>(rO1, sScale0, sScale1, idx_in_warpgroup);
     if constexpr (!IS_BLK0_LAST) {
         dsa_warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, idx_in_warpgroup, wg_idx);
     }
@@ -1325,7 +1284,7 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
         Tensor tKsK0 = gmem_thr_copy_K.partition_D(nxt_sK0);
 #endif
-        launch_kv_tiles_dsa_wg<4, 9>(tiled_copy, tKgK, tKsK0, &barriers_K0[1]);
+        launch_kv_tiles_dsa_wg<4, T::NUM_TILES>(tiled_copy, tKgK, tKsK0, &barriers_K0[1]);
         if (nxt_block0 < end_block_idx) {
             nxt_token_idx0 = __ldg(gIndices_ptr + nxt_block0 * T::kBlockN);
         }
@@ -1391,7 +1350,7 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
 #if DSA_SIM_AIU
     Tensor sKSim = make_tensor(sK.data(), (typename T::SmemLayoutKSim){});
 #endif
-    Tensor sP0 = make_tensor(flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, Int<T::PAGE_BLOCK_SIZE>>{})(_, _, _0{}, _8{}).data(), (typename T::SmemLayoutP0){}); // Overlap with sQ's 8-th tile
+    Tensor sP0 = make_tensor(flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, Int<T::PAGE_BLOCK_SIZE>>{})(_, _, _0{}, Int<T::NUM_TILES - 1>{}).data(), (typename T::SmemLayoutP0){}); // Overlap with sQ's last tile
     Tensor sP1 = make_tensor(sP0.data() + sP0.size(), (typename T::SmemLayoutP0){});
     Tensor sM = make_tensor(make_smem_ptr(plan.smem_sM.data()), make_shape(Int<T::BLOCK_SIZE_M>{}));
     Tensor sL_reduction_wksp = make_tensor(make_smem_ptr(plan.sL_reduction_wksp.data()), make_shape(Int<2 * T::BLOCK_SIZE_M>{}));
@@ -1433,7 +1392,7 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
     // Copy the first Q
     launch_q_dsa_prefill_wg<T>(params, m_block_idx, sQ, tidx, warp_idx, barrier_Q);
 
-    int seqlen_k = params.topk;
+    int seqlen_k = params.topk_length ? __ldg(params.topk_length + q_idx) : params.topk;
     int start_block_idx = 0;
     int end_block_idx = cute::ceil_div(seqlen_k, kBlockN);
     int rRightBorderForQSeq[2] = {seqlen_k, seqlen_k};
@@ -1444,12 +1403,17 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
 
     // Copy K0 and K1
     GmemTiledCopyKNoAiu gmem_tiled_copy_K;
-#if DSA_SIM_AIU && (ACOMPUTE_VERSION ==10000)
-    int cross_tid_h = (idx_in_warpgroup & 0xFFFFFFF8) >> 3;
-    int cross_tid_l = idx_in_warpgroup & 0x7;
-    int cross_bias = (cross_tid_l / 2 == 1) ? 2 : ((cross_tid_l / 2 == 2) ? 1 : cross_tid_l / 2);
-    cross_tid_h = (cross_tid_h & 0xFFFFFFFC) | (((cross_tid_h & 0x3) + cross_bias) & 0x3);
-    int sim_cross_tid = (cross_tid_h << 3) | cross_tid_l;
+#if DSA_SIM_AIU
+    int sim_cross_tid;
+    if constexpr (T::Arch_value == 80) {
+        int cross_tid_h = (idx_in_warpgroup & 0xFFFFFFF8) >> 3;
+        int cross_tid_l = idx_in_warpgroup & 0x7;
+        int cross_bias = (cross_tid_l / 2 == 1) ? 2 : ((cross_tid_l / 2 == 2) ? 1 : cross_tid_l / 2);
+        cross_tid_h = (cross_tid_h & 0xFFFFFFFC) | (((cross_tid_h & 0x3) + cross_bias) & 0x3);
+        sim_cross_tid = (cross_tid_h << 3) | cross_tid_l;
+    } else {
+        sim_cross_tid = idx_in_warpgroup;
+    }
     auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(sim_cross_tid);
 #else
     auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(idx_in_warpgroup);
@@ -1470,11 +1434,11 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
     Tensor tKsK1 = gmem_thr_copy_K.partition_D(cur_sK1);
 #endif
 
-    if (warpgroup_idx == 0) {
+    if (warpgroup_idx == 0 && seqlen_k != 0) {
         bool is_token_valid = nxt_token_idx0 >= 0 && nxt_token_idx0 < params.s_kv;
         tKgK.data() = gK_base + nxt_token_idx0 * (int64_t)params.stride_kv_s_kv + (idx_in_warpgroup % 8) * 8;
         gmem_tiled_copy_K.pred = is_token_valid; // !!!!!!!!!
-        launch_kv_tiles_dsa_wg<4, 9>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K0[1]);
+        launch_kv_tiles_dsa_wg<4, T::NUM_TILES>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K0[1]);
         launch_kv_tiles_dsa_wg<0, 4>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K0[0]);
         nxt_token_idx0 = __ldg(gIndices_ptr + kBlockN * 2);
         nxt_token_idx1 = __ldg(gIndices_ptr + kBlockN * 3);
@@ -1485,7 +1449,7 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
             bool is_token_valid = nxt_token_idx1 >= 0 && nxt_token_idx1 < params.s_kv;
             tKgK.data() = gK_base + nxt_token_idx1 * (int64_t)params.stride_kv_s_kv + (idx_in_warpgroup % 8) * 8;
             gmem_tiled_copy_K.pred = is_token_valid;
-            launch_kv_tiles_dsa_wg<4, 9>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K1[1]);
+            launch_kv_tiles_dsa_wg<4, T::NUM_TILES>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K1[1]);
             launch_kv_tiles_dsa_wg<0, 4>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K1[0]);
             nxt_token_idx0 = __ldg(gIndices_ptr + kBlockN * 2);
             nxt_token_idx1 = __ldg(gIndices_ptr + kBlockN * 3);
@@ -1507,8 +1471,9 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
     }
     cur_phase_Q = (cur_phase_Q + 1) & 1;
 
+    // rQ8 stores the last tile of Q (tile 8 for 576, tile 7 for 512) to leave smem room for sP0/sP1
     Tensor rQ8 = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
-    retrieve_rP_from_sP<T>(rQ8, local_tile(sQ, Shape<_128, _64>{}, Coord<_0, _8>{}), idx_in_warpgroup);
+    retrieve_rP_from_sP<T>(rQ8, local_tile(sQ, Shape<_128, _64>{}, Coord<_0, Int<T::NUM_TILES - 1>>{}), idx_in_warpgroup);
 
     if (warpgroup_idx == 0) {
         // Warpgroup 0
@@ -1639,9 +1604,26 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
     for (int i = 0; i < 2; ++i)
         rL[i] = (rL[i] == 0.0f || rL[i] != rL[i]) ? 1.0f : rL[i];
 
+    // Apply attention sink: adjust rL to account for the sink term in the normalization denominator.
+    // rL_adjusted = rL + exp2f(sink_log2 - sM[row])
+    // where sink_log2 = attn_sink[head_idx] * M_LOG2E (convert natural log to log2 space)
+    // and sM[row] is the log2-space scaled max (max(raw_score) * sm_scale_div_log2)
+    // This ensures output = rO / rL_adjusted = sum(P*V) / (sum(P) + exp(attn_sink))
+    // LSE and max_logits outputs are NOT affected (they read from sL_reduction_wksp, not rL)
+    if (params.attn_sink != nullptr && seqlen_k > 0) {
+        int head_block_idx = m_block_idx % (params.h_q / T::kBlockM);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 2; ++i) {
+            int row_idx = get_AorC_row_idx(i, idx_in_warpgroup);
+            int head_idx = head_block_idx * T::BLOCK_SIZE_M + row_idx;
+            float sink_log2 = params.attn_sink[head_idx] * (float)M_LOG2E;
+            rL[i] += exp2f(sink_log2 - sM(row_idx));
+        }
+    }
+
     // Epilogue
     int num_valid_seq_q = min(params.s_q * params.h_q - m_block_idx * T::BLOCK_SIZE_M, T::BLOCK_SIZE_M);
-    InputT *o_ptr = (InputT *)params.out + m_block_idx * T::BLOCK_SIZE_M * T::kHeadDimV;
+    InputT *o_ptr = (InputT *)params.out + (int64_t)m_block_idx * T::BLOCK_SIZE_M * T::kHeadDimV;
     float *softmax_lse_ptr = (float *)params.lse + m_block_idx * T::BLOCK_SIZE_M;
     float *mlogits_ptr = (float *)params.max_logits + m_block_idx * T::BLOCK_SIZE_M;
 
@@ -1665,13 +1647,13 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
     if (i < num_valid_seq_q) {
         float cur_L = sL_reduction_wksp[i];
         gSoftmaxLse(i) = (cur_L == 0.0f || cur_L != cur_L) ? INFINITY : logf(cur_L) + sM(i) / (float)M_LOG2E;
-        gMLogits(i) = sM(i) * M_LN2;
+        gMLogits(i) = (seqlen_k == 0) ? -INFINITY : sM(i) * M_LN2;
     }
 }
 
-template<typename InputT, int Arch>
+template<typename InputT, int Arch, int HEAD_DIM>
 void run_flash_sparse_prefill_fwd_wg(SparsePrefillParams &params) {
-    using T = DSA_Traits<cutlass::bfloat16_t>;
+    using T = DSA_Traits<cutlass::bfloat16_t, HEAD_DIM, Arch>;
 
     auto mla_kernel = &flash_sparse_prefill_fwd_wg_kernel<T, true>;
     constexpr size_t smem_size = std::max(sizeof(typename T::SharedMemoryPlan), sizeof(typename T::SharedMemoryOutPut));
@@ -1719,14 +1701,28 @@ void run_flash_sparse_prefill_fwd_wg(SparsePrefillParams &params) {
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template void run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 80>(SparsePrefillParams &params);
+// 576
+template void run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 80, 576>(SparsePrefillParams &params);
 
 #ifndef FLASH_MLA_DISABLE_FP16
-template void run_flash_sparse_prefill_fwd_wg<cutlass::half_t, 80>(SparsePrefillParams &params);
+template void run_flash_sparse_prefill_fwd_wg<cutlass::half_t, 80, 576>(SparsePrefillParams &params);
 #endif
 
-template void run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 89>(SparsePrefillParams &params);
+template void run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 89, 576>(SparsePrefillParams &params);
 
 #ifndef FLASH_MLA_DISABLE_FP16
-template void run_flash_sparse_prefill_fwd_wg<cutlass::half_t, 89>(SparsePrefillParams &params);
+template void run_flash_sparse_prefill_fwd_wg<cutlass::half_t, 89, 576>(SparsePrefillParams &params);
+#endif
+
+// 512
+template void run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 80, 512>(SparsePrefillParams &params);
+
+#ifndef FLASH_MLA_DISABLE_FP16
+template void run_flash_sparse_prefill_fwd_wg<cutlass::half_t, 80, 512>(SparsePrefillParams &params);
+#endif
+
+template void run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 89, 512>(SparsePrefillParams &params);
+
+#ifndef FLASH_MLA_DISABLE_FP16
+template void run_flash_sparse_prefill_fwd_wg<cutlass::half_t, 89, 512>(SparsePrefillParams &params);
 #endif

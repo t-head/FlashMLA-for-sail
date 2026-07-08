@@ -35,11 +35,11 @@ def generate_testcase(t: TestParam) -> Testcase:
     torch.manual_seed(t.seed)
     torch.cuda.manual_seed(t.seed)
     random.seed(t.seed)
-    # q = torch.randn((t.b, t.s_q, t.h_q, t.d_qk), dtype=torch.bfloat16) / 10
-    # kv = torch.randn((t.b, t.s_kv, t.h_kv, t.d_qk), dtype=torch.bfloat16) / 10
+    q = torch.randn((t.b, t.s_q, t.h_q, t.d_qk), dtype=torch.bfloat16) / 10
+    kv = torch.randn((t.b, t.s_kv, t.h_kv, t.d_qk), dtype=torch.bfloat16) / 10
 
-    q = torch.ones((t.b, t.s_q, t.h_q, t.d_qk), dtype=torch.bfloat16)
-    kv = torch.ones((t.b, t.s_kv, t.h_kv, t.d_qk), dtype=torch.bfloat16)
+    # q = torch.ones((t.b, t.s_q, t.h_q, t.d_qk), dtype=torch.bfloat16)
+    # kv = torch.ones((t.b, t.s_kv, t.h_kv, t.d_qk), dtype=torch.bfloat16)
 
     q.clamp_(-10, 10)
     kv.clamp_(-10, 10)
@@ -48,21 +48,21 @@ def generate_testcase(t: TestParam) -> Testcase:
     for b in range(t.b):
         for s in range(t.s_q):
             for h in range(t.h_kv):
-                # # NOTE We use the following method to generate indices so that most indices lies within [s_kv-20000, s_kv), which is more realistic for sparse attention
-                # near_mask = torch.randint(0, 32, (min(t.topk, t.s_kv),)) < 31
-                # cur_indices = torch.randperm(t.s_kv)[:t.topk]
-                # cur_indices[near_mask] = torch.randint(max(0, t.s_kv - 20000), t.s_kv - 1, (near_mask.sum().item(),))
-                # if len(cur_indices) < t.topk:
-                #     cur_indices = torch.cat([cur_indices, torch.full((t.topk - len(cur_indices),), 2147480000)])
-                # cur_indices = cur_indices[torch.randperm(t.topk)]
-                # indices[b, s, h] = cur_indices
-                cur_indices = torch.arange(t.topk, device='cpu').to(torch.int)
+                # NOTE We use the following method to generate indices so that most indices lies within [s_kv-20000, s_kv), which is more realistic for sparse attention
+                near_mask = torch.randint(0, 32, (min(t.topk, t.s_kv),)) < 31
+                cur_indices = torch.randperm(t.s_kv)[:t.topk]
+                cur_indices[near_mask] = torch.randint(max(0, t.s_kv - 20000), t.s_kv - 1, (near_mask.sum().item(),))
+                if len(cur_indices) < t.topk:
+                    cur_indices = torch.cat([cur_indices, torch.full((t.topk - len(cur_indices),), 2147480000)])
+                cur_indices = cur_indices[torch.randperm(t.topk)]
                 indices[b, s, h] = cur_indices
+                # cur_indices = torch.arange(t.topk, device='cpu').to(torch.int)
+                # indices[b, s, h] = cur_indices
 
     indices = indices.to(q.device)
 
-    print(f'indices size:{indices.size()}\n')
-    print(f'indices:{indices}\n')
+    # print(f'indices size:{indices.size()}\n')
+    # print(f'indices:{indices}\n')
 
     return Testcase(
         t=t,

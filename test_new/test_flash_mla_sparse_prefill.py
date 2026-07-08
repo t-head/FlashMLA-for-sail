@@ -31,7 +31,7 @@ def run_test(p: TestParam) -> bool:
 
     if p.num_runs > 0:
         flops_and_mem_vol = lib.count_flop_and_mem_vol(p, t)
-        prefill_ans_time = kk.bench_kineto(run_prefill, num_tests=p.num_runs).get_kernel_time("flash_sparse_prefill_fwd_kernel")
+        prefill_ans_time = kk.bench_kineto(run_prefill, num_tests=p.num_runs).get_kernel_time("flash_sparse_prefill_fwd")
         prefill_flops = flops_and_mem_vol.fwd_flop/prefill_ans_time/1e12
         prefill_mem_bw = flops_and_mem_vol.fwd_mem_vol/prefill_ans_time/1e12
         print(f"Prefill:  {prefill_ans_time*1e6:4.0f} us, {prefill_flops:6.1f} TFlops, {prefill_mem_bw:4.2f} TBps")
@@ -63,6 +63,8 @@ if __name__ == '__main__':
     torch.set_default_device(device)
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('high')
+
+    first_case = [TestParam(256, 1024, 512, h_q=128, num_runs=0, d_qk=512, have_topk_length=False)]
 
     correctness_cases = [
         # Regular shapes
@@ -167,6 +169,7 @@ if __name__ == '__main__':
     ]
 
     testcases = correctness_cases + correctness_cases_with_features + corner_cases + performance_cases
+    # testcases = first_case
 
     is_no_cooldown = lib.is_no_cooldown()
     failed_cases = []

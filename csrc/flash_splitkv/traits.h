@@ -198,8 +198,9 @@ struct Traits {
 };
 
 #define DSA_SIM_AIU 1
-template<typename InputT_>
+template<typename InputT_, int HEAD_DIM, int Arch>
 struct DSA_Traits {
+    static constexpr int Arch_value = Arch;
     using InputT = InputT_;
     using Element = InputT_;
     using ElementAccum = float;
@@ -209,7 +210,8 @@ struct DSA_Traits {
     static constexpr int PAGE_BLOCK_SIZE = Config::PAGE_BLOCK_SIZE;
     static constexpr int kBlockM = Config::BLOCK_SIZE_M;
     static constexpr int kBlockN = Config::BLOCK_SIZE_N;
-    static constexpr int kHeadDim = Config::HEAD_DIM_K;
+    static constexpr int kHeadDim = HEAD_DIM;
+    static constexpr int NUM_TILES = kHeadDim / 64;  // 9 for 576, 8 for 512
     static constexpr int kHeadDimV = Config::HEAD_DIM_V;
     static constexpr float Page_In_BlockN = float(kBlockN) / (float)PAGE_BLOCK_SIZE;
 

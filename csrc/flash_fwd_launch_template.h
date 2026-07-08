@@ -310,13 +310,17 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
     FLASH_ASSERT(params.topk > 0);
     // FLASH_ASSERT(params.h_q % B_H == 0);
 
-    if (!is_sm89_or_newer()) {
-        bool warp_interleave = (params.d_qk == 576) && ((params.s_q % 128 == 0) || (params.s_q > 256)) && (params.h_q == 128)
-            && (params.s_kv >= params.topk) && !params.attn_sink && !params.topk_length;
-        if (warp_interleave) {
-            run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 80>(params);
-            return;
-        }
+    bool warp_interleave = ((params.s_q % 128 == 0) || (params.s_q > 256)) && (params.h_q == 128)
+        && (params.s_kv >= params.topk);
+    if (warp_interleave) {
+        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+            if (!is_sm89_or_newer()) {
+                run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 80, HEAD_DIM_QK>(params);
+            } else {
+                run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 89, HEAD_DIM_QK>(params);
+            }
+        });
+        return;
     }
 
     constexpr bool USE_MMA_M8 = 0;
