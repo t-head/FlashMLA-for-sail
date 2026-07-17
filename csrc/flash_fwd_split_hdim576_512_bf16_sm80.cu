@@ -1,0 +1,8 @@
+// Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+// Copyright (c) 2024, Tri Dao.
+// Splitting the different head dimensions to different files to speed up compilation.
+// This file is auto-generated. See "generate_kernels.py"
+
+#include "flash_fwd_launch_template.h"
+
+template void run_mha_fwd_splithd_splitkv_dispatch<cutlass::bfloat16_t, 576, 512>(Flash_fwd_params &params, hggcStream_t stream);

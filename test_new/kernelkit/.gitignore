@@ -3,5 +3,7 @@ build
 *.egg-info/
 __pycache__/
 dist/
-*perf.csv
-*.png
+/.vscode
+.cache
+/temp
+/profiles

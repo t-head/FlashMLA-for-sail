@@ -1,16 +1,21 @@
 # MLA Triton kernel is from: https://github.com/monellz/vllm/commit/feebaa7c063be6bfb590a876741aeef1c5f58cf8#diff-7b2e1c9032522f7266051b9887246a65753871dfb3625a258fee40109fe6e87a
-import argparse
 import math
 import random
 
-import flashinfer
 import torch
-import triton
-import triton.language as tl
+import argparse
 
 # pip install flashinfer-python
-from flash_mla import flash_mla_with_kvcache, get_mla_metadata
-
+from flash_mla import get_mla_metadata, flash_mla_with_kvcache
+try:
+    import flashinfer
+except ImportError:
+    print("Import flashinfer failed, please install if need!")
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    print("Import triton failed, please install if need!")
 
 def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
     query = query.float()
@@ -181,6 +186,7 @@ def _mla_attn_kernel(
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    offs_d_ckv_i64 = offs_d_ckv.cast(tl.int64)
 
     for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -190,7 +196,9 @@ def _mla_attn_kernel(
             other=0,
         )
         kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
-        offs_k_c = kv_loc[None, :] * stride_kv_c_bs + offs_d_ckv[:, None]
+        kv_loc_i64 = kv_loc.cast(tl.int64)
+        stride_kv_c_bs_i64 = stride_kv_c_bs.cast(tl.int64)
+        offs_k_c = kv_loc_i64[None, :] * stride_kv_c_bs_i64 + offs_d_ckv_i64[:, None]
         k_c = tl.load(Kv_c_cache + offs_k_c, mask=offs_n[None, :] < split_kv_end, other=0.0)
 
         qk = tl.dot(q_nope, k_c.to(q_nope.dtype))
@@ -444,7 +452,6 @@ def compare_ab(baseline, target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal
     bytes = (total_seqlens * h_kv * d + b * s_q * h_q * d + b * s_q * h_q * dv) * (torch.finfo(dtype).bits // 8)
     print(f"perf {baseline}: {perf_a:.3f} ms, {FLOPS / 10 ** 9 / perf_a:.0f} TFLOPS, {bytes / 10 ** 6 / perf_a:.0f} GB/s")
     print(f"perf {target}: {perf_b:.3f} ms, {FLOPS / 10 ** 9 / perf_b:.0f} TFLOPS, {bytes / 10 ** 6 / perf_b:.0f} GB/s")
-    return bytes / 10 ** 6 / perf_a, bytes / 10 ** 6 / perf_b
 
 
 def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
@@ -503,8 +510,7 @@ def get_args():
     
 if __name__ == "__main__":
     args = get_args()
-    benchmark_type = "all" if args.all else f"{args.baseline}_vs_{args.target}" if args.compare else args.target
-    with open(f"{benchmark_type}_perf.csv", "w") as fout:
+    with open("all_perf.csv", "w") as fout:
         fout.write("name,batch,seqlen,head,bw\n")
         for shape in shape_configs:
             if args.all:
@@ -512,9 +518,6 @@ if __name__ == "__main__":
                     perf = compare_a(target, shape["b"], shape["s_q"], shape["cache_seqlens"], shape["h_q"], shape["h_kv"], shape["d"], shape["dv"], shape["causal"], shape["dtype"])
                     fout.write(f'{target},{shape["b"]},{shape["cache_seqlens"].float().mean().cpu().item():.0f},{shape["h_q"]},{perf:.0f}\n')
             elif args.compare:
-                perfa, prefb = compare_ab(args.baseline, args.target, shape["b"], shape["s_q"], shape["cache_seqlens"], shape["h_q"], shape["h_kv"], shape["d"], shape["dv"], shape["causal"], shape["dtype"])
-                fout.write(f'{args.baseline},{shape["b"]},{shape["cache_seqlens"].float().mean().cpu().item():.0f},{shape["h_q"]},{perfa:.0f}\n')
-                fout.write(f'{args.target},{shape["b"]},{shape["cache_seqlens"].float().mean().cpu().item():.0f},{shape["h_q"]},{prefb:.0f}\n')
+                compare_ab(args.baseline, args.target, shape["b"], shape["s_q"], shape["cache_seqlens"], shape["h_q"], shape["h_kv"], shape["d"], shape["dv"], shape["causal"], shape["dtype"])
             elif args.one:
-                perf = compare_a(args.target, shape["b"], shape["s_q"], shape["cache_seqlens"], shape["h_q"], shape["h_kv"], shape["d"], shape["dv"], shape["causal"], shape["dtype"])
-                fout.write(f'{args.target},{shape["b"]},{shape["cache_seqlens"].float().mean().cpu().item():.0f},{shape["h_q"]},{perf:.0f}\n')
+                compare_a(args.target, shape["b"], shape["s_q"], shape["cache_seqlens"], shape["h_q"], shape["h_kv"], shape["d"], shape["dv"], shape["causal"], shape["dtype"])
