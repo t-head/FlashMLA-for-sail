@@ -1192,7 +1192,7 @@ __forceinline__ __device__ long get_block_index(
     // const int block_table_idx = block_idx * T::Page_In_BlockN;
     const int block_table_idx = block_idx * 1 / 2;
     const int block_table_offset = block_idx * T::kBlockN - block_table_idx * T::PAGE_BLOCK_SIZE;
-    return long(__ldg(block_table_ptr + block_table_idx) * params.k_batch_stride + block_table_offset * params.k_row_stride);
+    return long(__ldg(block_table_ptr + block_table_idx) * params.k_batch_stride + block_table_offset * params.k_row_stride + blockIdx.y * params.k_head_stride);
 }
 
 template <
