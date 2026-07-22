@@ -22,10 +22,10 @@ This repository contains the following implementations:
 
 ```bash
 # Dense:
-python tests/test_flash_mla.py
+python tests/test_flash_mla_dense_decoding.py
 # Sparse:
-python tests/test_flash_mla_decoding.py
-python tests/test_flash_mla_prefill.py
+python tests/test_flash_mla_sparse_decoding.py
+python tests/test_flash_mla_sparse_prefill.py
 # Compare test:
 python bench_flash_mla.py --baseline torch --target flash_mla --compare
 ```
@@ -76,7 +76,7 @@ Where
 - `h_kv` is the number of key-value heads.
 - `h_q` is the number of query heads.
 
-See `tests/test_flash_mla.py` for a complete example.
+See `tests/test_flash_mla_dense_decoding.py` for a complete example.
 
 **FP8 KV Cache:**
 If `is_fp8_kvcache` is set to `True`, the kernel reads the KV cache in the "FP8 with scale" format (described below). It dequantizes the cache to bfloat16 and performs attention computation in bfloat16. The output is also in bfloat16.
@@ -94,7 +94,7 @@ The kernel returns `(out, lse)`, where:
 -   `out` is the attention result.
 -   `lse` is the log-sum-exp value of the attention scores for each query head.
 
-See `tests/test_flash_mla_decoding.py` for a complete example.
+See `tests/test_flash_mla_sparse_decoding.py` for a complete example.
 
 ### Sparse MLA Prefill
 
@@ -129,7 +129,7 @@ out = S @ focused_kv  # [s_q, h_q, d_qk]
 return (out, max_logits, lse)
 ```
 
-See `tests/test_flash_mla_prefill.py` for a complete example.
+See `tests/test_flash_mla_sparse_prefill.py` for a complete example.
 
 ## When you encounter issues
 If you encounter bugs, please open a GitHub Issue!

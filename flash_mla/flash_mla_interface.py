@@ -31,8 +31,7 @@ class FlashMLASchedMeta:
     config: Optional[Config] = None
 
     tile_scheduler_metadata: Optional[torch.Tensor] = None   # (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
-    num_splits: Optional[torch.Tensor] = None                # (1), dtype torch.int32.
-
+    num_splits: Optional[torch.Tensor] = None                # (batch_size + 1), dtype torch.int32.
 
 # def get_mla_metadata(
 #     cache_seqlens: torch.Tensor,
@@ -58,18 +57,20 @@ class FlashMLASchedMeta:
 #     return flash_mla_cuda.get_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k, num_heads_q, is_fp8_kvcache, topk)
 
 def get_mla_metadata(
-    *args,
+    *args, 
     **kwargs
 ) -> Tuple[FlashMLASchedMeta, None]:
     """
     Returns an empty instance of FlashMLASchedMeta. The actual scheduling metadata will be generated during the first invocation of flash_mla_with_kvcache.
 
-    This function does not need any arguments, but we keep *args and **kwargs to be compatible with the old interface.
+    Arguments:
+        This function does not need any arguments, but we keep *args and **kwargs to be compatible with the old interface.
 
     Return:
         A tuple. Due to historical reasons, we return a tuple of (FlashMLASchedMeta, None) now. Only the first element is useful.
     """
     return FlashMLASchedMeta(), None
+
 
 def flash_mla_with_kvcache(
     q: torch.Tensor,
@@ -88,7 +89,7 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -101,8 +102,8 @@ def flash_mla_with_kvcache(
         block_table: (batch_size, max_num_blocks_per_seq), torch.int32. Can be None when sparse attention is used.
         cache_seqlens: (batch_size), torch.int32. Can be None when sparse attention is used.
         head_dim_v: Head_dim of v. Must be 512
-        sched_meta: FlashMLASchedMeta, return by get_mla_metadata. You may reuse the same sched_meta across different invocations, but only when the tensor shapes and the values of cache_seqlens, topk_length, and extra_topk_length remain the same.
-        num_splits_placeholder: must be "None" (to be compatible with the old interface).
+        tile_scheduler_metadata: FlashMLASchedMeta, return by get_mla_metadata. You may reuse the same sched_meta across different invocations, but only when the tensor shapes and the values of cache_seqlens, topk_length, and extra_topk_length remain the same.
+        num_splits placeholder: must be "None" (to be compatible with the old interface).
         softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim_k).
         causal: bool. Whether to apply causal attention mask. Only valid for dense attention
         is_fp8_kvcache: bool.
@@ -163,20 +164,7 @@ def flash_mla_with_kvcache(
             extra_k_page_block_size,
             extra_topk,
         )
-        cache_seqlens_ = cache_seqlens if cache_seqlens is not None else torch.empty(sched_meta.config.b, dtype=torch.int32, device=q.device)
-        new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.get_mla_metadata(
-            cache_seqlens_,
-            sched_meta.config.s_q * sched_meta.config.h_q // sched_meta.config.h_k,
-            sched_meta.config.h_k,
-            sched_meta.config.h_q,
-            sched_meta.config.is_fp8_kvcache,
-            sched_meta.config.topk,
-            sched_meta.config.extra_topk,
-            topk_length,
-            extra_topk_length,
-        )
-        sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
-        sched_meta.num_splits = new_num_splits
+        # Metadata will be generated lazily in C++ on first call
 
     else:
         # Check whether the input arguments are consistent with sched_meta
@@ -193,30 +181,48 @@ def flash_mla_with_kvcache(
         assert sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg
         assert sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg
 
-    if indices is not None:
+    if topk is not None:
         assert causal == False, "causal must be `false` if sparse attention is enabled."
 
-    out, softmax_lse = flash_mla_cuda.fwd_kvcache_mla(
-        q,
-        k_cache,
-        None, # v_cache
-        head_dim_v,
-        cache_seqlens, # can be none
-        block_table, # can be none
-        softmax_scale,
-        causal,
-        sched_meta.tile_scheduler_metadata,
-        sched_meta.num_splits,
-        is_fp8_kvcache,
-        indices,
-        attn_sink,
-        topk_length,
-        extra_k_cache,
-        extra_indices_in_kvcache,
-        extra_topk_length,
-        out
-    )
+    # Dispatch to appropriate C++ function based on whether indices are provided
+    if topk is not None:
+        # Sparse decode path
+        out, softmax_lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd(
+            q,
+            k_cache,
+            head_dim_v,
+            indices,
+            attn_sink,
+            topk_length,
+            sched_meta.tile_scheduler_metadata,
+            sched_meta.num_splits,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
+            softmax_scale,
+            out
+        )
+    else:
+        # Dense decode path
+        out, softmax_lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.dense_decode_fwd(
+            q,
+            k_cache,
+            head_dim_v,
+            cache_seqlens,
+            block_table,
+            softmax_scale,
+            causal,
+            sched_meta.tile_scheduler_metadata,
+            sched_meta.num_splits,
+            out
+        )
+
+    # Update metadata from C++ return values
+    sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
+    sched_meta.num_splits = new_num_splits
+
     return out, softmax_lse
+
 
 def flash_mla_sparse_fwd(
     q: torch.Tensor,

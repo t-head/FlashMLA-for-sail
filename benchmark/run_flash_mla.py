@@ -27,16 +27,16 @@ import os
 import sys
 from utils import read_cmds_from_file
 
-# `test_new/quant.py` provides both V3 (d_qk=576) and MODEL1 (d_qk=512) FP8 KV
+# `tests/quant.py` provides both V3 (d_qk=576) and MODEL1 (d_qk=512) FP8 KV
 # cache layouts. The bench-local `quantize_k_cache` defined further down only
-# emits the V3 layout, so we prefer the test_new version when present.
+# emits the V3 layout, so we prefer the tests version when present.
 _test_new_quant = None
 try:
     _here = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, os.path.join(_here, "..", "test_new"))
+    sys.path.insert(0, os.path.join(_here, "..", "tests"))
     import quant as _test_new_quant  # type: ignore
 finally:
-    if sys.path and sys.path[0].endswith("test_new"):
+    if sys.path and sys.path[0].endswith("tests"):
         sys.path.pop(0)
 device_name = torch.cuda.get_device_name()
 USE_PPU = (device_name.lower().find("ppu") != -1) or (device_name.lower().find("zw") != -1)

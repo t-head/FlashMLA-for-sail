@@ -1,6 +1,5 @@
 import sys
 import os
-import sys
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -19,17 +18,25 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 def get_sources():
     sources = [
-        "csrc/flash_api.cpp",
-        "csrc/flash_fwd_split_hdim576_512_bf16_sm80.cu",
-        "csrc/flash_fwd_sparse_prefill_hdim576_512_bf16_sm80.cu",
-        "csrc/flash_fwd_mla_metadata.cu",
-        "csrc/flash_splitkv/mla_combine.cu",
-        "csrc/flash_splitkv/splitkv_mla.cu",
-        "csrc/flash_splitkv/splitkv_dsa.cu",
+        "csrc/api/api.cpp",
+        "csrc/ppu/decode/dense/instantiations/hdim576_512_bf16.cu",
+        "csrc/ppu/decode/dense/instantiations/splitkv_mla_bf16.cu",
+        "csrc/ppu/prefill/sparse/instantiations/dispatch_bf16.cu",
+        "csrc/ppu/decode/sparse/instantiations/hdim576_bf16.cu",
+        "csrc/ppu/decode/sparse/instantiations/hdim512_bf16.cu",
+        "csrc/ppuxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+        "csrc/ppuxx/decode/combine/instantiations/mla_combine_bf16.cu",
+        "csrc/ppu/prefill/sparse/instantiations/wg_bf16_sm80.cu",
+        "csrc/ppu/prefill/sparse/instantiations/wg_bf16_sm89.cu",
     ]
     if not DISABLE_FP16:
-        sources.append("csrc/flash_fwd_split_hdim576_512_fp16_sm80.cu")
+        sources.append("csrc/ppu/decode/dense/instantiations/hdim576_512_fp16.cu")
+        sources.append("csrc/ppu/decode/dense/instantiations/splitkv_mla_fp16.cu")
+        sources.append("csrc/ppuxx/decode/combine/instantiations/mla_combine_fp16.cu")
+        sources.append("csrc/ppu/prefill/sparse/instantiations/wg_fp16_sm80.cu")
+        sources.append("csrc/ppu/prefill/sparse/instantiations/wg_fp16_sm89.cu")
     return sources
+
 
 
 def get_features_args():
@@ -167,8 +174,6 @@ class HGCCBuildExtension(build_ext):
 # Extension module definition
 # ============================================================================
 
-this_dir = os.path.dirname(os.path.abspath(__file__))
-# subprocess.run(["git", "submodule", "update", "--init", "csrc/actlize"])
 dir_actlize = this_dir + "/csrc/actlize"
 if not os.path.exists(dir_actlize):
     try:
@@ -192,6 +197,9 @@ ext_modules.append(
         include_dirs=[
             str(Path(this_dir) / "csrc"),
             str(Path(this_dir) / "csrc" / "actlize" / "include"),
+            str(Path(this_dir) / "csrc" / "api"),
+            str(Path(this_dir) / "csrc" / "kerutils" / "include"),
+            str(Path(this_dir) / "csrc" / "ppu"),
         ],
     )
 )

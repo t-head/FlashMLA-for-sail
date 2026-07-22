@@ -6,3 +6,10 @@ from flash_mla.flash_mla_interface import (
     flash_mla_with_kvcache,
     flash_mla_sparse_fwd
 )
+
+__all__ = [
+    "FlashMLASchedMeta",
+    "get_mla_metadata",
+    "flash_mla_with_kvcache",
+    "flash_mla_sparse_fwd"
+]
