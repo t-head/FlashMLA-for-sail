@@ -30,6 +30,18 @@ python tests/test_flash_mla_sparse_prefill.py
 python bench_flash_mla.py --baseline torch --target flash_mla --compare
 ```
 
+## PPU Backend Extensions and Optimizations
+
+The PPU version includes targeted optimizations around data movement, shared storage layout, matrix computation, warp specialization, metadata scheduling, and compilation backend orchestration.
+
+- **AIU + TSM Swizzle data path**: Tiled Q/K/V and KV cache data are routed through the AIU for asynchronous movement, and a swizzle layout is applied when writing to TSM / shared memory, so that data in shared storage aligns more closely with the operand read pattern of the subsequent MMA operations, reducing extra reshuffling and memory access conflicts.
+- **PPU Tensor Cell mapping**: The QK and PV multiply-accumulate operations are organized as tiled MMA and mapped onto PPU Tensor Cell instructions, together with accumulator layout conversion, covering the FP16/BF16 compute paths as well as the BF16 compute path used after reading an FP8 KV cache.
+- **Warp interleave / CrossCut scheduling**: The dense MLA decoding path selects CrossCut and warp interleave schemes according to sequence length, batch size, and device capability, advancing QK, softmax, PV, and output write-back in an interleaved manner across warp groups to improve parallelism and pipeline utilization during the decoding stage.
+- **Tile and register residency tuning**: Block shape, warp count, stage count, MMA atom shape, and Q register residency strategy are selected for different `seqlen_q`, head counts, page block sizes, top-k values, and KV cache formats, matching the differing memory-access/compute ratios of dense decoding, sparse prefill, and sparse decoding.
+- **Metadata + Split-KV load balancing**: Metadata precomputes the intra-batch tile partitioning and split count before execution, and the decoding kernel dispatches work according to this metadata, improving load balancing for long/short sequences, variable-length batches, top-k sparse attention, and multi-split scenarios.
+- **Sparse / FP8 KV cache path optimizations**: The DSA decoding path supports token-level sparse attention, extra KV, attention sink, and top-k length scenarios; an FP8 KV cache is dequantized after being read and then computed in BF16, reducing KV cache bandwidth pressure.
+- **Compilation options assisting backend orchestration**: The build parameters enable PPU/AIU support and configure backend optimization options such as register count, matrix address sinking, asynchronous address sinking, load/store address sinking, warpage, and virtual register reordering, helping the compiler better orchestrate memory access, register usage, and the compute pipeline.
+
 ## Requirements
 
 - PPU SDK
