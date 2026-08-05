@@ -1787,12 +1787,6 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             {
                 launch_q_copy<T>(params, batch_idx + 1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
             }
-            else
-            {
-                // Allow the next kernel (the combine kernel) to launch
-                // The next kernel MUST be the combine kernel
-                hggcTriggerProgrammaticLaunchCompletion();
-            }
 
             int i = threadIdx.x;
             if (i < num_valid_seq_q)
@@ -1840,12 +1834,6 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
                 }
                 cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
                 launch_q_copy<T>(params, batch_idx + 1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
-            }
-            else
-            {
-                // Allow the next kernel (the combine kernel) to launch
-                // The next kernel MUST be the combine kernel
-                hggcTriggerProgrammaticLaunchCompletion();
             }
         }
         if (batch_idx != end_idx)
