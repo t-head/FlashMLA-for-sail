@@ -389,6 +389,11 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
         kv_load_num++;
     }
 
+    // sOaccum aliases the K/V smem: all warps must finish their last sVt reads
+    // (final gemm_rs) before store() writes sOaccum. Same barrier as the
+    // cross_cut path before its epilogue.
+    __syncthreads();
+
     // Epilogue
     if (NoSplit) {
         store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
