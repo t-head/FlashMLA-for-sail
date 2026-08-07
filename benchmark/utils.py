@@ -50,7 +50,7 @@ def worker(gpu_id, fa_cases, output, device, is_local, backend, args):
         run_fa_cycle_on_device(fa_cases, output, device, is_local, backend, args)
 
 # devices = {
-#     "name": ["cycle", "tensor core efficiency", "waves"],
+#     "name": ["cycle", "tensor cell efficiency", "waves"],
 #     "gpu":  ["sm__cycles_elapsed.max", "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", "launch__waves_per_multiprocessor"],
 #     "ppu":  ["ce__cycles_elapsed.max", "cu__inst_executed_pipe_tensor_fp16.avg.pct_of_peak_sustained_active", "launch__waves_per_cu"],
 # }
@@ -234,7 +234,7 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, ba
     consecutive = args.consecutive
     output_lines = list()
     # headers = ["casename","cycle","tc efficiency", "hbm efficiency", "cmd", "detail"]
-    headers = ["casename","cycles(sm__cycles_elapsed.max)","tc_pct(TensorCore效率%)","L2_hit_pct(L2命中率%)","hbm_pct(HBM带宽效率%)","inner_cycles","duration_us(gpu__time_duration.sum)","ncu_cmd","detail"]
+    headers = ["casename","cycles(sm__cycles_elapsed.max)","tc_pct(TensorCell效率%)","L2_hit_pct(L2命中率%)","hbm_pct(HBM带宽效率%)","inner_cycles","duration_us(gpu__time_duration.sum)","ncu_cmd","detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
     # output_lines.append(new_row)
     if not os.path.exists("./logs"):
