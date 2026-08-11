@@ -21,6 +21,8 @@
 #include "kerutils/device/ppu/dequant.cuh"
 #include "utils.h"
 #include "ppuxx/decode/combine/combine.cuh"
+#include "decode/sparse/sparse_decode_wg.h"
+#include "kerutils/host/host.h"
 
 #include <hggc_ad.h>
 
@@ -1069,31 +1071,78 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
         constexpr bool USE_MMA_M8 = 0;
         constexpr bool KeepQ = true;
         constexpr static int kBlockN = 64;
+        // Warp-interleave compile-time gate: enabled for sparse-FP8 paths.
+        // WI v2 supports Headdim=576/512, extra_topk, but requires:
+        //   - page_block_size > 0 and a power of two (kPagePow2 gate below)
+        //   - seqlen_q == ngroups (s_q_ori==1, single m_block only)
+        // BlockM=128 path: ngroups >= 128
+        // BlockM=64 path:  64 <= ngroups < 128 (cross-cut layout)
+        // Other configurations fall back to non-WI splitkv path.
+        const bool kCanWI = false; //is_sm89_or_newer();
+        // blockM=128 path (original 8,1 atom layout)
+        const bool wi_enable_m128 = kCanWI
+            && (params.ngroups >= 128)
+            && (params.seqlen_q == params.ngroups)
+            && (params.page_block_size > 0);
+        // blockM=64 path (cross-cut 4,2 atom layout, for h_q=64)
+        const bool wi_enable_m64 = kCanWI
+            && (params.ngroups >= 64)
+            && (params.ngroups < 128)
+            && (params.seqlen_q == params.ngroups)
+            && (params.page_block_size > 0);
         SEQLENG_SWITCH_ALIGN(params.seqlen_q, [&] {
             IS_PAGE_POWER2(params.page_block_size, params.extra_page_block_size, [&] {
                 constexpr int AtomLayoutQ = kBlockM / 16;
                 constexpr int kNwarps0 = AtomLayoutQ * (kBlockN / 16);
                 constexpr int kNwarps = 16;
                 constexpr int AtomLayoutP = kBlockM == 64 ? 2 : 1; // to save regs(sum/max in softmax)
-                run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
-                    Headdim, kBlockM, kBlockN, kNwarps, KeepQ/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
-                    T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,
-                    kBlockN/*kBlockNPagedPerAiuLoad*/, 2/*kStages*/, kNwarps0, kPagePow2
-                    >, IsFP8>(params, stream);
+                if (wi_enable_m128 && kPagePow2) {
+                    run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 128>(params, stream);
+                } else if (wi_enable_m64 && kPagePow2) {
+                    run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 64>(params, stream);
+                } else {
+                    // WI v2 rejected (ngroups < 64):
+                    // fall back to non-WI sparse decode (splitkv compute path).
+                    run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
+                        Headdim, kBlockM, kBlockN, kNwarps, KeepQ/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
+                        T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,
+                        kBlockN/*kBlockNPagedPerAiuLoad*/, 2/*kStages*/, kNwarps0, kPagePow2
+                        >, IsFP8>(params, stream);
+                }
             });
         });
     } else {
         constexpr bool USE_MMA_M8 = 0;
         constexpr bool KeepQ = true;
         constexpr static int kBlockN = 64;
-        SEQLENG_SWITCH_ALIGN(params.seqlen_q, [&] {
-            constexpr int AtomLayoutQ = kBlockM / 16;
-            constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
-            constexpr int AtomLayoutP = kBlockM == 64 ? 2 : 1;
-            run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
-                Headdim, kBlockM, kBlockN, kNwarps, KeepQ/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
-                T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
-                >, IsFP8>(params, stream);
+        // BF16 sparse decode — WI v2 supported with same runtime constraints as FP8.
+        // BlockM=128 path: ngroups >= 128
+        // BlockM=64 path:  64 <= ngroups < 128 (cross-cut layout)
+        // WI v2 requires page_block_size == 2'power
+        const bool kCanWI = is_sm89_or_newer();
+        const bool wi_enable_m128 = kCanWI
+            && (params.ngroups >= 128)
+            && (params.seqlen_q == params.ngroups)
+            && (params.page_block_size > 0);
+        const bool wi_enable_m64 = kCanWI
+            && (params.ngroups >= 64)
+            && (params.ngroups < 128)
+            && (params.seqlen_q == params.ngroups)
+            && (params.page_block_size > 0);
+        IS_PAGE_POWER2(params.page_block_size, params.extra_page_block_size, [&] {
+            if (wi_enable_m128 && kPagePow2) {
+                run_flash_sparse_decode_wg_kernel<T, 89, false, 128>(params, stream);
+            } else {
+                SEQLENG_SWITCH_ALIGN(params.seqlen_q, [&] {
+                    constexpr int AtomLayoutQ = kBlockM / 16;
+                    constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
+                    constexpr int AtomLayoutP = kBlockM == 64 ? 2 : 1;
+                    run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
+                        Headdim, kBlockM, kBlockN, kNwarps, KeepQ/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
+                        T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
+                        >, IsFP8>(params, stream);
+                });
+            }
         });
     }
 }

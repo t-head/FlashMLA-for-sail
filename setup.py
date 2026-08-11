@@ -27,6 +27,7 @@ def get_sources():
         "csrc/ppu/prefill/sparse/instantiations/dispatch_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/hdim576_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/hdim512_bf16.cu",
+        "csrc/ppu/decode/sparse/instantiations/sparse_decode_wg_bf16.cu",
         "csrc/ppuxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
         "csrc/ppuxx/decode/combine/instantiations/mla_combine_bf16.cu",
         "csrc/ppu/prefill/sparse/instantiations/wg_bf16_sm80.cu",

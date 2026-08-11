@@ -42,6 +42,7 @@ flash_fwd_mla_combine_kernel_small_size(__grid_constant__ const Flash_fwd_params
     if (actual_num_splits == 1) return;
 
     __shared__ ElementAccum sLseScale[kMaxSplits];
+    __shared__ float sGlobalLse;  // broadcast global_lse from warp0 to all threads
 
     const index_t row_offset_lseaccum = split_offset * hs + hs_idx;
     const index_t row_offset_lse = bidx;
@@ -83,6 +84,7 @@ flash_fwd_mla_combine_kernel_small_size(__grid_constant__ const Flash_fwd_params
             const int split = i * 32 + tidx;
             if (split < actual_num_splits) sLseScale[split] = exp2f(local_lse[i] - global_lse);
         }
+        if (tidx == 0) sGlobalLse = global_lse;
     }
     __syncthreads();
 
@@ -110,6 +112,28 @@ flash_fwd_mla_combine_kernel_small_size(__grid_constant__ const Flash_fwd_params
             tOrO(i) += lse_scale * tOrOaccum(i);
         }
         tOgOaccum.data() = tOgOaccum.data() + hs * kHeadDimV;
+    }
+
+    // [Task #75] Apply attn_sink scaling after combining partial results.
+    // O_final = O_combined * 1/(1 + exp(sink - lse))
+    // In log2 space: factor = 1/(1 + exp2f(sink*M_LOG2E - global_lse))
+    // gLSE written above stays sink-free, matching the reference contract.
+    if (params.attn_sink_ptr != nullptr) {
+        // In the MLA layout q-heads are folded into the seqlen_q dimension as
+        // (q_pos * ngroups + q_head_in_group), so the q-head index of this row
+        // is hs_idx % ngroups (consistent with the WG kernel epilogue and the
+        // legacy flash_fwd_splitkv_mla_combine_kernel).
+        const int q_head_for_sink = hs_idx % params.ngroups;
+        float sink_log2 = __ldg(params.attn_sink_ptr + q_head_for_sink) * (float)M_LOG2E;
+        // Guard: when global_lse is INFINITY (no valid tokens attended), output
+        // should stay 0.  Computing sink_log2 - INFINITY would produce NaN when
+        // sink_log2 is also +INF (INF - INF = NaN).  Use factor=1 in this case
+        // since result is already 0.
+        float factor = (sGlobalLse != sGlobalLse || sGlobalLse == INFINITY)
+            ? 1.0f : 1.0f / (1.0f + exp2f(sink_log2 - sGlobalLse));
+        for (int i = 0; i < size(tOrO); ++i) {
+            tOrO(i) *= factor;
+        }
     }
 
     Tensor rO = flash::convert_type<Element>(tOrO);
@@ -176,6 +200,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const Flash_fwd_params params) {
         return;
 
     // Warp #i gathers LseAccum for seq #i
+    float my_global_lse;  // visible to both LSE reduction and O accumulation
     {
         constexpr int NUM_LSE_PER_THREAD = cute::ceil_div(MAX_SPLITS, 32);
 
@@ -206,6 +231,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const Flash_fwd_params params) {
             sum_lse = sum_lse + __shfl_xor_sync(uint32_t(-1), sum_lse, offset);
 
         float global_lse = (sum_lse == 0.f || sum_lse != sum_lse) ? INFINITY : log2f(sum_lse) + max_lse;
+        my_global_lse = global_lse;
 
         if (lane_idx == 0)
             gLse(warp_idx) = global_lse / (float)M_LOG2E;
@@ -243,6 +269,29 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const Flash_fwd_params params) {
                 for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
                     result[i] += lse_scale * gOaccum(split, lane_idx + i*32);
                 }
+            }
+        }
+
+        // [Task #75] Apply attn_sink scaling after combining partial results.
+        // O_final = O_combined * 1/(1 + exp(sink - lse))
+        // In log2 space: factor = 1/(1 + exp2f(sink*M_LOG2E - global_lse))
+        // gLse written above stays sink-free, matching the reference contract.
+        if (params.attn_sink_ptr != nullptr) {
+            // In the MLA layout q-heads are folded into the seqlen_q dimension
+            // as (q_pos * ngroups + q_head_in_group), so the q-head index of
+            // this row is q_seq_idx % ngroups (consistent with the WG kernel
+            // epilogue and the legacy flash_fwd_splitkv_mla_combine_kernel).
+            const int q_head_for_sink = (m_block_idx*BLOCK_SIZE_M + warp_idx) % params.ngroups;
+            float sink_log2 = __ldg(params.attn_sink_ptr + q_head_for_sink) * (float)M_LOG2E;
+            // Guard: when my_global_lse is INFINITY (no valid tokens attended),
+            // output should stay 0.  Computing sink_log2 - INFINITY produces NaN
+            // when sink_log2 is also +INF (INF - INF = NaN).  Use factor=1 since
+            // result is already 0.
+            float factor = (my_global_lse != my_global_lse || my_global_lse == INFINITY)
+                ? 1.0f : 1.0f / (1.0f + exp2f(sink_log2 - my_global_lse));
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                result[i] *= factor;
             }
         }
 
