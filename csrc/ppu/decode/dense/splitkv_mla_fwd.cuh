@@ -65,9 +65,10 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     const int64_t *hllm_block_table = params.block_table == nullptr ? params.hllm_block_table + bidb * params.block_table_batch_stride : nullptr;
     const int block_table_idx = (n_block_max - 1) * kBlockN / params.page_block_size;
     const int block_table_offset = (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
-    const index_t row_offset_k = block_table != nullptr
-        ? __ldg(block_table + block_table_idx) * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
-        : block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+    const index_t row_offset_k = have_zero_seqlen_k ? (index_t)0 :
+        (block_table != nullptr
+            ? __ldg(block_table + block_table_idx) * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
+            : block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride);
     // const index_t row_offset_v = block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
@@ -77,7 +78,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     Tensor gQ = local_tile(make_mix_tensor_like(mQ(_, bidh, _)), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
     Tensor gK = make_tensor(make_gmem_ptr(
-                                block_table != nullptr
+                                block_table != nullptr || have_zero_seqlen_k
                                     ? reinterpret_cast<Element *>(params.k_ptr)
                                     : reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx))) + row_offset_k,
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
@@ -458,7 +459,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     const int page_block_size = params.page_block_size;
     int block_table_idx = n_block * kBlockN / page_block_size;
     int block_table_offset = n_block * kBlockN - block_table_idx * page_block_size;
-    int cur_block_table = GET_BLOCK_INDEX(n_block, block_table_idx);
+    int cur_block_table = have_zero_seqlen_k ? 0 : GET_BLOCK_INDEX(n_block, block_table_idx);
 
     index_t row_offset_k = cur_block_table * params.k_batch_stride
                          + block_table_offset * params.k_row_stride
@@ -470,7 +471,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
                             make_stride(params.q_row_stride, params.q_head_stride, _1{}));
     Tensor gQ = local_tile(make_mix_tensor_like(mQ(_, bidh, _)), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
-    Tensor gK = make_mix_tensor(make_gmem_ptr(block_table == nullptr
+    Tensor gK = make_mix_tensor(make_gmem_ptr(block_table == nullptr && !have_zero_seqlen_k
                                 ? reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx))
                                 : reinterpret_cast<Element *>(params.k_ptr)) + row_offset_k,
                             Shape<Int<kBlockNPagedPerAiuLoad>, Int<kHeadDim>>{},
