@@ -12,6 +12,7 @@
 typedef struct HGstream_st* hggcStream_t;
 #include <cutlass/fast_math.h>
 #include <cutlass/numeric_types.h>
+#include <algorithm>
 #include <limits>
 
 #include "kerutils/host/host.h"
@@ -110,7 +111,7 @@ get_num_sm_parts(
 
     // to avoid too big empty sm split parts when batch is small
     int num_sm_parts = num_heads_per_head_k > 128 && batch < 4 ?
-        (occupancy * sm_count) / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m) :
+        std::max(1, (occupancy * sm_count) / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m)) :
         (occupancy * sm_count) / gcd(cutlass::ceil_div(num_heads_per_head_k, block_size_m) * num_heads_k, occupancy * sm_count);
 
     // make sure num_sm_parts <= 320 && can be divided by sm_count
