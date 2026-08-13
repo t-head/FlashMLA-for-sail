@@ -29,7 +29,7 @@
 
 using namespace cute;
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kBlockNPagedPerAiuLoad_, bool USE_MMA_M8=true, typename elem_type=cutlass::half_t>
+template<bool USE_MMA_M8=true, typename elem_type=cutlass::half_t>
 struct Flash_kernel_traits {
 
 #if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100
@@ -69,31 +69,6 @@ struct Flash_kernel_traits {
     using SmemCopyAtom = Copy_Atom<PPU_U32x4_LDSM_N, elem_type>;
     // using SmemCopyAtom = Copy_Atom<PPU_U32x2_LDSM_N, elem_type>;
     using SmemCopyAtomTransposed = Copy_Atom<PPU_U16x8_LDSM_T, elem_type>;
-
-#if USE_AIU
-    static constexpr int kBlockKSmem = kHeadDim_ % 64 == 0 ? 64 : 32;
-    using SmemCopyOpQ = std::conditional_t<
-        USE_MMA_M8,
-        PPU0010_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false, 1, 2>, //only for ACOMPUTE_VERSION=10000
-        PPU_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false, 1>
-    >;
-    using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, elem_type>;
-
-    // using SmemCopyOpQt = PPU_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, true, true, 1>;
-    // using SmemCopyAtomQt = Copy_Atom<SmemCopyOpQt, elem_type>;
-    using SmemCopyOpK = PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad_, kBlockKSmem, true, false,
-                                        kBlockN_ / kBlockNPagedPerAiuLoad_ * kHeadDim_ / kBlockKSmem>;
-    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, elem_type>;
-
-    // using SmemCopyOpKVt = Acompute10000_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, false, true>;
-    // using SmemCopyAtomKVt = Copy_Atom<SmemCopyOpKVt, elem_type>;
-
-#else
-    using SmemCopyAtomQ = SmemCopyAtom;
-    // using SmemCopyAtomQt = SmemCopyAtomTransposed;
-    using SmemCopyAtomK = SmemCopyAtom;
-    // using SmemCopyAtomKVt = SmemCopyAtomTransposed
-#endif
 #else
     using SmemCopyAtom = Copy_Atom<DefaultCopy, elem_type>;
     using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;
@@ -104,7 +79,7 @@ template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_r
          int kHeadDimV_ = kHeadDim_,
          bool CrossCut_ = false, bool USE_MMA_M8_ = true, int AtomLayoutQ_ = kNWarps_, int AtomLayoutP_ = kNWarps_,
          int kBlockNPagedPerAiuLoad_ = kBlockN_, int kStages_ = 2, int kNWarps0_ = kNWarps_, bool page_pow2_ = false,
-         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, kBlockNPagedPerAiuLoad_, USE_MMA_M8_, elem_type>>
+         bool CvtGemm0SwzlLd_ = false, typename Base=Flash_kernel_traits<USE_MMA_M8_, elem_type>>
 struct Flash_fwd_kernel_traits : public Base {
     using Element = typename Base::Element;
     using ElementAccum = typename Base::ElementAccum;
@@ -119,11 +94,6 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kNThreads = kNWarps * 32;
     static constexpr int kStages = kStages_;
     static constexpr bool kPagePow2 = page_pow2_;
-
-    /// only for CrossCut ///
-// #if ACOMPUTE_VERSION > 10000
-//     static_assert(USE_MMA_M8_ == false, "Not support for mma.m8!");
-// #endif
 
     static constexpr bool USE_MMA_M8 = USE_MMA_M8_;
     static constexpr bool CrossCut = CrossCut_;
@@ -146,13 +116,51 @@ struct Flash_fwd_kernel_traits : public Base {
     // static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
     static constexpr int kSwizzleV = kBlockKSmemV == 32 ? 2 : 3;
-    static constexpr int kBlockNPagedPerAiuLoad = kBlockNPagedPerAiuLoad_;
+
+    static constexpr bool CvtGemm0SwzlLd = CvtGemm0SwzlLd_;
+    static constexpr int kBlockNPagedPerAiuLoad = CvtGemm0SwzlLd ? 16: kBlockNPagedPerAiuLoad_;
+    static constexpr int kBlockMPagedPerAiuLoad = CvtGemm0SwzlLd ? 8 : kBlockM;
+    static constexpr int kHeadDimPadding = CvtGemm0SwzlLd ? (kHeadDim + 127) / 128 * 128 : kHeadDim;
 
 #if USE_AIU
+#if ACOMPUTE_VERSION == 10000
+    using SmemCopyOpQ = std::conditional_t<
+            USE_MMA_M8,
+            PPU0010_TSM_LD_SWZL<elem_type, kBlockM, kBlockKSmem, false, false, 1, 2>,
+            PPU_TSM_LD_SWZL<elem_type, kBlockM, kBlockKSmem, false, false, 1>
+        >;
+    using SmemCopyOpK = PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmem, true, false, 
+            kBlockN / kBlockNPagedPerAiuLoad * kHeadDim / kBlockKSmem>;
     using SmemCopyOpVt = PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmemV, true, true,
-                                         kBlockN/kBlockNPagedPerAiuLoad * kHeadDim / kBlockKSmemV>;
+            kBlockN/kBlockNPagedPerAiuLoad * kHeadDimPadding / kBlockKSmemV>;
+       
+#else
+    using SmemCopyOpQ = std::conditional_t<
+        CvtGemm0SwzlLd,
+        PPU0015_TSM_LD_SWZL_CVT<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmem, kBlockNPagedPerAiuLoad, kHeadDimPadding, false, false,
+                                kHeadDimPadding/kBlockKSmem, true, -1>,
+        PPU_TSM_LD_SWZL<elem_type, kBlockM, kBlockKSmem, false, false, 1>
+    >;
+    using SmemCopyOpK = std::conditional_t<
+        CvtGemm0SwzlLd,
+        PPU0015_TSM_LD_SWZL_CVT<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmem, kBlockNPagedPerAiuLoad, kHeadDimPadding, true, false,
+                                      kBlockN / kBlockNPagedPerAiuLoad * kHeadDimPadding/kBlockKSmem, true, -1>,
+        PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmem, true, false, kBlockN / kBlockNPagedPerAiuLoad * kHeadDim / kBlockKSmem>
+    >;
+    using SmemCopyOpVt = std::conditional_t<
+        CvtGemm0SwzlLd,
+        PPU0015_TSM_LD_SWZL_CVT<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmemV, kBlockNPagedPerAiuLoad, kHeadDimPadding, true, true,
+                                      kBlockN / kBlockNPagedPerAiuLoad * kHeadDimPadding / kBlockKSmemV, false, -1>,
+        PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmemV, true, true,
+                        kBlockN/kBlockNPagedPerAiuLoad * kHeadDimPadding / kBlockKSmemV>
+    >;
+#endif
+    using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, elem_type>;
+    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, elem_type>;
     using SmemCopyAtomVt = Copy_Atom<SmemCopyOpVt, elem_type>;
 #else
+    using SmemCopyAtomQ = SmemCopyAtom;
+    using SmemCopyAtomK = SmemCopyAtom;
     using SmemCopyAtomVt = SmemCopyAtomTransposed;
 #endif
     static_assert((CrossCut && kStages==3) || kStages == 2, "kStages can be 2 or 3 if CrossCut.");
@@ -207,9 +215,18 @@ struct Flash_fwd_kernel_traits : public Base {
         SmemLayoutAtomQ{},
         Shape<Int<kBlockN>, Int<kHeadDim>, Int<kStages>>{}));
 
+    using SmemLayoutQPaged = decltype(tile_to_shape(
+        SmemLayoutAtomQ{},
+        Shape<Int<kBlockMPagedPerAiuLoad>, Int<kHeadDimPadding>,
+        Int<kBlockM/kBlockMPagedPerAiuLoad>>{}));
+
+    using SmemLayoutQTest = decltype(tile_to_shape(
+        SmemLayoutAtomQ{},
+        Shape<Int<kBlockM>, Int<kHeadDimPadding>>{}));
+
     using SmemLayoutKPagedstages = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
-        Shape<Int<kBlockNPagedPerAiuLoad>, Int<kHeadDim>,
+        Shape<Int<kBlockNPagedPerAiuLoad>, Int<kHeadDimPadding>,
         Int<kBlockN/kBlockNPagedPerAiuLoad>, Int<kStages>>{}));
 
     using SmemLayoutVstages = decltype(tile_to_shape(
@@ -263,10 +280,10 @@ struct Flash_fwd_kernel_traits : public Base {
     // using SmemCopyAtomS = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
     /// end for CrossCut ///
 
-    static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
+    static constexpr int kSmemQSize = size(SmemLayoutQPaged{}) * sizeof(Element);
     // static constexpr int kSmemKVSize = (size(SmemLayoutK{}) + size(SmemLayoutV{})) * sizeof(Element);
     // static constexpr int kSmemKVSize = (size(SmemLayoutK{}) * kStages) * sizeof(Element);
-    static constexpr int kSmemKVSize = size(SmemLayoutKstages{}) * sizeof(Element);
+    static constexpr int kSmemKVSize = size(SmemLayoutKPagedstages{}) * sizeof(Element);
     static constexpr int OSmemSize = size(SmemLayoutO{}) * sizeof(Element);
     static constexpr int OSmemSizeAccum = size(SmemLayoutO{}) * sizeof(ElementAccum);
 
@@ -311,8 +328,8 @@ struct Flash_fwd_kernel_traits : public Base {
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
 #if USE_AIU
     // static_assert(Block_K{} * sizeof(Element) % 32 == 0, "aiu_no_trans: block_k must be multiple of 32B");
-    static constexpr int bits_per_aiu_Q = kBlockM * kBlockKSmem * sizeof(Element) * 8;
-    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, Element, false, kBlockM, kBlockKSmem>;
+    static constexpr int bits_per_aiu_Q = kBlockMPagedPerAiuLoad * kBlockKSmem * sizeof(Element) * 8;
+    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, Element, false, kBlockMPagedPerAiuLoad, kBlockKSmem>;
 
     static constexpr int bits_per_aiu_K = kBlockNPagedPerAiuLoad * kBlockKSmem * sizeof(Element) * 8;
     using Gmem_copy_struct_K = PPU_AIU_LOAD<cute::C<bits_per_aiu_K>, Element, false, kBlockNPagedPerAiuLoad, kBlockKSmem>;
@@ -321,7 +338,7 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, Element>{},
                     Layout<Shape <_1,_1>,
                            Stride<_1,_1>>{},
-                    Layout<Shape <Int<kBlockM>, Int<kBlockKSmem>>>{}));
+                    Layout<Shape <Int<kBlockMPagedPerAiuLoad>, Int<kBlockKSmem>>>{}));
     using GmemTiledCopyK = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_K, Element>{},
                     Layout<Shape <_1,_1>,

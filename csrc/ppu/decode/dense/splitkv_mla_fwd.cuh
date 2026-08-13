@@ -398,7 +398,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv(const Params &par
     } // new namespace end for the mix tensor
 }
 
-template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, bool PageLargerThankBlockN, typename Params>
 __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &params, const int bidb, const int bidh, const int m_block,
                                                                const int n_split_idx, const bool have_zero_seqlen_k,
                                                                const int n_block_min, int n_block_max,  const bool NoSplit) {
@@ -423,7 +423,9 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     constexpr bool USE_MMA_M8 = Kernel_traits::USE_MMA_M8;
     constexpr int MMA_ATOM_M = USE_MMA_M8 ? 8 : 16;
     constexpr int kStages = Kernel_traits::kStages;
+    constexpr int kBlockMPagedPerAiuLoad = Kernel_traits::kBlockMPagedPerAiuLoad;
     constexpr int kBlockNPagedPerAiuLoad = Kernel_traits::kBlockNPagedPerAiuLoad;
+    constexpr bool CvtGemm0SwzlLd = Kernel_traits::CvtGemm0SwzlLd;
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
@@ -465,28 +467,27 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
                          + block_table_offset * params.k_row_stride
                          + (bidh / params.h_h_k_ratio) * params.k_head_stride;
 
-    Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
-                                          + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
-                            make_shape(binfo.actual_seqlen_q, params.h, params.d),
-                            make_stride(params.q_row_stride, params.q_head_stride, _1{}));
-    Tensor gQ = local_tile(make_mix_tensor_like(mQ(_, bidh, _)), Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                           make_coord(m_block, 0));  // (kBlockM, kHeadDim)
+    const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
+        + m_block * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
+    Tensor gQ = make_mix_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
+        Shape<Int<kBlockMPagedPerAiuLoad>, Int<kHeadDim>>{}, make_stride(params.q_row_stride, _1{}));// (kBlockMPagedPerAiuLoad, kHeadDim)
+
     Tensor gK = make_mix_tensor(make_gmem_ptr(block_table == nullptr && !have_zero_seqlen_k
                                 ? reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx))
                                 : reinterpret_cast<Element *>(params.k_ptr)) + row_offset_k,
                             Shape<Int<kBlockNPagedPerAiuLoad>, Int<kHeadDim>>{},
                             make_stride(params.k_row_stride, _1{}));
 
-    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
-                            typename Kernel_traits::SmemLayoutQ{});
-    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), typename Kernel_traits::SmemLayoutKstages{});
+    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename Kernel_traits::SmemLayoutQ{});
+    Tensor sQPagedforCopy = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutQPaged{});
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQPagedforCopy)), typename Kernel_traits::SmemLayoutKstages{});
     Tensor sKPagedforCopy = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutKPagedstages{});
     Tensor sVt = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtstage{});
 
     // sVtNoSwizzle
     Tensor sVtNoSwizzle = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
-    Tensor sP = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutP{});
+    Tensor sP = make_tensor(sKPagedforCopy.data() + size(sKPagedforCopy), typename Kernel_traits::SmemLayoutP{});
 
     Tensor smem_row_scale = make_tensor(make_smem_ptr(reinterpret_cast<float *>((sP.data() + size(sP)).get())),
         Shape<Int<kBlockM>>{}, Stride<_1>{});
@@ -502,6 +503,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
 
     Tensor tQgQ = gmem_thr_copy_Q.partition_S(gQ);
     Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
+    Tensor tQsQpaged = gmem_thr_copy_Q.partition_D(sQPagedforCopy);
     Tensor tKgK = gmem_thr_copy_K.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K)
     Tensor tKsK = gmem_thr_copy_K.partition_D(sKPagedforCopy);
 
@@ -524,11 +526,9 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
 #if USE_AIU
 #if ACOMPUTE_VERSION == 10000
     gmem_tiled_copy_Q.desc_ = AiuDesc{nullptr, binfo.actual_seqlen_q, params.q_row_stride, kBlockM, Kernel_traits::kBlockKSmem, 0};
-    // gmem_tiled_copy_K.desc_ = AiuDesc{nullptr, kBlockN, params.k_row_stride, kBlockN, Kernel_traits::kBlockKSmem, 0};
     gmem_tiled_copy_K.desc_ = AiuDesc{nullptr, kBlockNPagedPerAiuLoad, params.k_row_stride, kBlockNPagedPerAiuLoad, Kernel_traits::kBlockKSmem, 0};
 #else
     gmem_tiled_copy_Q.desc_.init(nullptr, binfo.actual_seqlen_q, params.d, params.q_row_stride);
-    // gmem_tiled_copy_K.desc_.init(nullptr, kBlockN, params.d, params.k_row_stride);
     gmem_tiled_copy_K.desc_.init(nullptr, kBlockNPagedPerAiuLoad, params.d, params.k_row_stride);
 #endif
     const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
@@ -573,8 +573,33 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
 
     // Prologue
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-    // FIXME: Is_even_MN should be false ?
-    flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM);
+    if constexpr (CvtGemm0SwzlLd) {
+        const int page_idx = warp_idx;
+        const int seqlen_q_remain  = binfo.actual_seqlen_q - m_block * kBlockM - page_idx * kBlockMPagedPerAiuLoad;
+        if (seqlen_q_remain > 0 && page_idx < size<3>(tQsQpaged)) { // size<2>(tQgQ) is 64/8
+            int odd_pidx = page_idx & 1; // page_idx % 2;
+            tQgQ.data() = tQgQ.data() + page_idx * params.q_row_stride * kBlockMPagedPerAiuLoad;
+            auto tQsQ_current = tQsQpaged(_, _, 0, 0);
+            gmem_tiled_copy_Q.desc_.dim_h = seqlen_q_remain;
+            #pragma unroll
+            for (int k = 0; k < size<2>(tQgQ); k += 2) { // size<2>(tQgQ) is 9
+                // tQsQ_current.data() = tQsQpaged(_, _, 0, 0).data() + page_idx/2*(16*640) + (k+odd_pidx)*(16*64);
+                int k_cvt = (2 * (k + odd_pidx)) % (size<2>(tQsQpaged));
+                int page_idx_cvt = (page_idx & ~1) + (2 * (k + odd_pidx)) / (size<2>(tQsQpaged));
+                tQsQ_current.data() = tQsQpaged(_, _, k_cvt, page_idx_cvt).data();
+                cute::copy(gmem_tiled_copy_Q, tQgQ(_,_,k), tQsQ_current);
+                // tQsQ_current.data() = tQsQ_current.data() + 8 * 64;
+                tQsQ_current.data() = tQsQpaged(_, _, k_cvt + 1, page_idx_cvt).data();
+                if (k + 1 < size<2>(tQgQ)) {
+                    cute::copy(gmem_tiled_copy_Q, tQgQ(_,_,k+1), tQsQ_current);
+                } else {
+                    cute::copy(gmem_tiled_copy_Q, tQgQ(_,_,k), tQsQ_current);
+                }
+            }
+        }
+    } else {
+        flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM);
+    }
 
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
@@ -596,8 +621,9 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     auto tOsVt = smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt));
 
     int block_table_idx_nxt = block_table_idx;
-    int block_table_offset_nxt = 0;
-    index_t row_offset_k_nxt = 0;
+    int block_table_offset_nxt = block_table_offset;
+    index_t row_offset_k_nxt = row_offset_k;
+    const int remain_k_offset = Is_even_MN ? kBlockN : binfo.actual_seqlen_k - (n_block_max - 1) * kBlockN;
 
     auto KV_load_kBlockN = [&](int const n_block_load, auto is_first_iter_type){
         static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
@@ -654,8 +680,53 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         cute::cp_async_fence();
     };
 
+    auto KV_load_Gemm0SwzlLd = [&](int const n_block_load, auto is_first_iter_type){
+        static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
+        const int wid = warp_idx;
+        if constexpr (Is_first_iter) {
+            if (wid < size<3>(tKsK)) {
+                auto tKsK_current = tKsK(_, _, _, wid, kv_store_num);
+                if (block_table) {
+                    tKgK.data().ptr_ = make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr)
+                        + row_offset_k_nxt + wid * kBlockNPagedPerAiuLoad * params.k_row_stride);
+                } else if (hllm_block_table) {
+                    tKgK.data().ptr_ = make_gmem_ptr(reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx_nxt))
+                         + row_offset_k_nxt + wid * kBlockNPagedPerAiuLoad * params.k_row_stride);
+                } else {
+                    tKgK.data() = tKgK.data() +  wid * kBlockNPagedPerAiuLoad * params.k_row_stride;
+                }
+                // FIXME: how to clear(tKsK_current) ?
+                // if (remain_k_offset - wid * kBlockNPagedPerAiuLoad <= 0) {
+                //     // cute::clear(tKsK_current);
+                //     cute::clear(sKPagedforCopy(_, _, wid, kv_store_num));
+                // } else
+                if (!have_zero_seqlen_k && remain_k_offset - wid * kBlockNPagedPerAiuLoad > 0)
+                flash::aiu_copy_gemm0swzlld<Is_even_MN>(gmem_tiled_copy_K, tKgK, tKsK_current, remain_k_offset - wid * kBlockNPagedPerAiuLoad);
+            }
+            kv_store_num = kv_store_num < kStages - 1 ? kv_store_num + 1 : 0;
+        }  else if (n_block_load >= n_block_min) {
+            if (wid < size<3>(tKsK)) {
+                auto tKsK_current = tKsK(_, _, _, wid, kv_store_num);
+                if (block_table) {
+                    tKgK.data().ptr_ = make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr)
+                        + row_offset_k_nxt + wid * kBlockNPagedPerAiuLoad * params.k_row_stride);
+                } else if (hllm_block_table) {
+                    tKgK.data().ptr_ = make_gmem_ptr(reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx_nxt))
+                         + row_offset_k_nxt + wid * kBlockNPagedPerAiuLoad * params.k_row_stride);
+                } else {
+                    tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride) + wid * kBlockNPagedPerAiuLoad * params.k_row_stride);
+                }
+                flash::aiu_copy_gemm0swzlld<true>(gmem_tiled_copy_K, tKgK, tKsK_current);
+            }
+            kv_store_num = kv_store_num < kStages - 1 ? kv_store_num + 1 : 0;
+        }
+        cute::cp_async_fence();
+    };
+
     auto KV_load = [&](int const n_block_load, auto is_first_iter_type){
-        if constexpr (kBlockNPagedPerAiuLoad == kBlockN) {
+        if constexpr (CvtGemm0SwzlLd) {
+            KV_load_Gemm0SwzlLd(n_block_load, is_first_iter_type);
+        } else if constexpr (PageLargerThankBlockN) {
             KV_load_kBlockN(n_block_load, is_first_iter_type);
         } else {
             KV_load_Paged(n_block_load, is_first_iter_type);
@@ -718,7 +789,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         block_table_offset_nxt = (n_block - kStages) * kBlockN - block_table_idx_nxt * page_block_size;
 
         if (!have_zero_seqlen_k)
-        (kBlockNPagedPerAiuLoad == kBlockN)
+        (CvtGemm0SwzlLd || PageLargerThankBlockN)
             ? flash::gemm<Kernel_traits::Is_Q_in_regs>(
                 acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, kv_load_num),
                 tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K)
@@ -759,14 +830,20 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         if (masking_step > 0) {
             softmax.template softmax_rescale_o(acc_o, smem_row_scale);
         }
+
         if (!have_zero_seqlen_k)
-        (kBlockNPagedPerAiuLoad == kBlockN)
+        if (masking_step == 0 && CvtGemm0SwzlLd) {
+            // FIXME: to avoid cute::clear(sK)
+            flash::gemm_pv_offset(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
+                smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V, remain_k_offset);
+        } else {
+        (CvtGemm0SwzlLd || PageLargerThankBlockN)
             ? flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num),
                  tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V)
             : flash::gemm_pagedkv<kBlockNPagedPerAiuLoad, kBlockNPagedPerAiuLoad*kHeadDim, 0>(
                 acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
                 smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V);
-
+        }
         kv_load_num = kv_load_num < kStages -1 ? kv_load_num + 1 : 0;
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -788,9 +865,9 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
 
         block_table_idx_nxt = (n_block - kStages) * kBlockN / page_block_size;
         nxt_block_table = GET_BLOCK_INDEX((n_block - kStages), block_table_idx_nxt);
-        block_table_offset_nxt = (n_block - kStages) * kBlockN - block_table_idx_nxt * page_block_size;
+        // block_table_offset_nxt = (n_block - kStages) * kBlockN - block_table_idx_nxt * page_block_size;
 
-        (kBlockNPagedPerAiuLoad == kBlockN)
+        (CvtGemm0SwzlLd || PageLargerThankBlockN)
             ? flash::gemm<Kernel_traits::Is_Q_in_regs>(acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, kv_load_num),
                 tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K)
             : flash::gemm_pagedkv<kBlockNPagedPerAiuLoad, kBlockNPagedPerAiuLoad*kHeadDim, 1,
@@ -804,18 +881,23 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         cute::copy(smem_tiled_copy_S, tSaS, tSsS);
         __syncthreads();
 
-        row_offset_k_nxt = nxt_block_table * params.k_batch_stride
-                         + block_table_offset_nxt * params.k_row_stride
-                         + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+        // row_offset_k_nxt = nxt_block_table * params.k_batch_stride
+        //                  + block_table_offset_nxt * params.k_row_stride
+        //                  + (bidh / params.h_h_k_ratio) * params.k_head_stride;
 
         softmax.template softmax_rescale_o(acc_o, smem_row_scale);
-        (kBlockNPagedPerAiuLoad == kBlockN)
+        (CvtGemm0SwzlLd || PageLargerThankBlockN)
             ? flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
                 smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V)
             : flash::gemm_pagedkv<kBlockNPagedPerAiuLoad, kBlockNPagedPerAiuLoad*kHeadDim, 0>(
                 acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
                 smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V);
 
+        // FIXME: row_offset_k_nxt move here to avoid Stall Memory Dependency
+        block_table_offset_nxt = (n_block - kStages) * kBlockN - block_table_idx_nxt * page_block_size;
+        row_offset_k_nxt = nxt_block_table * params.k_batch_stride
+                         + block_table_offset_nxt * params.k_row_stride
+                         + (bidh / params.h_h_k_ratio) * params.k_head_stride;
         kv_load_num = kv_load_num < kStages -1 ? kv_load_num + 1 : 0;
     }
 
@@ -835,7 +917,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     }
 }
 
-template<typename Kernel_traits, bool Is_causal, bool CrossCut = false>
+template<typename Kernel_traits, bool Is_causal, bool CrossCut = false, bool PageLargerThankBlockN = true>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
 flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_params params) {
     constexpr int kBlockN = Kernel_traits::kBlockN;
@@ -870,10 +952,12 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_params params) {
         }
 #if ACOMPUTE_VERSION != 10000
     if constexpr (!Kernel_traits::USE_MMA_M8)
+#else
+    if constexpr (!Kernel_traits::CvtGemm0SwzlLd)
 #endif
     {
         if constexpr (CrossCut) {
-            compute_attn_cross_cut_splitkv<Kernel_traits, Is_causal, false>(
+            compute_attn_cross_cut_splitkv<Kernel_traits, Is_causal, false, PageLargerThankBlockN>(
                 params, batch_id, bidh, m_block, n_split_idx, seqlen_k == 0,
                 n_block_min, n_block_max, NoSplit);
         } else {
@@ -887,14 +971,14 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_params params) {
 
 } // namespace flash
 
-template<typename Kernel_traits, bool CrossCut>
+template<typename Kernel_traits, bool CrossCut, bool PageLargerThankBlockN>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     //constexpr size_t smem_size = Kernel_traits::kSmemSize;
     constexpr size_t smem_size = Kernel_traits::kSmemSizeAccum;
     const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
     // FLASH_ASSERT(params.page_block_size % Kernel_traits::kBlockN == 0);
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal, CrossCut>;
+        auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal, CrossCut, PageLargerThankBlockN>;
         if (smem_size >= 48 * 1024) {
             hggcFuncSetAttribute(
                 kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);

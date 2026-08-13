@@ -23,7 +23,7 @@
 template<typename InputT, int Arch>
 void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, hggcStream_t stream);
 
-template<typename Kernel_traits, bool CrossCut = false>
+template<typename Kernel_traits, bool CrossCut = false, bool PageLargerThankBlockN = false>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, hggcStream_t stream);
 
 template<typename T, int Headdim, int Headdim_V>
@@ -40,7 +40,6 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t
             warp_interleave = false;
     }
 
-// #if ACOMPUTE_VERSION==10000
     if (!is_sm89_or_newer()) {
         if (cross_cut) {
             // support seqlen_q > 16.
@@ -52,12 +51,12 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t
                 constexpr int kNwarps = 8;
                 constexpr int AtomLayoutQ = 4;
                 constexpr int AtomLayoutP = 1;
-                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThanBlockN, [&] {
-                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThanBlockN ? kBlockN : 16;
+                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThankBlockN, [&] {
+                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThankBlockN ? kBlockN : 16;
                     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
                         Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
                         Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP, kBlockNPagedPerAiuLoad
-                        >, 1/*CrossCut*/>(params, stream);
+                        >, 1/*CrossCut*/, PageLargerThankBlockN>(params, stream);
                 });
             } else if (params.seqlen_q <= 48) {
                 constexpr static int kBlockM = 48;
@@ -66,12 +65,12 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t
                 constexpr int kNwarps = 12;
                 constexpr int AtomLayoutQ = 3;
                 constexpr int AtomLayoutP = 3;
-                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThanBlockN, [&] {
-                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThanBlockN ? kBlockN : 16;
+                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThankBlockN, [&] {
+                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThankBlockN ? kBlockN : 16;
                     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
                         Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
                         Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP, kBlockNPagedPerAiuLoad
-                        >, 1/*CrossCut*/>(params, stream);
+                        >, 1/*CrossCut*/, PageLargerThankBlockN>(params, stream);
                 });
             } else if (params.seqlen_q <= 64) {
                 constexpr static int kBlockM = 64;
@@ -80,12 +79,12 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t
                 constexpr int kNwarps = 16;
                 constexpr int AtomLayoutQ = 4;
                 constexpr int AtomLayoutP = 1;
-                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThanBlockN, [&] {
-                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThanBlockN ? kBlockN : 16;
+                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThankBlockN, [&] {
+                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThankBlockN ? kBlockN : 16;
                     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
                         Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
                         Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP, kBlockNPagedPerAiuLoad
-                        >, 1/*CrossCut*/>(params, stream);
+                        >, 1/*CrossCut*/, PageLargerThankBlockN>(params, stream);
                 });
             } else if (params.seqlen_q > 64) {
                 if (warp_interleave) {
@@ -98,12 +97,12 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t
                 constexpr int kNwarps = 16;
                 constexpr int AtomLayoutQ = 8;
                 constexpr int AtomLayoutP = 4;
-                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThanBlockN, [&] {
-                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThanBlockN ? kBlockN : 16;
+                BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThankBlockN, [&] {
+                    constexpr int kBlockNPagedPerAiuLoad = PageLargerThankBlockN ? kBlockN : 16;
                     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
                         Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/, T,
                         Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP, kBlockNPagedPerAiuLoad
-                        >, 1/*CrossCut*/>(params, stream);
+                        >, 1/*CrossCut*/, PageLargerThankBlockN>(params, stream);
                 });
             }
         } else {
@@ -118,7 +117,6 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t
 
         }
     } else {
-// #else
         if (warp_interleave  && params.num_blocks > 40) {
             // cta size small than sms do not use warp interleave since memory efficiency not good on 890.
             run_flash_splitkv_mla_kernel<T, 89>(params, stream);
@@ -129,8 +127,9 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t
         constexpr bool USE_MMA_M8 = 0;
         constexpr static int kBlockN = 64;
         SEQLENG_SWITCH(params.seqlen_q, [&] {
-            BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThanBlockN, [&] {
-                constexpr int kBlockNPagedPerAiuLoad = PageLargerThanBlockN ? kBlockN : 16;
+            BOOL_SWITCH(params.page_block_size >= kBlockN, PageLargerThankBlockN, [&] {
+                constexpr bool CvtGemm0SwzlLd = (PageLargerThankBlockN) && (kBlockM >= 48) ? true : false;
+                constexpr int kBlockNPagedPerAiuLoad = (PageLargerThankBlockN && !CvtGemm0SwzlLd) ? kBlockN : 16;
                 constexpr int AtomLayoutQ = kBlockM / 16;
                 constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
                 constexpr int kStages = kBlockM <= 16 ? 3 : 2;
@@ -138,8 +137,8 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t
                 run_flash_splitkv_fwd<Flash_fwd_kernel_traits<
                     Headdim, kBlockM, kBlockN, kNwarps, USE_MMA_M8/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
                     T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,
-                    kBlockNPagedPerAiuLoad, kStages
-                    >, 1/*CrossCut*/>(params, stream);
+                    kBlockNPagedPerAiuLoad, kStages, kNwarps/*kNwarps0*/, 0/*kPagePow2*/, CvtGemm0SwzlLd
+                    >, 1/*CrossCut*/, PageLargerThankBlockN>(params, stream);
             });
         });
     }

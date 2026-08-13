@@ -72,12 +72,26 @@ __forceinline__ __device__ void launch_kv_tiles_copy_aiu(
     __mbarrier_t *barriers_K,
     int warp_idx)
 {
-    // if (warp_idx == 0) {
-    Tensor cur_gKV = gKV(_, _0{}, Int<START_HEAD_DIM_TILE_IDX>{});
-    Tensor cur_sKV = sKV(_, _0{}, Int<START_HEAD_DIM_TILE_IDX>{});
-    cute::copy(tiled_copy, cur_gKV, cur_sKV);
-    // cutlass::arch::cpasync_barrier_arrive_noinc(&barriers_K[START_HEAD_DIM_TILE_IDX]);
-    // }
+    if constexpr (cute::size<1>(Layout0{}) == 1) {
+        Tensor cur_gKV = gKV(_, _0{}, Int<START_HEAD_DIM_TILE_IDX>{});
+        Tensor cur_sKV = sKV(_, _0{}, Int<START_HEAD_DIM_TILE_IDX>{});
+        cute::copy(tiled_copy, cur_gKV, cur_sKV);
+    } else {
+        Tensor cur_gKV0 = gKV(_, _0{}, Int<START_HEAD_DIM_TILE_IDX>{});
+        Tensor cur_gKV1 = gKV(_, _1{}, Int<START_HEAD_DIM_TILE_IDX>{});
+        Tensor cur_sKV0 = sKV(_, _0{}, Int<START_HEAD_DIM_TILE_IDX>{});
+        Tensor cur_sKV1 = sKV(_, _1{}, Int<START_HEAD_DIM_TILE_IDX>{});
+
+        int size0 = (START_HEAD_DIM_TILE_IDX & ~1) * 32 * 64
+                + (START_HEAD_DIM_TILE_IDX & 1) * 16 * 64;
+        int size1 = 16 * (START_HEAD_DIM_TILE_IDX == 8 ? 64 : 128);
+
+        cur_sKV0.data() = sKV.data() + size0;
+        cur_sKV1.data() = cur_sKV0.data() + size1;
+
+        cute::copy(tiled_copy, cur_gKV0, cur_sKV0);
+        cute::copy(tiled_copy, cur_gKV1, cur_sKV1);
+    }
 
     if constexpr (START_HEAD_DIM_TILE_IDX + 1 < END_HEAD_DIM_TILE_IDX)
     {
@@ -890,20 +904,20 @@ template <
     typename Engine1, typename Layout1>
 __forceinline__ __device__ void retrieve_rP_from_sP(
     Tensor<Engine0, Layout0> &rPb,
-    Tensor<Engine1, Layout1> const &sP,
+    Tensor<Engine1, Layout1> const &sQ,
     int idx_in_warpgroup)
 {
     typename T::TiledMma tiled_mma;
     const int warp_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
-
-    auto thr_mma = tiled_mma.get_thread_slice(idx_in_warpgroup);
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename T::SmemCopyAtomQ{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(warp_idx * 32);
-    Tensor tSsQ = smem_thr_copy_Q.partition_S(make_mix_tensor_like(sP));
+    
+    Tensor sQ_tiled = flat_divide(sQ, Shape<_128, _64>{})(_, _, _0{}, _);
+    Tensor tSsQ_tiled = smem_thr_copy_Q.partition_S(make_mix_tensor_like(sQ_tiled));
     // Tensor tSrQ  = thr_mma.partition_fragment_A(sP);
     // Tensor rQ8 = smem_thr_copy_Q.retile_D(tSrQ);
-    CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(rPb));
-    cute::copy(smem_tiled_copy_Q, tSsQ, rPb);
+    CUTE_STATIC_ASSERT_V(size<1>(tSsQ_tiled) == size<1>(rPb));
+    cute::copy(smem_tiled_copy_Q, tSsQ_tiled(_, _, _, Int<8>{}), rPb);
 }
 
 
@@ -1095,7 +1109,23 @@ __forceinline__ __device__ void store_o(
     ThrCopy r2s_thr_copy = r2s_tiled_copy.get_slice(idx_in_warpgroup);
     Tensor r2s_thr_copy_rOb = r2s_thr_copy.retile_S(rOb);
     Tensor r2s_thr_copy_sMyOutputBuf = r2s_thr_copy.partition_D(sMyOutputBuf);
-    cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sMyOutputBuf);
+
+    if constexpr (T::CvtGemmSwzlLd) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < size<2>(r2s_thr_copy_sMyOutputBuf); ++j) { //tile: 4*64/16
+            CUTLASS_PRAGMA_UNROLL
+            for(int i = 0; i < size<0>(r2s_thr_copy_sMyOutputBuf); ++i) { // register of mma.16
+                // int tile_idx = j / 4;
+                // int real_j = (tile_idx / 2) * 2 * 4 + j % 4 + (i / 4) * 4;
+                // int real_i =  (i % 4) + (tile_idx % 2) * 4;
+                int real_i = (i & 3) | (j & 4);
+                int real_j = i + j - real_i;
+                cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb(real_i,_,real_j), r2s_thr_copy_sMyOutputBuf(i,_,j));
+            }
+        }
+    } else {
+        cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sMyOutputBuf);
+    }
 
     __syncthreads();
 
@@ -1161,8 +1191,22 @@ __forceinline__ __device__ void launch_q_copy(
 #endif
     Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
 
-    if (warp_idx == 0) {
-        cute::copy(gmem_tiled_copy_Q, tQgQ, tQsQ);
+    int vid = warp_idx;
+    // if (warp_idx == 0) {
+    if (vid < (T::kBlockM/T::kBlockMPerLoad)) {
+        if constexpr(T::CvtGemmSwzlLd) {
+            #pragma unroll
+            for (int tile = 0; tile < T::kHeadDim/T::kBlockKSmem; ++tile) {
+                auto tQsQ_current = tQsQ(_, vid, tile);
+                auto tQgQ_current = tQgQ(_, vid, tile);
+                int size = (tile & ~1) * T::kBlockM * 64 + (tile & 1) * 16 * 64
+                         +  vid * 16 * (tile == 8 ? 64 : 128);
+                tQsQ_current.data() = tQsQ.data() + size;
+                cute::copy(gmem_tiled_copy_Q, tQgQ_current, tQsQ_current);
+            }
+        } else {
+            cute::copy(gmem_tiled_copy_Q, tQgQ, tQsQ);
+        }
 
         // __pipeline_arrive_on(barrier_Q);
         cutlass::arch::cpasync_barrier_arrive_noinc(barrier_Q);
@@ -1527,7 +1571,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     // // Initialize TMA barriers
     if (threadIdx.x == 0)
     {
-        __mbarrier_init(barrier_Q, 32);
+        __mbarrier_init(barrier_Q, 32 * (T::kBlockM/T::kBlockMPerLoad));
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < 2; ++i)
         {
@@ -1621,18 +1665,18 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         if (seqlen_k != 0) {
             if (warp_idx == 0) {
                 gmem_tiled_copy_K.desc_.dim_h = seqlen_k - (start_block_idx * kBlockN);
-                launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK1, params, &barriers_K0[1], warp_idx);
                 launch_kv_tiles_copy<0, 4>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K0[0], warp_idx);
+                launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK1, params, &barriers_K0[1], warp_idx);
             }
-         }
+        }
 
         if (start_block_idx+1 < end_block_idx) {
             if (warp_idx == 0) {
                 tKgK.data().ptr_ = make_gmem_ptr(
                         reinterpret_cast<InputT *>(params.k_ptr) + get_block_index<T>(start_block_idx + 1, params, block_table_ptr));
                 gmem_tiled_copy_K.desc_.dim_h = seqlen_k - ((start_block_idx + 1) * kBlockN);
-                launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K1[1], warp_idx);
                 launch_kv_tiles_copy<0, 4>(gmem_tiled_copy_K, tKgK, tKsK1, params, &barriers_K1[0], warp_idx);
+                launch_kv_tiles_copy<4, 9>(gmem_tiled_copy_K, tKgK, tKsK0, params, &barriers_K1[1], warp_idx);
             }
         }
 
@@ -1652,7 +1696,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         cur_phase_Q = (cur_phase_Q + 1) & 1;
 
         Tensor rQ8 = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
-        retrieve_rP_from_sP<T>(rQ8, local_tile(sQ, Shape<_128, _64>{}, Coord<_0, _8>{}), idx_in_warpgroup);
+        retrieve_rP_from_sP<T>(rQ8, sQ, idx_in_warpgroup);
 
         if (warpgroup_idx == 0) {
             // Warpgroup 0
@@ -1824,7 +1868,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             {
                 if (threadIdx.x == 0)
                 {
-                    __mbarrier_init(barrier_Q, 32);
+                    __mbarrier_init(barrier_Q, 32 * (T::kBlockM/T::kBlockMPerLoad));
                     CUTLASS_PRAGMA_UNROLL
                     for (int i = 0; i < 2; ++i)
                     {
@@ -1846,7 +1890,8 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, hggcStream_t str
 {
     BOOL_SWITCH(params.is_causal, Is_causal, [&]
                 {
-        using T = Traits<InputT>;
+        constexpr bool CvtGemmSwzlLd = (Arch == 89);
+        using T = Traits<InputT, CvtGemmSwzlLd>;
 
         auto mla_kernel = &flash_fwd_splitkv_mla_kernel<T, Is_causal>;
         constexpr size_t smem_size = std::max(sizeof(typename T::SharedMemoryPlan), sizeof(typename T::SharedMemoryOutPut));
@@ -1871,7 +1916,7 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, hggcStream_t str
 
             printf("blockM:%d, blockN:%d, threads:%d, block_size:%d\n",
                     T::kBlockM, T::kBlockN, T::NUM_THREADS, params.page_block_size);
-            printf("Is_causal:%d\n", Is_causal);
+            printf("Is_causal:%d, CvtGemmSwzlLd:%d\n", Is_causal, CvtGemmSwzlLd);
             printf("grid_n[%d, %d, %d]\n",
                     num_m_block, params.h, params.num_sm_parts);
             printf("verg:%d, stack:%d, sm:%d, occpuancy:%0.3f, Arch:%d\n", int(attr.numRegs), int(attr.localSizeBytes), sm_count,

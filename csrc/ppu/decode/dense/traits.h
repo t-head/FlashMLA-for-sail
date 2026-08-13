@@ -28,7 +28,7 @@
 
 using namespace cute;
 
-template<typename InputT_>
+template<typename InputT_, bool CvtGemmSwzlLd_ = false>
 struct Traits {
     using InputT = InputT_;
     using Element = InputT_;
@@ -42,6 +42,9 @@ struct Traits {
     static constexpr int kHeadDim = Config::HEAD_DIM_K;
     static constexpr int kHeadDimV = Config::HEAD_DIM_V;
     static constexpr float Page_In_BlockN = float(kBlockN) / (float)PAGE_BLOCK_SIZE;
+    static constexpr bool CvtGemmSwzlLd = CvtGemmSwzlLd_;
+    static constexpr int kBlockMPerLoad = CvtGemmSwzlLd ? 16 : kBlockM;
+    static constexpr int kBlockNPerLoad = CvtGemmSwzlLd ? 16 : kBlockN;
 
     // static constexpr int NUM_THREADS = 256;
     static constexpr int NUM_THREADS = 512;
@@ -68,13 +71,29 @@ struct Traits {
     static constexpr int kBlockKSmem = 64;
     static constexpr int kSwizzle = 3;
 
+#if ACOMPUTE_VERSION == 10000
     using SmemCopyOpQ = PPU_TSM_LD_SWZL<InputT, kBlockM, kBlockKSmem, false, false, 1>;
-    using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, InputT>;
-
     using SmemCopyOpK = PPU_TSM_LD_SWZL<InputT, kBlockN, kBlockKSmem, true, false, 1>;
-    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, InputT>;
-
     using SmemCopyOpVt = PPU_TSM_LD_SWZL<InputT, kBlockN, kBlockKSmem, true, true, 1>;
+#else
+    using SmemCopyOpQ = std::conditional_t<
+        CvtGemmSwzlLd,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockM, 128, false, false, 1, false, 8>,
+        PPU_TSM_LD_SWZL<InputT, kBlockM, kBlockKSmem, false, false, 1>
+    >;
+    using SmemCopyOpK = std::conditional_t<
+        CvtGemmSwzlLd,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockN, 128, true, false, 1, false, 8>,
+        PPU_TSM_LD_SWZL<InputT, kBlockN, kBlockKSmem, true, false, 1>
+    >;
+    using SmemCopyOpVt = std::conditional_t<
+        CvtGemmSwzlLd,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, kBlockNPerLoad, kBlockKSmem, kBlockN, 2 * kBlockKSmem, true, true, 1, true, -1>,
+        PPU_TSM_LD_SWZL<InputT, kBlockN, kBlockKSmem, true, true, 1>
+    >;
+#endif
+    using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, InputT>;
+    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, InputT>;
     using SmemCopyAtomVt = Copy_Atom<SmemCopyOpVt, InputT>;
 
     // using TiledMma = TiledMMA<
@@ -162,11 +181,11 @@ struct Traits {
         cute::array_aligned<ElementAccum, cosize_v<SmemLayoutO>> smem_out;
     };
 
-    static constexpr int bits_per_aiu_Q = kBlockM * kBlockKSmem * sizeof(InputT) * 8;
-    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, InputT, false, kBlockM, kBlockKSmem>;
+    static constexpr int bits_per_aiu_Q = kBlockMPerLoad * kBlockKSmem * sizeof(InputT) * 8;
+    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, InputT, false, kBlockMPerLoad, kBlockKSmem>;
 
-    static constexpr int bits_per_aiu_KV = kBlockN * kBlockKSmem * sizeof(InputT) * 8;
-    using Gmem_copy_struct_KV = PPU_AIU_LOAD<cute::C<bits_per_aiu_KV>, InputT, false, kBlockN, kBlockKSmem>;
+    static constexpr int bits_per_aiu_KV = kBlockNPerLoad * kBlockKSmem * sizeof(InputT) * 8;
+    using Gmem_copy_struct_KV = PPU_AIU_LOAD<cute::C<bits_per_aiu_KV>, InputT, false, kBlockNPerLoad, kBlockKSmem>;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(InputT);
     static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
@@ -180,13 +199,13 @@ struct Traits {
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, InputT>{},
                     Layout<Shape <_1,_1>,
                            Stride<_1,_1>>{},
-                    Layout<Shape <Int<kBlockM>, Int<kBlockKSmem>>>{}));
+                    Layout<Shape <Int<kBlockMPerLoad>, Int<kBlockKSmem>>>{}));
 
     using GmemTiledCopyKV = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_KV, InputT>{},
                     Layout<Shape <_1,_1>,
                            Stride<_1,_1>>{},
-                    Layout<Shape <Int<kBlockN>, Int<kBlockKSmem>>>{}));
+                    Layout<Shape <Int<kBlockNPerLoad>, Int<kBlockKSmem>>>{}));
 
     using GmemTiledCopyO = decltype(
         make_tiled_copy(Copy_Atom<DefaultCopy, InputT>{},

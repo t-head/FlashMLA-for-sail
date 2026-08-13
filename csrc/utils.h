@@ -253,6 +253,28 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
 #endif
 };
 
+template<bool A_in_regs=false, bool B_in_regs=false, typename Tensor0, typename Tensor1,
+         typename Tensor2, typename Tensor3, typename Tensor4,
+         typename TiledMma, typename TiledCopyA, typename TiledCopyB,
+         typename ThrCopyA, typename ThrCopyB>
+__forceinline__ __device__ void gemm_pv_offset(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
+                            Tensor4 const& tCsB, TiledMma tiled_mma,
+                            TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
+                            ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, int remain_k_offset) {
+
+    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (cute::get<0>(tCsB(_, _, i).data().coord_) >= remain_k_offset) { // coord_h >= remain_k_offset
+            break;
+        }
+        if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i), tCrA_copy_view(_, _, i)); }
+        if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i)); }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
@@ -558,4 +580,18 @@ void printf_prefill_show_log(const void* kernel, SparsePrefillParams &params, co
     }
 }
 
+template <bool Is_even_MN=true, typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__forceinline__ __device__ void aiu_copy_gemm0swzlld(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
+                                Tensor<Engine1, Layout1> &D, const int max_MN = 0){
+    CUTE_STATIC_ASSERT_V(size<2>(D) - size<2>(S) == Int<1>{});
+    // warp_idx have been set!
+    if constexpr (!Is_even_MN) {
+        tiled_copy.desc_.dim_h = max_MN;
+    }
+    #pragma unroll
+    for (int k = 0; k < size<2>(S); k++) {
+        cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
+    }
+    cute::copy(tiled_copy, S(_, _, size<2>(S) - 1), D(_, _, size<2>(S)));
+}
 }  // namespace flash
