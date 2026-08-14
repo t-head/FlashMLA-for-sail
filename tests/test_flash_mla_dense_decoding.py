@@ -207,7 +207,7 @@ def main(torch_dtype, loops=1):
         for s_q in [1, 2, 4]
         for s_k in [20, 140, 4096]
         for h_q in [1, 3, 9, 63, 64, 126, 128]
-        for h_kv in [1, 2, 3] # Temporarily remove 8; there are unresolved precision issues with h_kv=8.
+        for h_kv in [1, 2, 3, 8]
         for is_varlen in [False, True]
         for is_causal in [False, True]
         for block_size in [16, 64, 256]
@@ -218,7 +218,7 @@ def main(torch_dtype, loops=1):
         # Cases where some kv cache have zero length
         TestParam(128, 2, 4096, is_varlen=True, is_causal=is_causal, test_performance=False, have_zero_seqlen_k=True, h_q=h_q, h_kv=h_kv)
         for h_q in [1, 3, 9, 63, 64, 126, 128]
-        for h_kv in [1, 2, 3] # Temporarily remove 8; there are unresolved precision issues with h_kv=8.
+        for h_kv in [1, 2, 3, 8]
         for is_causal in [False, True]
         if h_q % h_kv == 0
     ]
