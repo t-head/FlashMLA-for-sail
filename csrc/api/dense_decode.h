@@ -29,12 +29,6 @@ dense_attn_decode_interface(
     // ========== Phase 1: Lazy metadata ==========
     if (!tile_scheduler_metadata.has_value()) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-        hggcStreamCaptureStatus captureStatus;
-        hggcStreamIsCapturing(stream, &captureStatus);
-        TORCH_CHECK(captureStatus == hggcStreamCaptureStatusNone,
-            "Metadata lazy generation during CUDA graph capture is unsafe. "
-            "Call flash_mla_with_kvcache at least once before graph capture (warmup).");
-
         const auto sizes = q.sizes();
         const int batch_size = sizes[0];
         const int seqlen_q_ori = sizes[1];
