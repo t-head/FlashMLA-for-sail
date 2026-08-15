@@ -7,6 +7,7 @@
 #ifdef FLASHMLA_C_ENABLE_DECODE_SPARSE
 #include "sparse_decode.h"
 #endif
+#include "compat.h"
 
 #ifndef FLASH_MLA_CPP_INFER_BUILD
 
@@ -21,6 +22,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_decode_fwd", &sparse_attn_decode_interface);
 #endif
     m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface);
+    // Backward-compatible aliases
+    m.def("fwd_kvcache_mla", &mha_fwd_kvcache_mla);
+    m.def("get_mla_metadata", &get_mla_metadata);
 }
 
 #else
@@ -40,6 +44,13 @@ TORCH_LIBRARY(_flashmla_C, m) {
 
     m.def("sparse_prefill_fwd", make_pytorch_shim(&sparse_attn_prefill_interface));
     m.impl("sparse_prefill_fwd", torch::kCUDA, make_pytorch_shim(&sparse_attn_prefill_interface));
+
+    // Backward-compatible aliases
+    m.def("fwd_kvcache_mla", make_pytorch_shim(&mha_fwd_kvcache_mla));
+    m.impl("fwd_kvcache_mla", torch::kCUDA, make_pytorch_shim(&mha_fwd_kvcache_mla));
+
+    m.def("get_mla_metadata", make_pytorch_shim(&get_mla_metadata));
+    m.impl("get_mla_metadata", torch::kCUDA, make_pytorch_shim(&get_mla_metadata));
 }
 
 PyMODINIT_FUNC PyInit__flashmla_C() {
