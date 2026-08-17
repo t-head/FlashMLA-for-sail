@@ -25,6 +25,7 @@
 #include "kerutils/host/host.h"
 
 #include <hggc_ad.h>
+#define DSA_SIM_AIU 1
 
 namespace flash {
 using namespace cute;

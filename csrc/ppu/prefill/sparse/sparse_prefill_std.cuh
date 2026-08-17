@@ -15,6 +15,10 @@
 #include "kerutils/device/ppu/mask.cuh"
 #include "kerutils/device/ppu/dequant.cuh"
 
+#ifndef DSA_SIM_AIU
+#define DSA_SIM_AIU 1
+#endif
+
 using namespace cute;
 
 namespace flash {
