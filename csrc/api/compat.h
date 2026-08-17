@@ -91,7 +91,7 @@ static std::vector<at::Tensor>
 mha_fwd_kvcache_mla(
     at::Tensor &q,
     const at::Tensor &kcache,
-    c10::optional<const at::Tensor> &vcache_,
+    std::optional<const at::Tensor> &vcache_,
     const int head_size_v,
     const std::optional<at::Tensor> &seqlens_k,
     const std::optional<at::Tensor> &block_table,
