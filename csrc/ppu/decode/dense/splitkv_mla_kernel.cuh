@@ -1309,16 +1309,6 @@ __forceinline__ __device__ void wg0_subroutine(
 
     auto nxt_sK1 = cur_sK0;
 
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        if (wg_idx == 0) {
-            tKgK.data().ptr_ = make_gmem_ptr(
-                reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block0, params, block_table_ptr));
-            auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
-            Tensor tKsK0 = gmem_thr_copy_K.partition_D(nxt_sK0);
-            tiled_copy.desc_.dim_h = seqlen_k - (nxt_block0 * T::kBlockN);
-            launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK0, params, &barriers_K0[0], wg_idx);
-        }
-    }
     // Calc P0 = softmax(P0)
 #if ACOMPUTE_VERSION == 10000
     Tensor rPb = wg0_bunch_0< T, IS_BLK0_LAST || IS_BLK1_LAST > (rP0, rO0, sScale0, sM, rL, rRightBorderForQSeq, params.scale_softmax_log2, start_token_idx, idx_in_warpgroup);
@@ -1332,18 +1322,33 @@ __forceinline__ __device__ void wg0_subroutine(
     wg0_scale0_rO0(rO0, sScale0, idx_in_warpgroup);
     warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV0L, rO0, idx_in_warpgroup, wg_idx);
 
-    //  if (!IS_BLK0_LAST && !IS_BLK1_LAST && __builtin_expect(block_idx + 3 < end_block_idx, true)) {
-    //     if (wg_idx == 0) {
-    //         tKgK.data().ptr_ = make_gmem_ptr(
-    //             reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block1, params, block_table_ptr));
-    //         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
-    //         Tensor tKsK1 = gmem_thr_copy_K.partition_D(nxt_sK1);
-    //         tiled_copy.desc_.dim_h = seqlen_k - (nxt_block1 * T::kBlockN);
-    //         launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK1, params, &barriers_K1[0], wg_idx);
-    //     }
-    // }
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
+        if (wg_idx == 0) {
+            tKgK.data().ptr_ = make_gmem_ptr(
+                reinterpret_cast<T::InputT *>(params.k_ptr) + get_block_index<T>(nxt_block0, params, block_table_ptr));
+            auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
+            Tensor tKsK0 = gmem_thr_copy_K.partition_D(nxt_sK0);
+            tiled_copy.desc_.dim_h = seqlen_k - (nxt_block0 * T::kBlockN);
+            launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK0, params, &barriers_K0[0], wg_idx);
+        }
+    }
+
     // Wait for warpgroup 1, rescale P0, notify warpgroup 1
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale1Ready);
+
+    wg0_scale_rP0<T>(sScale1, rP0, rPb, idx_in_warpgroup);
+    save_rP0_to_sP<T>(rPb, sP0, idx_in_warpgroup);
+
+    NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sP0Ready);
+
+    // Rescale O0, issue rO0 += sP1 @ sV1L
+    // sP1 readiness is guaranteed by sScale1Ready (warpgroup 1 saves sP1 before arriving),
+    // so the rO1sP0sV0RIssued barrier is no longer needed here.
+    if constexpr (!IS_BLK0_LAST)
+    {
+        wg0_rescale_rO0(rO0, sScale1, rL, idx_in_warpgroup);
+        warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup, wg_idx);
+    }
 
     if (!IS_BLK0_LAST && !IS_BLK1_LAST && __builtin_expect(block_idx + 3 < end_block_idx, true)) {
         if (wg_idx == 0) {
@@ -1354,19 +1359,6 @@ __forceinline__ __device__ void wg0_subroutine(
             tiled_copy.desc_.dim_h = seqlen_k - (nxt_block1 * T::kBlockN);
             launch_kv_tiles_copy<0, 4>(tiled_copy, tKgK, tKsK1, params, &barriers_K1[0], wg_idx);
         }
-    }
-
-    wg0_scale_rP0<T>(sScale1, rP0, rPb, idx_in_warpgroup);
-    save_rP0_to_sP<T>(rPb, sP0, idx_in_warpgroup);
-
-    NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sP0Ready);
-
-    // Wait for warpgroup 1, rescale O0, issue rO0 += rPb @ sV1L
-    if constexpr (!IS_BLK0_LAST)
-    {
-        NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
-        wg0_rescale_rO0(rO0, sScale1, rL, idx_in_warpgroup);
-        warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup, wg_idx);
     }
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST)
@@ -1468,14 +1460,16 @@ __forceinline__ __device__ void wg1_subroutine(
     Tensor rP1b = make_tensor<T::InputT>(Shape<Shape<_2, _2, _2>, _1, _2>{});
     wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(rP1b, sScale1, rO1, sM, rL, rRightBorderForQSeq, sScale0, rP1, params.scale_softmax_log2, start_token_idx+T::kBlockN, idx_in_warpgroup);
 #endif
-    NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
-    // Save rPb to sP, and issue rO1 += rP1b @ sV1R
-    // We do this after notifying warpgroup 1, since both "saving rPb to sP" and "issuing" WGMMA are high-latency operations
+    // Save rPb to sP before arriving sScale1Ready, so that sScale1Ready also guarantees
+    // that sP1 is ready for warpgroup 0's remote P V gemm (which reads sP1 after waiting
+    // sScale1Ready). rP1b is fully produced by wg1_bunch_0 above.
     if constexpr (!IS_BLK0_LAST) {
         save_rP1_to_sP<T>(rP1b, sP1, idx_in_warpgroup);
     }
+    NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
+    // Issue rO1 += rP1b @ sV1R
     wg1_scale0_rO1(rO1, sScale0, sScale1, idx_in_warpgroup);
     if constexpr (!IS_BLK0_LAST) {
         warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, idx_in_warpgroup, wg_idx);
@@ -1496,10 +1490,6 @@ __forceinline__ __device__ void wg1_subroutine(
     }
 
     warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup, wg_idx);
-
-    if constexpr (!IS_BLK0_LAST) {
-        NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
-    }
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST) {
         cute::clear(rP1);

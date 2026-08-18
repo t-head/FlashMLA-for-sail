@@ -15,7 +15,7 @@ enum NamedBarriers : int {
     sScale0Ready = 5,
     sScale1Ready = 6,
     sP0Ready = 7,
-    rO1sP0sV0RIssued = 8,
+    rO1sP0sV0RIssued = 8, // DEPRECATED: no longer used. sP1 readiness is now guaranteed by sScale1Ready (WG1 saves sP1 before arriving). Kept to preserve barrier ID numbering.
     sMInitialized = 9,
     mGroup0 = 10,
     mGroup1 = 11,
