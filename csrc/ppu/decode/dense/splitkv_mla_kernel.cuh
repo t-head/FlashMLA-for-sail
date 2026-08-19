@@ -1198,11 +1198,11 @@ __forceinline__ __device__ void launch_q_copy(
             #pragma unroll
             for (int tile = 0; tile < T::kHeadDim/T::kBlockKSmem; ++tile) {
                 auto tQsQ_current = tQsQ(_, vid, tile);
-                auto tQgQ_current = tQgQ(_, vid, tile);
-                int size = (tile & ~1) * T::kBlockM * 64 + (tile & 1) * 16 * 64
-                         +  vid * 16 * (tile == 8 ? 64 : 128);
-                tQsQ_current.data() = tQsQ.data() + size;
-                cute::copy(gmem_tiled_copy_Q, tQgQ_current, tQsQ_current);
+                if (tile < T::TileNoCvt) {
+                    int size = (tile & ~1) * T::kBlockM * T::kBlockKSmem + ((vid << 1) + (tile & 1)) * T::kBlockMPerLoad * T::kBlockKSmem;
+                    tQsQ_current.data() = tQsQ.data() + size;
+                }
+                cute::copy(gmem_tiled_copy_Q, tQgQ(_, vid, tile), tQsQ_current);
             }
         } else {
             cute::copy(gmem_tiled_copy_Q, tQgQ, tQsQ);

@@ -43,8 +43,9 @@ struct Traits {
     static constexpr int kHeadDimV = Config::HEAD_DIM_V;
     static constexpr float Page_In_BlockN = float(kBlockN) / (float)PAGE_BLOCK_SIZE;
     static constexpr bool CvtGemmSwzlLd = CvtGemmSwzlLd_;
-    static constexpr int kBlockMPerLoad = CvtGemmSwzlLd ? 16 : kBlockM;
+    static constexpr int kBlockMPerLoad = CvtGemmSwzlLd ? 8 : kBlockM;
     static constexpr int kBlockNPerLoad = CvtGemmSwzlLd ? 16 : kBlockN;
+    static constexpr int TileNoCvt = 8;
 
     // static constexpr int NUM_THREADS = 256;
     static constexpr int NUM_THREADS = 512;
@@ -78,12 +79,12 @@ struct Traits {
 #else
     using SmemCopyOpQ = std::conditional_t<
         CvtGemmSwzlLd,
-        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockM, 128, false, false, 1, false, 8>,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockM, 128, false, false, 1, true, TileNoCvt>,
         PPU_TSM_LD_SWZL<InputT, kBlockM, kBlockKSmem, false, false, 1>
     >;
     using SmemCopyOpK = std::conditional_t<
         CvtGemmSwzlLd,
-        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockN, 128, true, false, 1, false, 8>,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockN, 128, true, false, 1, true, TileNoCvt>,
         PPU_TSM_LD_SWZL<InputT, kBlockN, kBlockKSmem, true, false, 1>
     >;
     using SmemCopyOpVt = std::conditional_t<
