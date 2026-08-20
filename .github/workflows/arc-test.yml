@@ -6,16 +6,63 @@ on:
     branches: [ "main" ]
   pull_request:
   workflow_dispatch:
+    inputs:
+      image:
+        description: "job 容器镜像"
+        default: "reg.docker.alibaba-inc.com/ai-tmp/llm:pytorch2.9.0-ubuntu24.04-cuda13.0-sglang0.5.10-py312-ppu202605281910"
 
 jobs:
-  test-scaling:
-    # 关键：指定你在 values.yaml 中配置的 runnerScaleSetName
+  test-ppu1:
     runs-on: k8s-runner-group-ppu1
     container:
-      image: reg.docker.alibaba-inc.com/ai-tmp/llm:pytorch2.9.0-ubuntu24.04-cuda13.0-sglang0.5.10-py312-ppu202605281910
+      image: ${{ inputs.image || 'reg.docker.alibaba-inc.com/ai-tmp/llm:pytorch2.9.0-ubuntu24.04-cuda13.0-sglang0.5.10-py312-ppu202605281910' }}
     steps:
-      - name: Hello World
+      - name: PPU 1卡测试
         run: |
-          echo "我跑在 K8s 自动拉起的 Pod 里！"
+          echo "PPU 1卡测试"
+          hostname
+          ppu-smi
+
+  test-ppu2:
+    runs-on: k8s-runner-group-ppu2
+    container:
+      image: ${{ inputs.image || 'reg.docker.alibaba-inc.com/ai-tmp/llm:pytorch2.9.0-ubuntu24.04-cuda13.0-sglang0.5.10-py312-ppu202605281910' }}
+    steps:
+      - name: PPU 2卡测试
+        run: |
+          echo "PPU 2卡测试"
+          hostname
+          ppu-smi
+
+  test-ppu4:
+    runs-on: k8s-runner-group-ppu4
+    container:
+      image: ${{ inputs.image || 'reg.docker.alibaba-inc.com/ai-tmp/llm:pytorch2.9.0-ubuntu24.04-cuda13.0-sglang0.5.10-py312-ppu202605281910' }}
+    steps:
+      - name: PPU 4卡测试
+        run: |
+          echo "PPU 4卡测试"
+          hostname
+          ppu-smi
+
+  test-ppu8:
+    runs-on: k8s-runner-group-ppu8
+    container:
+      image: ${{ inputs.image || 'reg.docker.alibaba-inc.com/ai-tmp/llm:pytorch2.9.0-ubuntu24.04-cuda13.0-sglang0.5.10-py312-ppu202605281910' }}
+    steps:
+      - name: PPU 8卡测试
+        run: |
+          echo "PPU 8卡测试"
+          hostname
+          ppu-smi
+
+  test-ppu16:
+    runs-on: k8s-runner-group-ppu16
+    container:
+      image: ${{ inputs.image || 'reg.docker.alibaba-inc.com/ai-tmp/llm:pytorch2.9.0-ubuntu24.04-cuda13.0-sglang0.5.10-py312-ppu202605281910' }}
+    steps:
+      - name: PPU 16卡测试
+        run: |
+          echo "PPU 16卡测试"
           hostname
           ppu-smi
