@@ -178,6 +178,9 @@ def run_flash_mla(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q,
         )
 
     out_flash, lse_flash = flash_mla()
+    # NOTE before enabling do_bench: in fp8 mode convert_to_fp8_e4m3 returns CPU tensors, so
+    # timing this closure would charge fp8 a full KV H2D that bf16 does not pay.  Hoist the
+    # device transfer out of the closure first.
     # t = triton.testing.do_bench(flash_mla)
     return out_flash, lse_flash
 
@@ -530,7 +533,20 @@ FUNC_TABLE = {
     "flash_mla_triton": run_flash_mla_triton,
 }
 
-def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype, _block_size):
+def convert_to_fp8_e4m3(tensor):
+    if tensor.dtype != torch.float8_e4m3fn:
+        x_float = tensor.float()
+        tensor_gpu = x_float.cuda()
+        tensor_gpu_fp8 = tensor_gpu.to(dtype=torch.float8_e4m3fn)
+        tensor_cpu_fp8 = tensor_gpu_fp8.cpu()
+        return tensor_cpu_fp8
+    return tensor
+
+# Test convenience bound, NOT the format limit (e4m3 max is 448): clamping to +/-240 keeps
+# products inside the range where PPU fp8 accumulation matches the bf16 reference tolerance.
+FP8_E4M3_MAX = 240
+FP8_E4M3_MIN = -240
+def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype, _block_size, qkv_fp8=False):
     print(f"{target}: {b=}, {s_q=}, mean_seqlens={cache_seqlens.float().mean()}, {h_q=}, {h_kv=}, {d=}, {dv=}, {causal=}, {dtype=}")
 
     torch.set_default_dtype(dtype)
@@ -556,6 +572,13 @@ def compare_a(target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype, _b
     # block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
     blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, device=ref_device)
     # blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
+    if qkv_fp8:
+        q = q.to(torch.float32)
+        q = torch.clamp(q, FP8_E4M3_MIN, FP8_E4M3_MAX)
+        q = convert_to_fp8_e4m3(q)
+        blocked_k = blocked_k.to(torch.float32)
+        blocked_k = torch.clamp(blocked_k, FP8_E4M3_MIN, FP8_E4M3_MAX)
+        blocked_k = convert_to_fp8_e4m3(blocked_k)
 
     out_b, lse_b = target_func(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype)
 
@@ -813,7 +836,12 @@ def get_params(input_str):
             (config_dict["batch_size"],), baseline, dtype=torch.int32, device=ref_device,
         )
 
-    config_dict["dtype"] = torch.bfloat16 if config_dict["dtype"] == "bf16" else torch.half
+    if config_dict["dtype"] == "fp8":
+        config_dict["dtype"] = torch.bfloat16
+        config_dict["qkv_fp8"] = True
+    else:
+        config_dict["dtype"] = torch.bfloat16 if config_dict["dtype"] == "bf16" else torch.half
+        config_dict["qkv_fp8"] = False
 
     return config_dict
 
@@ -872,4 +900,4 @@ if __name__ == "__main__":
             if "block_size" not in config.keys():
                 config["block_size"] = 64
             # exit(0)
-            perf = compare_a(config["mla"], config["batch_size"], config["seq_q"], config["cache_seqlens"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["causal"], config["dtype"], config["block_size"])
+            perf = compare_a(config["mla"], config["batch_size"], config["seq_q"], config["cache_seqlens"], config["num_heads"], config["num_heads_kv"], config["head_dim"], config["head_dim_v"], config["causal"], config["dtype"], config["block_size"], config["qkv_fp8"])

@@ -21,6 +21,7 @@ class FlashMLASchedMeta:
 
         causal: bool
         is_fp8_kvcache: bool
+        qkv_fp8: bool
         topk: Optional[int]
 
         extra_page_block_size: Optional[int]
@@ -39,6 +40,7 @@ class FlashMLASchedMeta:
 #     num_heads_k: int,
 #     num_heads_q: Optional[int] = None,
 #     is_fp8_kvcache: bool = False,
+#     qkv_fp8: bool = False
 #     topk: Optional[int] = None
 # ) -> Tuple[torch.Tensor, torch.Tensor]:
 #     """
@@ -48,13 +50,14 @@ class FlashMLASchedMeta:
 #         num_heads_k: num_heads_k.
 #         num_heads_q: The number of q heads. This argument is optional when sparse attention is not enabled
 #         is_fp8_kvcache: Whether the k_cache and v_cache are in fp8 format.
+#         qkv_fp8: Whether both q and k_cache are in fp8 format (requires the fp8 kernel path).
 #         topk: If not None, sparse attention will be enabled, and only tokens in the `indices` array passed to `flash_mla_with_kvcache_sm90` will be attended to.
 
 #     Returns:
 #         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
 #         num_splits: (batch_size + 1), dtype torch.int32.
 #     """
-#     return flash_mla_cuda.get_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k, num_heads_q, is_fp8_kvcache, topk)
+#     return flash_mla_cuda.get_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k, num_heads_q, is_fp8_kvcache, topk, qkv_fp8)
 
 def get_mla_metadata(
     *args,
@@ -140,6 +143,7 @@ def flash_mla_with_kvcache(
     topk = indices_in_kvcache.shape[-1] if indices_in_kvcache is not None else None
     extra_k_page_block_size = extra_k_cache.shape[1] if extra_k_cache is not None else None
     extra_topk = extra_indices_in_kvcache.shape[-1] if extra_indices_in_kvcache is not None else None
+    qkv_fp8 = (q.dtype == torch.float8_e4m3fn) and (k_cache.dtype == torch.float8_e4m3fn)
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -156,11 +160,10 @@ def flash_mla_with_kvcache(
             q.shape[2],
             k_cache.shape[1],
             k_cache.shape[2],
-
             causal,
             is_fp8_kvcache,
+            qkv_fp8,
             topk,
-
             extra_k_page_block_size,
             extra_topk,
         )
@@ -177,6 +180,7 @@ def flash_mla_with_kvcache(
         assert sched_meta.config.h_k == k_cache.shape[2], "sched_meta.config.h_k must be equal to num_heads_k." + helper_msg
         assert sched_meta.config.causal == causal, "sched_meta.config.causal must be equal to causal." + helper_msg
         assert sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, "sched_meta.config.is_fp8_kvcache must be equal to is_fp8_kvcache." + helper_msg
+        assert sched_meta.config.qkv_fp8 == qkv_fp8, "sched_meta.config.qkv_fp8 must be equal to (q.dtype == torch.float8_e4m3fn and k_cache.dtype == torch.float8_e4m3fn)." + helper_msg
         assert sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg
         assert sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg
         assert sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg

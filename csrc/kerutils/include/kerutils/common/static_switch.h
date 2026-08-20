@@ -65,7 +65,7 @@
       constexpr static int kBlockM = 32;  \
       return __VA_ARGS__();                \
     } else if (SEQLENG <= 48) {            \
-      constexpr static int kBlockM = 48;  \
+      constexpr static int kBlockM = std::is_same_v<T, cutlass::float_e4m3_t> ? 64 : 48;\
       return __VA_ARGS__();               \
     } else {                              \
       constexpr static int kBlockM = 64;  \

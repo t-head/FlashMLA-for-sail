@@ -316,7 +316,7 @@ namespace flash {
 template<typename Kernel_traits, int kMaxSplits>
 __global__ void __launch_bounds__(256, 1, 1)
 flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_params params) {
-    using Element = typename Kernel_traits::Element;
+    using Element = typename Kernel_traits::ElementOutputType;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
 

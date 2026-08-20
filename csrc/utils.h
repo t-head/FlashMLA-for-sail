@@ -174,6 +174,38 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// fp8: QK gemm with the first kKeepA k-steps of A (Q) held resident in registers
+// across the whole n_block loop.
+template<int kKeepA, typename Tensor0, typename Tensor1,
+         typename Tensor2, typename Tensor3, typename Tensor4,
+         typename TiledMma, typename TiledCopyA, typename TiledCopyB,
+         typename ThrCopyA, typename ThrCopyB>
+__forceinline__ __device__ void gemm_qstep_keep(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
+                            Tensor4 const& tCsB, TiledMma tiled_mma,
+                            TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
+                            ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B) {
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+
+    // A k-steps [0, kKeepA) are preloaded once before the mainloop; stream only the tail.
+    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            if (i + 1 >= kKeepA) {
+                cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1));
+            }
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template<int start_kidx_A, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB, typename ThrCopyA, typename ThrCopyB>
 __forceinline__ __device__ void gemm_rss(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
@@ -383,7 +415,7 @@ template<typename Kernel_traits, bool Split, bool CrossCut = false, bool IsSpars
 __forceinline__ __device__ void store(const Flash_fwd_params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
                                       __shared__ char* smem_,  AccO acc_o, Softmax softmax) {
 
-    using Element = typename Kernel_traits::Element;
+    using Element = typename Kernel_traits::ElementOutputType;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
     using GmemTiledCopyO = std::conditional_t<
@@ -404,7 +436,7 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
 
     Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax);
 
-    using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
+    using ElementO = std::conditional_t<!Split, Element, typename Kernel_traits::ElementAccum>;
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{});
                                                                                                                              // Partition sO to match the accumulator partitioning
     using SmemTiledCopyO = std::conditional_t<
@@ -413,7 +445,13 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
         typename Kernel_traits::SmemCopyAtomOaccum
     >;
 
-    typename Kernel_traits::TiledMma tiled_mma;
+    using TiledMmaStore = std::conditional_t<
+        Kernel_traits::QKV_FP8,
+        typename Kernel_traits::TiledMmaStoreFP8,
+        typename Kernel_traits::TiledMma
+    >;
+
+    TiledMmaStore tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
     auto smem_tiled_copy_Oaccum = make_tiled_copy_C(SmemTiledCopyO{}, tiled_mma);
     auto smem_thr_copy_Oaccum = smem_tiled_copy_Oaccum.get_thread_slice(tidx);
@@ -503,7 +541,7 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
 
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy<false, true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, seqlen_q_max
+        gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, Kernel_traits::QKV_FP8 ? min((int)kBlockM, seqlen_q_max) : seqlen_q_max
     );
 }
 
@@ -593,5 +631,19 @@ __forceinline__ __device__ void aiu_copy_gemm0swzlld(TiledCopy tiled_copy, Tenso
         cute::copy(tiled_copy, S(_, _, k), D(_, _, k));
     }
     cute::copy(tiled_copy, S(_, _, size<2>(S) - 1), D(_, _, size<2>(S)));
+}
+
+// Zero-fill one contiguous paged KV chunk with 16B vector stores.
+// cute::clear() on the AIU gmem-copy partition scalarizes to per-byte tsm.st.b8 for fp8.
+template <typename Element, int kChunkElems, int kNThreads>
+__forceinline__ __device__ void zfill_smem_chunk(Element *chunk_base, int tidx) {
+    static_assert(kChunkElems * (int)sizeof(Element) % 16 == 0);
+    // int4 vector stores require a 16B-aligned chunk base pointer.
+    assert((reinterpret_cast<uintptr_t>(chunk_base) & 0xF) == 0);
+    int4 *dst = reinterpret_cast<int4 *>(chunk_base);
+    constexpr int kVecs = kChunkElems * (int)sizeof(Element) / 16;
+    for (int zi = tidx; zi < kVecs; zi += kNThreads) {
+        dst[zi] = make_int4(0, 0, 0, 0);
+    }
 }
 }  // namespace flash

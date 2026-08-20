@@ -475,12 +475,12 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + m_block * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
     Tensor gQ = make_mix_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
-        Shape<Int<kBlockMPagedPerAiuLoad>, Int<kHeadDim>>{}, make_stride(params.q_row_stride, _1{}));// (kBlockMPagedPerAiuLoad, kHeadDim)
+        Shape<Int<kBlockMPagedPerAiuLoad>, Int<Kernel_traits::kHeadDimRaw>>{}, make_stride(params.q_row_stride, _1{}));// (kBlockMPagedPerAiuLoad, kHeadDimRaw)
 
     Tensor gK = make_mix_tensor(make_gmem_ptr(block_table == nullptr && !have_zero_seqlen_k
                                 ? reinterpret_cast<Element *>(__ldg(hllm_block_table + block_table_idx))
                                 : reinterpret_cast<Element *>(params.k_ptr)) + row_offset_k,
-                            Shape<Int<kBlockNPagedPerAiuLoad>, Int<kHeadDim>>{},
+                            Shape<Int<kBlockNPagedPerAiuLoad>, Int<Kernel_traits::kHeadDimRaw>>{},
                             make_stride(params.k_row_stride, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename Kernel_traits::SmemLayoutQ{});
@@ -493,6 +493,8 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     Tensor sVtNoSwizzle = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
     Tensor sP = make_tensor(sKPagedforCopy.data() + size(sKPagedforCopy), typename Kernel_traits::SmemLayoutP{});
+    // fp8-only non-swizzled view of sP (dead alias for bf16).
+    Tensor sPNoSwizzle = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutPNoSwizzle{});
 
     Tensor smem_row_scale = make_tensor(make_smem_ptr(reinterpret_cast<float *>((sP.data() + size(sP)).get())),
         Shape<Int<kBlockM>>{}, Stride<_1>{});
@@ -519,7 +521,13 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
 
     typename Kernel_traits::TiledMma tiled_mma_o;
     auto thr_mma_o = tiled_mma_o.get_thread_slice(tidx);
-    Tensor tOrP  = thr_mma_o.partition_fragment_A(sP);                           // (MMA,MMA_M,MMA_N)
+    Tensor tOrP = [&] {                                                         // (MMA,MMA_M,MMA_N)
+        if constexpr (std::is_same_v<Element, cutlass::float_e4m3_t>) {
+            return thr_mma_o.partition_fragment_A(sPNoSwizzle);
+        } else {
+            return thr_mma_o.partition_fragment_A(sP);
+        }
+    }();
     Tensor tOrVt  = thr_mma_o.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
 
     // Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDimV>>{});  // MMA, MMA_M, MMA_K
@@ -573,8 +581,13 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
 
     auto smem_tiled_copy_P = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtomP{}, tiled_mma_o);
     auto smem_thr_copy_P = smem_tiled_copy_P.get_thread_slice(tidx);
-    Tensor tOsP = smem_thr_copy_P.partition_S(sP);
-
+    Tensor tOsP = [&] {
+        if constexpr (std::is_same_v<Element, cutlass::float_e4m3_t>) {
+            return smem_thr_copy_P.partition_S(make_mix_tensor_like(sPNoSwizzle));
+        } else {
+            return smem_thr_copy_P.partition_S(sP);
+        }
+    }();
 
     // Prologue
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
@@ -606,7 +619,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         flash::copy<true, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM);
     }
 
-    if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
+    if (Kernel_traits::Is_Q_in_regs || Kernel_traits::QKV_FP8) { cute::cp_async_fence(); }
 
     if (Kernel_traits::Share_Q_K_smem) {
         flash::cp_async_wait<0>();
@@ -659,7 +672,14 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
                 auto tKsK_current = tKsK(_, _, _, vv, kv_store_num);
                 const int seqlen_k_begin = n_block_load * kBlockN + vv * kBlockNPagedPerAiuLoad;
                 if (Is_first_iter && seqlen_k_begin >= binfo.actual_seqlen_k) {
-                    cute::clear(tKsK_current);
+                    if constexpr (!Kernel_traits::QKV_FP8){
+                        cute::clear(tKsK_current);
+                    } else {
+                        constexpr int kChunkElems = kBlockNPagedPerAiuLoad * kHeadDim;
+                        zfill_smem_chunk<Element, kChunkElems, Kernel_traits::kNThreads>(
+                          sK.data().get() + (kv_store_num * (kBlockN / kBlockNPagedPerAiuLoad) + vv) * kChunkElems,
+                          tidx);
+                    }
                     continue;
                 }
                 const int block_table_idx_paged = seqlen_k_begin / page_block_size;
@@ -747,12 +767,29 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
                      + block_table_offset_nxt * params.k_row_stride
                      + (bidh / params.h_h_k_ratio) * params.k_head_stride;
 
+    // fp8 - keep the first 9 of Q's MMA_K=20 (kHeadDim/32) k-steps in registers,
+    // stream the rest. Cost: 4 regs/thread per kept step, avoiding register spills.
+    // 0 = disabled: non-fp8 / paged-KV tiers stream all steps.
+    constexpr int QKeepStepsInRegs = (Kernel_traits::QKV_FP8 && !Kernel_traits::Is_Q_in_regs && kBlockNPagedPerAiuLoad == kBlockN) ? 9 : 0;
+    auto preload_q_steps = [&](auto k_steps) {
+        Tensor tSrQ_view = smem_thr_copy_Q.retile_D(tSrQ);
+        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_view));
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < decltype(k_steps)::value; ++i) {
+            cute::copy(smem_tiled_copy_Q, tSsQ(_, _, i), tSrQ_view(_, _, i));
+        }
+    };
     if (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
         flash::cp_async_wait<1>();
         __syncthreads();
-        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
-        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
-        cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+        preload_q_steps(size<2>(tSrQ));
+    }
+
+    // Same predicate as the mainloop gemm path -- gemm_pagedkv would clobber the preloaded Q slots.
+    if constexpr (QKeepStepsInRegs > 0) {
+        flash::cp_async_wait<1>();
+        __syncthreads();
+        preload_q_steps(Int<QKeepStepsInRegs>{});
     }
 
     // #pragma unroll
@@ -776,6 +813,17 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         ? 1
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
 
+    // fp8 keeps Q's leading k-steps in registers; bf16 streams Q as before.
+    auto qk_gemm = [&](auto& acc_s, int kv_stage) {
+        if constexpr (Kernel_traits::QKV_FP8 && QKeepStepsInRegs > 0) {
+            flash::gemm_qstep_keep<QKeepStepsInRegs>(acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, kv_stage),
+                tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
+        } else {
+            flash::gemm<Kernel_traits::Is_Q_in_regs>(acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, kv_stage),
+                tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
+        }
+    };
+
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_s, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -795,9 +843,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
 
         if (!have_zero_seqlen_k)
         (CvtGemm0SwzlLd || PageLargerThankBlockN)
-            ? flash::gemm<Kernel_traits::Is_Q_in_regs>(
-                acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, kv_load_num),
-                tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K)
+            ? qk_gemm(acc_s, kv_load_num)
             : flash::gemm_pagedkv<kBlockNPagedPerAiuLoad, kBlockNPagedPerAiuLoad*kHeadDim, 1,
                 Kernel_traits::Is_Q_in_regs>(acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, kv_load_num),
                 tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
@@ -873,8 +919,7 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         // block_table_offset_nxt = (n_block - kStages) * kBlockN - block_table_idx_nxt * page_block_size;
 
         (CvtGemm0SwzlLd || PageLargerThankBlockN)
-            ? flash::gemm<Kernel_traits::Is_Q_in_regs>(acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, kv_load_num),
-                tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K)
+            ? qk_gemm(acc_s, kv_load_num)
             : flash::gemm_pagedkv<kBlockNPagedPerAiuLoad, kBlockNPagedPerAiuLoad*kHeadDim, 1,
                 Kernel_traits::Is_Q_in_regs>(acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, kv_load_num),
                 tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
@@ -966,9 +1011,11 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_params params) {
                 params, batch_id, bidh, m_block, n_split_idx, seqlen_k == 0,
                 n_block_min, n_block_max, NoSplit);
         } else {
-            compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, false>(
-                params, batch_id, bidh, m_block, n_split_idx, seqlen_k == 0,
-                n_block_min, n_block_max, NoSplit);
+            if constexpr (!(std::is_same_v<typename Kernel_traits::Element, cutlass::float_e4m3_t>)){
+                compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, false>(
+                    params, batch_id, bidh, m_block, n_split_idx, seqlen_k == 0,
+                    n_block_min, n_block_max, NoSplit);
+            }
         }
     }
     }

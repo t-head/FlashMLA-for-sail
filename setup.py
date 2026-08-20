@@ -23,6 +23,7 @@ def get_sources():
     sources = [
         "csrc/api/api.cpp",
         "csrc/ppu/decode/dense/instantiations/hdim576_512_bf16.cu",
+        "csrc/ppu/decode/dense/instantiations/hdim576_512_fp8.cu",
         "csrc/ppu/decode/dense/instantiations/splitkv_mla_bf16.cu",
         "csrc/ppu/prefill/sparse/instantiations/dispatch_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/hdim576_bf16.cu",

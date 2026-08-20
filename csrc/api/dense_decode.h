@@ -12,6 +12,9 @@
 template<typename T, int Headdim, int Headdim_V>
 void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t stream);
 void get_mla_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
+// fp8 splits KV at 128-row granularity (its largest kernel tile); bf16/fp16 use 64.
+// Split boundaries must divide the kernel's kBlockN -- single source for both metadata paths.
+inline int dense_decode_block_size_n(const bool qkv_fp8) { return qkv_fp8 ? 128 : 64; }
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 dense_attn_decode_interface(
@@ -26,6 +29,7 @@ dense_attn_decode_interface(
     std::optional<at::Tensor> &num_splits,                // batch_size + 1
     const std::optional<at::Tensor> &out_                 // batch_size x seqlen_q_ori x num_heads_ori x head_size_v
 ) {
+    const bool qkv_fp8 = (q.dtype() == torch::kFloat8_e4m3fn && kcache.dtype() == torch::kFloat8_e4m3fn);
     // ========== Phase 1: Lazy metadata ==========
     if (!tile_scheduler_metadata.has_value()) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -49,7 +53,7 @@ dense_attn_decode_interface(
                          ? (seqlen_q > 32 && seqlen_q <= 64 ? 64 : 32) : 16;
         } else {
             // btv105 only use cross_cut method.
-            block_size_n = 64;
+            block_size_n = dense_decode_block_size_n(qkv_fp8);
         }
 
         static constexpr int fixed_overhead_num_blocks = 5;
@@ -84,8 +88,8 @@ dense_attn_decode_interface(
     TORCH_CHECK(is_sm8x);
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || (qkv_fp8 && is_sm89_or_newer()),
+                "FlashAttention only support fp16, bf16 and fp8_e4m3(newer than sm89) data type");
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
     CHECK_DEVICE(q); CHECK_DEVICE(kcache);
 
@@ -105,6 +109,8 @@ dense_attn_decode_interface(
     const int num_heads_k = kcache.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(num_heads_ori % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+    TORCH_CHECK(!qkv_fp8 || page_block_size % 64 == 0,
+                "fp8 dense decode requires page_block_size to be a multiple of 64");
 
     if (seqlen_q_ori == 1) { is_causal = false; }
 
@@ -133,14 +139,19 @@ dense_attn_decode_interface(
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "out must have the same dtype as q");
+        TORCH_CHECK((!qkv_fp8 && out.dtype() == q_dtype) || (qkv_fp8 && out.dtype() == torch::kBFloat16),
+                    "out must have the same dtype as q, unless dataType of q and kv is FP8, output dtype must be BFloat16.");
         KU_CHECK_SHAPE(out, batch_size, seqlen_q_ori, num_heads_ori, head_size_v);
         out = out.view({batch_size, seqlen_q_ori, num_heads_k, ngroups, head_size_v}).transpose(2, 3)
                 .reshape({batch_size, seqlen_q, num_heads, head_size_v});
         KU_CHECK_CONTIGUOUS(out);
         KU_CHECK_DEVICE(out);
     } else {
-        out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts);
+        if (qkv_fp8) {
+            out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(torch::kBFloat16));
+        } else {
+            out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts);
+        }
     }
     at::Tensor softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
@@ -271,6 +282,9 @@ dense_attn_decode_interface(
         run_mha_fwd_splithd_splitkv_dispatch<cutlass::half_t, 576, 512>(params, stream);
     }
     #endif
+    else if (q_dtype == torch::kFloat8_e4m3fn) {
+        run_mha_fwd_splithd_splitkv_dispatch<cutlass::float_e4m3_t, 576, 512>(params, stream);
+    }
     else {
         TORCH_CHECK(false, "Unsupported tensor dtype for query");
     }
