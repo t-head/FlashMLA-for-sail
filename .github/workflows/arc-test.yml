@@ -1,0 +1,18 @@
+# .github/workflows/arc-test.yml
+name: ARC Scaling Test
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-scaling:
+    # 关键：指定你在 values.yaml 中配置的 runnerScaleSetName
+    runs-on: k8s-runner-group
+    steps:
+      - name: Hello World
+        run: |
+          echo "我跑在 K8s 自动拉起的 Pod 里！"
+          hostname
