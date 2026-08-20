@@ -40,7 +40,7 @@ def split_list_into_groups(lst, num):
     return groups
 
 def worker(gpu_id, fa_cases, output, device, is_local, backend, args):
-    # 设置当前进程可见的 GPU
+    # Set the GPU visible to the current process
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     print(f"Process {os.getpid()} is running on GPU {gpu_id}")
     if backend == "all":
@@ -234,7 +234,7 @@ def run_fa_cycle_on_device(fa_cases, output_file, dev="gpu", run_local=False, ba
     consecutive = args.consecutive
     output_lines = list()
     # headers = ["casename","cycle","tc efficiency", "hbm efficiency", "cmd", "detail"]
-    headers = ["casename","cycles(sm__cycles_elapsed.max)","tc_pct(TensorCell效率%)","L2_hit_pct(L2命中率%)","hbm_pct(HBM带宽效率%)","inner_cycles","duration_us(gpu__time_duration.sum)","ncu_cmd","detail"]
+    headers = ["casename","cycles(sm__cycles_elapsed.max)","tc_pct(TensorCell efficiency %)","L2_hit_pct(L2 hit rate %)","hbm_pct(HBM bandwidth efficiency %)","inner_cycles","duration_us(gpu__time_duration.sum)","ncu_cmd","detail"]
     # new_row=["casename"]  metrics.get("name", [])  ["detail"]
     # output_lines.append(new_row)
     if not os.path.exists("./logs"):

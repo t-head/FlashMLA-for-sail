@@ -748,7 +748,7 @@ def convert_value(value):
             return True
         elif value.lower() == 'false':
             return False
-        # 其他情况保持字符串
+        # Keep other cases as strings
         return value
 
 def _parse_int_list(s):

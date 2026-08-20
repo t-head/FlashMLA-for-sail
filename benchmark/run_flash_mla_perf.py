@@ -57,7 +57,7 @@ if __name__ == '__main__':
         processes = []
         fa_cases_groups = split_list_into_groups(fa_cases, len(num_gpus))
         for i in range(len(num_gpus)):
-            # 创建子进程并传递 GPU ID, 在worker中循环 backend的取值
+            # Create subprocesses with GPU IDs, and iterate backend values inside worker
             p = mp.Process(target=worker, args=(num_gpus[i], fa_cases_groups[i], args.output, "ppu" if USE_PPU else "gpu", args.local, args.backend, args))
             p.start()
             processes.append(p)
