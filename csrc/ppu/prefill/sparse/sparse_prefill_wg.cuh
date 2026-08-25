@@ -1130,7 +1130,6 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
     // Wait for warpgroup 1, rescale O0, issue rO0 += rPb @ sV1L
     if constexpr (!IS_BLK0_LAST)
     {
-        NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
         wg0_rescale_rO0<T>(rO0, sScale1, rL, idx_in_warpgroup);
         dsa_warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup, wg_idx);
     }
@@ -1268,13 +1267,14 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
 
     Tensor rP1b = wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(sScale1, rO1, sM, rL, rRightBorderForQSeq, sScale0, rP1, params.sm_scale_div_log2, start_token_idx+T::kBlockN, idx_in_warpgroup);
-    NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
-    // Save rPb to sP, and issue rO1 += rP1b @ sV1R
-    // We do this after notifying warpgroup 1, since both "saving rPb to sP" and "issuing" WGMMA are high-latency operations
+    // Save rPb to sP before arriving sScale1Ready, so that sScale1Ready also guarantees
+    // that sP1 is ready for warpgroup 0's remote P V gemm (which reads sP1 after waiting
+    // sScale1Ready). rP1b is fully produced by wg1_bunch_0 above.
     if constexpr (!IS_BLK0_LAST) {
         save_rP1_to_sP<T>(rP1b, sP1, idx_in_warpgroup);
     }
+    NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
     wg1_scale0_rO1<T>(rO1, sScale0, sScale1, idx_in_warpgroup);
     if constexpr (!IS_BLK0_LAST) {
@@ -1303,9 +1303,7 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
 
     dsa_warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup, wg_idx);
 
-    if constexpr (!IS_BLK0_LAST) {
-        NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
-    }
+
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST) {
         cute::clear(rP1);
