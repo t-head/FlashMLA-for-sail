@@ -7,6 +7,7 @@
 
 #include <hggc_fp16.h>
 #include <hggc_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include <hggc_bf16.h>
 

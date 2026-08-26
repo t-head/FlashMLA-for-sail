@@ -44,8 +44,8 @@ using namespace cute;
         const char* _str = nullptr;                         \
         hgGetErrorName(_r, &_name);                         \
         hgGetErrorString(_r, &_str);                        \
-        printf("HG driver error: %s: %s\n",                \
-               (_name ? _name : "?"), (_str ? _str : "?")); \
+        TORCH_CHECK(false, "HG driver error ",            \
+        (_name ? _name : "?"), ": ", (_str ? _str : "?"));  \
     }
 
 
@@ -529,8 +529,8 @@ void printf_show_log(const void* kernel, Flash_fwd_params &params, const size_t 
 
             hggcFuncAttributes attr;
             hggcFuncGetAttributes(&attr, kernel);
-            int sm_count = get_num_sm(get_current_device());
-            if (sm_count == 64) sm_count = 20;
+            auto dprops = at::cuda::getCurrentDeviceProperties();
+            int sm_count = dprops->multiProcessorCount == 64 ? 20 : dprops->multiProcessorCount;
             printf("HeadDim:%d, HeadDimV:%d\n",Kernel_traits::kHeadDim, Kernel_traits::kHeadDimV);
             printf("blockM:%d, blockN:%d, threads:%d, params.num_splits:%d, block_size:%d\n",
                     Kernel_traits::kBlockM, Kernel_traits::kBlockN, Kernel_traits::kNThreads, params.num_splits, params.page_block_size);
@@ -564,8 +564,8 @@ void printf_prefill_show_log(const void* kernel, SparsePrefillParams &params, co
             printf("smem_size = %d, CTAs per SM = %d,", int(smem_size), ctas_per_sm);
             hggcFuncAttributes attr;
             hggcFuncGetAttributes(&attr, kernel);
-            int sm_count = get_num_sm(get_current_device());
-            if (sm_count == 64) sm_count = 20;
+            auto dprops = at::cuda::getCurrentDeviceProperties();
+            int sm_count = dprops->multiProcessorCount == 64 ? 20 : dprops->multiProcessorCount;
             printf("HeadDim:%d, HeadDimV:%d, blockM:%d, blockN:%d\n",
                     Kernel_traits::kHeadDim, Kernel_traits::kHeadDimV, Kernel_traits::kBlockM, Kernel_traits::kBlockN);
             printf("kNThreads:%d, CrossCut:%d, USE_MMA_M8:%d, kStages:%d\n",

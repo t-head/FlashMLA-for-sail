@@ -3,7 +3,9 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if !defined(__HGGCCC_RTC__)
 #include <hggc_runtime.h>
+#endif
 
 #define FLASH_DEVICE_ASSERT(cond)                                                 \
     do {                                                                          \

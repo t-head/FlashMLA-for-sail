@@ -25,7 +25,9 @@
 #include "acc_vreg_fraga.h"
 #include "ppuxx/decode/combine/combine.cuh"
 
+#ifdef __HGGCCC__
 #include <hggc_ad.h>
+#endif
 
 using namespace cute;
 using cutlass::arch::NamedBarrier;
@@ -1886,7 +1888,7 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, hggcStream_t str
         auto mla_kernel = &flash_fwd_splitkv_mla_kernel<T, Is_causal>;
         constexpr size_t smem_size = std::max(sizeof(typename T::SharedMemoryPlan), sizeof(typename T::SharedMemoryOutPut));
 
-                hggcFuncSetAttribute(mla_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+                C10_CUDA_CHECK(hggcFuncSetAttribute(mla_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
         const int num_m_block = cute::ceil_div(params.seqlen_q, T::kBlockM);
 
@@ -1901,8 +1903,12 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, hggcStream_t str
 
             hggcFuncAttributes attr;
             hggcFuncGetAttributes(&attr, mla_kernel);
-            int sm_count = get_num_sm(get_current_device());
-            if (sm_count == 64) sm_count = 20;
+            auto dprops = at::cuda::getCurrentDeviceProperties();
+
+            int sm_count = dprops->multiProcessorCount;
+            if (std::string(dprops->name).find("810E") != std::string::npos) {
+                sm_count = 20;
+            }
 
             printf("blockM:%d, blockN:%d, threads:%d, block_size:%d\n",
                     T::kBlockM, T::kBlockN, T::NUM_THREADS, params.page_block_size);

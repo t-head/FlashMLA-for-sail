@@ -34,11 +34,9 @@ void run_mha_fwd_splithd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t
     // mtp3/5 tp4/8 seq_m is 160 or 192, blockM 256 not good.
     bool warp_interleave = ((params.seqlen_q % 128 == 0) || (params.seqlen_q == 96) || (params.seqlen_q == 80) || (params.seqlen_q > 256)) && params.page_block_size == 64;
     // temp to disable warp interleave for random issue.
-    {
-        auto [cap_major, cap_minor] = get_compute_capability(get_current_device());
-        if (cap_major < 8 || (cap_major == 8 && cap_minor < 9))
-            warp_interleave = false;
-    }
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    if (std::string(dprops->name).find("610") != std::string::npos)
+        warp_interleave = false;
 
     if (!is_sm89_or_newer()) {
         if (cross_cut) {
