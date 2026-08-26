@@ -1018,8 +1018,8 @@ void run_flash_sparse_decode_fwd(Flash_fwd_params &params, hggcStream_t stream) 
         flash::printf_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size, false, true, IsFP8);
         //CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         if (smem_size >= 48 * 1024) {
-            hggcFuncSetAttribute(
-                kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+            C10_CUDA_CHECK(hggcFuncSetAttribute(
+                kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
 #ifdef __HGGCCC__
        //TODO

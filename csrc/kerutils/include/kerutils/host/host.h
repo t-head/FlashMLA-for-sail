@@ -5,14 +5,11 @@
 #pragma once
 
 #include <hggc_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "kerutils/common/common.h"
 
 static inline bool is_sm89_or_newer() {
-    int device = 0;
-    hggcGetDevice(&device);
-    int major = 0, minor = 0;
-    hggcDeviceGetAttribute(&major, hggcDevAttrComputeCapabilityMajor, device);
-    hggcDeviceGetAttribute(&minor, hggcDevAttrComputeCapabilityMinor, device);
-    return (major > 8) || (major == 8 && minor >= 9);
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    return (dprops->major > 8) || (dprops->major == 8 && dprops->minor >= 9);
 }
