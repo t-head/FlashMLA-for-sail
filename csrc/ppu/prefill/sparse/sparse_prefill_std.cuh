@@ -285,7 +285,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     // Q is loop-invariant across n_block; keep the leading QK k-steps of the Q A-operand
     // in registers so that subsequent QK GEMMs reuse them instead of reloading from smem.
     constexpr int kKeepQQkSteps = 24;
-    static_assert(kKeepQQkSteps + 1 <= decltype(size<2>(tSrQ))::value, "kKeepQQkSteps exceeds QK k-step count");
+    static_assert(kKeepQQkSteps + 1 <= decltype(size<2>(tSrQ))::value, "kKeepQQkSteps must leave at least one QK k-step streamed from smem");
 
     // These are the iterations where we don't need masking on S
     for (int n_block = 0; n_block < n_block_max; ++n_block) {
