@@ -322,18 +322,30 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
         auto tOsVt_current = kv_load_num % 2 == 0 ? tOsVt : tOsVt_double;
 
         if (warp_idx < kNWarps0) {
-            if (n_block == 0) {
-                Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
-                CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
-                #pragma unroll
-                for (int i = 0; i < kKeepQQkSteps; ++i) {
-                    cute::copy(smem_tiled_copy_Q, tSsQ(_, _, i), tSrQ_copy_view(_, _, i));
+            if constexpr (!Kernel_traits::Share_Q_K_smem) {
+                // Q and K occupy disjoint smem here, so Q is still intact at n_block == 0;
+                // stage its leading QK k-steps into registers once and reuse them below.
+                if (n_block == 0) {
+                    Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+                    CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
+                    #pragma unroll
+                    for (int i = 0; i < kKeepQQkSteps; ++i) {
+                        cute::copy(smem_tiled_copy_Q, tSsQ(_, _, i), tSrQ_copy_view(_, _, i));
+                    }
                 }
+                flash::gemm_rss<kKeepQQkSteps>(
+                    acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
+                    smem_thr_copy_Q, smem_thr_copy_K
+                );
+            } else {
+                // Q/K alias the same smem (Share_Q_K_smem): sQ has already been overwritten by
+                // the first K cp_async before the loop, and Q was staged to registers in the
+                // prologue, so keep the original QK GEMM path instead of re-reading the stale sQ.
+                flash::gemm<Kernel_traits::Is_Q_in_regs>(
+                    acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
+                    smem_thr_copy_Q, smem_thr_copy_K
+                );
             }
-            flash::gemm_rss<kKeepQQkSteps>(
-                acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
-                smem_thr_copy_Q, smem_thr_copy_K
-            );
 
             constexpr int MMA_N_S = kBlockN / decltype(typename Kernel_traits::TiledMmaS{}.template tile_size_mnk<1>())::value;
             flash::apply_indices_mask(acc_s, smem_valid_indices, (warp_idx / AtomLayoutQ) * MMA_N_S, kv_load_num % 2);
