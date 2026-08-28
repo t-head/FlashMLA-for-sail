@@ -1,8 +1,8 @@
-# FlashMLA 2.0.0 for PPU
+# FlashMLA 2.1.0 for PPU
 
 ## Introduction
 
-FlashMLA 2.0.0 is an efficient MLA kernel designed specifically for PPUs, powering the DeepSeek-V4 models.
+FlashMLA 2.1.0 is an efficient MLA kernel designed specifically for PPUs, powering the DeepSeek-V4 models.
 
 This repository contains the following implementations:
 
