@@ -92,7 +92,11 @@ sparse_attn_prefill_interface(
         (void*)max_logits.data_ptr(),
         (void*)lse.data_ptr(),
 
+#ifdef __HGGC_API_V3__
+        reinterpret_cast<hggcStream_t>(at::cuda::getCurrentCUDAStream().stream())
+#else
         at::cuda::getCurrentCUDAStream().stream()
+#endif
     };
     ppu::fmha::FmhaProfParam fmha_prof_params;
     if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){

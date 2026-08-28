@@ -19,7 +19,6 @@
 #include "traits.h"
 #include "acc_vreg_fraga.h"
 
-#include <c10/cuda/CUDAException.h>
 #include "kernel_traits.h"
 #include "utils.h"
 #include "kerutils/device/ppu/softmax.cuh"

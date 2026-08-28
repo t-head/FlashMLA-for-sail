@@ -97,6 +97,29 @@ def main(loops=1):
         for attn_sink in [False, True]
     ]
 
+    # TP16 production contract: eight query heads per rank.  These cases keep
+    # the dedicated M8 path covered across both head dimensions, a partial
+    # top-k tail, and the optional per-row top-k length input.
+    correctness_cases_hq8 = [
+        TestParam(
+            s_q,
+            s_kv,
+            topk,
+            h_q=8,
+            num_runs=0,
+            d_qk=d_qk,
+            have_topk_length=have_topk_length,
+        )
+        for d_qk in [512, 576]
+        for s_q, s_kv, topk in [
+            (1, 128, 128),
+            (62, 1840, 256),
+            (274, 1592, 384),
+            (4096, 65536, 1024),
+        ]
+        for have_topk_length in [False, True]
+    ]
+
     correctness_cases_with_features = [
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, have_attn_sink=have_attn_sink, have_topk_length=have_topk_length, d_qk=d_qk)
         for d_qk in [512, 576]
@@ -168,7 +191,7 @@ def main(loops=1):
         for s_kv in s_kv_list
     ]
 
-    testcases = correctness_cases + correctness_cases_with_features + corner_cases + performance_cases
+    testcases = correctness_cases + correctness_cases_hq8 + correctness_cases_with_features + corner_cases + performance_cases
     # testcases = first_case
 
     is_no_cooldown = lib.is_no_cooldown()
@@ -207,4 +230,3 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     main(int(args.loops))
-

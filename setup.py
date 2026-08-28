@@ -14,12 +14,22 @@ from torch.utils.cpp_extension import (
 DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") == "TRUE"
 ENABLE_C_DECODE_SPARSE = os.getenv("FLASHMLA_C_ENABLE_DECODE_SPARSE", "TRUE") == "TRUE"
 CPP_INFERENCE = 'FLASH_MLA_CPP_INFER_BUILD' in os.environ.keys() and os.environ['FLASH_MLA_CPP_INFER_BUILD'] == "1"
+HGGC_API_V3 = os.getenv("FLASH_MLA_HGGC_API_V3", "FALSE") == "TRUE"
+PREFILL_ONLY_BUILD = os.getenv("FLASH_MLA_PREFILL_ONLY_BUILD", "FALSE") == "TRUE"
 
 def append_hgcc_threads(hgcc_extra_args):
     hgcc_threads = os.getenv("NVCC_THREADS") or "32"
     return hgcc_extra_args + ["--threads", hgcc_threads]
 
 def get_sources():
+    if PREFILL_ONLY_BUILD:
+        return [
+            "csrc/api/sparse_prefill_only.cpp",
+            "csrc/ppu/prefill/sparse/instantiations/dispatch_bf16.cu",
+            "csrc/ppu/prefill/sparse/instantiations/wg_bf16_sm80.cu",
+            "csrc/ppu/prefill/sparse/instantiations/wg_bf16_sm89.cu",
+        ]
+
     sources = [
         "csrc/api/api.cpp",
         "csrc/ppu/decode/dense/instantiations/hdim576_512_bf16.cu",
@@ -51,6 +61,13 @@ def get_features_args():
         features_args.append("-DFLASHMLA_C_ENABLE_DECODE_SPARSE")
     if CPP_INFERENCE:
         features_args.append("-DFLASH_MLA_CPP_INFER_BUILD")
+    if HGGC_API_V3:
+        # PPU SDK 2.1's CUDA compatibility shim and Torch expose the v3
+        # runtime types.  The proxy headers otherwise default to v2, which
+        # produces duplicate half/bfloat16 definitions and incompatible
+        # stream types.  Keep this opt-in so older SDK builds are unchanged.
+        features_args.append("-D__HGGC_API_V3__")
+        features_args.append("-DSWITCH_TO_HGGCRT")
     features_args.append("-DFLASH_MLA_STANDALONE_BUILD")
     features_args.append("-DUSE_TS")
 

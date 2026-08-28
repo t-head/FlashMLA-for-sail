@@ -12,9 +12,6 @@
 #include <hggc_fp16.h>
 #include <hggc_bf16.h>
 
-#include <c10/cuda/CUDAException.h>
-#include <ATen/cuda/CUDAContext.h>
-
 #include <cute/tensor.hpp>
 
 #include <cutlass/array.h>
