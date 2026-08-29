@@ -11,6 +11,7 @@ ENABLE_C_DECODE_SPARSE = (
     os.getenv("FLASHMLA_C_ENABLE_DECODE_SPARSE", "TRUE") == "TRUE"
 )
 CPP_INFERENCE = os.getenv("FLASH_MLA_CPP_INFER_BUILD") == "1"
+SPARSE_PREFILL_ONLY = os.getenv("FLASH_MLA_SPARSE_PREFILL_ONLY") == "1"
 
 
 def append_hgcc_threads(hgcc_extra_args):
@@ -19,6 +20,11 @@ def append_hgcc_threads(hgcc_extra_args):
 
 
 def get_sources():
+    if SPARSE_PREFILL_ONLY:
+        return [
+            "csrc/sparse_prefill_api.cpp",
+            "csrc/flash_fwd_sparse_prefill_hdim576_512_bf16_sm80.cu",
+        ]
     sources = [
         "csrc/flash_api.cpp",
         "csrc/flash_fwd_split_hdim576_512_bf16_sm80.cu",
@@ -41,6 +47,8 @@ def get_features_args():
         features_args.append("-DFLASHMLA_C_ENABLE_DECODE_SPARSE")
     if CPP_INFERENCE:
         features_args.append("-DFLASH_MLA_CPP_INFER_BUILD")
+    if SPARSE_PREFILL_ONLY:
+        features_args.append("-DFLASH_MLA_SPARSE_PREFILL_ONLY")
     features_args.extend(["-DFLASH_MLA_STANDALONE_BUILD", "-DUSE_TS"])
     return features_args
 

@@ -15,6 +15,9 @@
 #include "flash_splitkv/splitkv_dsa.h"
 
 #include <hggc_ad.h>
+#if defined(FLASH_MLA_SPARSE_PREFILL_ONLY)
+#include <cuda_ad.h>
+#endif
 #include "utils.h"
 
 
@@ -99,13 +102,13 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     // FLASH_ASSERT(params.page_block_size % Kernel_traits::kBlockN == 0);
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal, CrossCut>;
+        const void *flash_func = reinterpret_cast<const void*>(kernel);
         if (smem_size >= 48 * 1024) {
             hggcFuncSetAttribute(
-                kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+                flash_func, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
         }
-        printf_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size, Is_causal);
+        printf_show_log<Kernel_traits>(flash_func, params, smem_size, Is_causal);
 #ifdef __HGGCCC__
-        const void *flash_func = reinterpret_cast<const void*>(kernel);
         HGfunction func = static_cast<HGfunction>(NULL);
         hggcGetFuncBySymbol(reinterpret_cast<hggcFunction_t*>(&func), flash_func);
 
@@ -276,15 +279,39 @@ void run_flash_sparse_prefill_fwd(SparsePrefillParams &params) {
     const int num_m_block = params.s_q*cute::ceil_div(params.h_q, Kernel_traits::kBlockM);
 
     auto kernel = &flash::flash_sparse_prefill_fwd_kernel<Kernel_traits, HAVE_TOPK_LENGTH>;
-    printf_prefill_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size);
-    CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+#if defined(FLASH_MLA_SPARSE_PREFILL_ONLY)
+    // PPU sparse prefill uses the AD launch contract.  A conventional CUDA
+    // triple-chevron launch registers correctly but is rejected by the 2.1.0
+    // runtime with cudaErrorNotSupported.
+    const void *flash_func = reinterpret_cast<const void *>(kernel);
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        flash_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    cudaFunction_t runtime_func = nullptr;
+    C10_CUDA_CHECK(cudaGetFuncBySymbol(&runtime_func, flash_func));
+    void *kernel_args[] = {&params};
+    CUlaunchAttributeAD launch_attr = {CUAD_LAUNCH_ATTRIBUTE_IGNORE};
+    CUlaunchConfigAD launch_config = {
+        static_cast<unsigned int>(num_m_block), 1, 1,
+        static_cast<unsigned int>(Kernel_traits::kNThreads), 1, 1,
+        static_cast<unsigned int>(smem_size),
+        reinterpret_cast<CUstream>(params.stream), &launch_attr, 0};
+    CUresult launch_status = cuLaunchKernelExAD(
+        &launch_config, reinterpret_cast<CUfunction>(runtime_func),
+        kernel_args, nullptr);
+    TORCH_CHECK(
+        launch_status == CUDA_SUCCESS,
+        "cuLaunchKernelExAD failed with status ", static_cast<int>(launch_status));
+#else
+    const void *flash_func = reinterpret_cast<const void*>(kernel);
+    printf_prefill_show_log<Kernel_traits>(flash_func, params, smem_size);
+    CHECK_CUDA(hggcFuncSetAttribute(flash_func, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     if (smem_size >= 48 * 1024) {
         hggcFuncSetAttribute(
-            kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+            flash_func, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     }
 #ifdef __HGGCCC__
        //TODO
-        const void *flash_func = reinterpret_cast<const void*>(kernel);
         HGfunction func = static_cast<HGfunction>(NULL);
         hggcGetFuncBySymbol(reinterpret_cast<hggcFunction_t*>(&func), flash_func);
 
@@ -296,6 +323,7 @@ void run_flash_sparse_prefill_fwd(SparsePrefillParams &params) {
         kernel<<<dim3(num_m_block, 1, 1), Kernel_traits::kNThreads, smem_size, params.stream>>>(params);
 #endif
     CHECK_CUDA_KERNEL_LAUNCH();
+#endif
 }
 
 template<typename T>
@@ -310,6 +338,7 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
     FLASH_ASSERT(params.topk > 0);
     // FLASH_ASSERT(params.h_q % B_H == 0);
 
+#if !defined(FLASH_MLA_SPARSE_PREFILL_ONLY)
     if (!is_sm89_or_newer()) {
         bool warp_interleave = (params.d_qk == 576) && ((params.s_q % 128 == 0) || (params.s_q > 256)) && (params.h_q == 128)
             && (params.s_kv >= params.topk) && !params.attn_sink && !params.topk_length;
@@ -318,6 +347,7 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
             return;
         }
     }
+#endif
 
     constexpr bool USE_MMA_M8 = 0;
     constexpr static int kBlockN = 64;
@@ -350,15 +380,15 @@ void run_flash_sparse_decode_fwd(Flash_fwd_params &params, hggcStream_t stream) 
     const int num_m_block = (params.seqlen_q / params.ngroups) * cute::ceil_div(params.ngroups, Kernel_traits::kBlockM);
 
         auto kernel = &flash::flash_sparse_decode_fwd_kernel<Kernel_traits, IsFP8>;
-        printf_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size, false, true, IsFP8);
+        const void *flash_func = reinterpret_cast<const void*>(kernel);
+        printf_show_log<Kernel_traits>(flash_func, params, smem_size, false, true, IsFP8);
         //CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         if (smem_size >= 48 * 1024) {
             hggcFuncSetAttribute(
-                kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+                flash_func, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
         }
 #ifdef __HGGCCC__
        //TODO
-        const void *flash_func = reinterpret_cast<const void*>(kernel);
         HGfunction func = static_cast<HGfunction>(NULL);
         hggcGetFuncBySymbol(reinterpret_cast<hggcFunction_t*>(&func), flash_func);
 
