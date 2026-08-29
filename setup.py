@@ -94,6 +94,20 @@ hgcc_args = append_hgcc_threads(
     + arch_flags
 )
 
+include_dirs = [
+    Path(this_dir) / "csrc",
+    Path(this_dir) / "csrc" / "actlize" / "include",
+]
+
+# Some runtime images split the compiler-owned CUDA/HGGC headers across
+# CUDA_SDK/targets and PPU_SDK/targets.  Adding the entire latter tree changes
+# which hggc_runtime.h nvcc force-includes and creates CUDA/HGGC math-header
+# conflicts.  A builder may instead provide a narrow compatibility directory
+# containing only the missing HGGC datatype headers.
+hggc_shim_include = os.getenv("FLASH_MLA_HGGC_SHIM_INCLUDE")
+if hggc_shim_include:
+    include_dirs.append(Path(hggc_shim_include))
+
 
 ext_modules = [
     CUDAExtension(
@@ -103,10 +117,7 @@ ext_modules = [
             "cxx": cxx_args + get_features_args(),
             "nvcc": hgcc_args + get_features_args(),
         },
-        include_dirs=[
-            Path(this_dir) / "csrc",
-            Path(this_dir) / "csrc" / "actlize" / "include",
-        ],
+        include_dirs=include_dirs,
     )
 ]
 
