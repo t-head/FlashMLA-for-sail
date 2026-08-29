@@ -245,6 +245,8 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const Flash_fwd_params params) {
             }
         }
 
+        hggcTriggerProgrammaticLaunchCompletion();
+        
         const int q_seq_idx = m_block_idx*BLOCK_SIZE_M + warp_idx;
         const int k_head_idx = q_seq_idx / params.seqlen_q;
         auto o_ptr = reinterpret_cast<ElementT *>(params.o_ptr) + batch_idx*params.o_batch_stride + k_head_idx*params.o_head_stride + (q_seq_idx%params.seqlen_q)*params.o_row_stride;
