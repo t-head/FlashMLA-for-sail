@@ -46,7 +46,6 @@ def get_features_args():
 
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-ppu_sdk = Path(os.getenv("PPU_SDK", "/usr/local/PPU_SDK"))
 dir_actlize = os.path.join(this_dir, "csrc", "actlize")
 if not os.path.exists(dir_actlize):
     repo_actlize = os.path.join(os.path.dirname(this_dir), "actlize")
@@ -107,7 +106,6 @@ ext_modules = [
         include_dirs=[
             Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "actlize" / "include",
-            ppu_sdk / "targets" / "x86_64-linux" / "include",
         ],
     )
 ]
