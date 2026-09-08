@@ -1,6 +1,7 @@
 name: "PPU Board Verification (t-head)"
 
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       test_scenario:
@@ -26,6 +27,7 @@ jobs:
   single-card-890p:
     if: >-
       ${{
+        inputs.test_scenario == '' ||
         inputs.test_scenario == 'all' ||
         inputs.test_scenario == '890p-only' ||
         inputs.test_scenario == 'single-card'
@@ -60,6 +62,7 @@ jobs:
   multi-card-890p:
     if: >-
       ${{
+        inputs.test_scenario == '' ||
         inputs.test_scenario == 'all' ||
         inputs.test_scenario == '890p-only' ||
         inputs.test_scenario == 'multi-card'
@@ -95,6 +98,7 @@ jobs:
   multi-node-890p:
     if: >-
       ${{
+        inputs.test_scenario == '' ||
         inputs.test_scenario == 'all' ||
         inputs.test_scenario == '890p-only' ||
         inputs.test_scenario == 'multi-node'
@@ -133,6 +137,7 @@ jobs:
   single-card-810e:
     if: >-
       ${{
+        inputs.test_scenario == '' ||
         inputs.test_scenario == 'all' ||
         inputs.test_scenario == '810e-only' ||
         inputs.test_scenario == 'single-card'
@@ -167,6 +172,7 @@ jobs:
   multi-card-810e:
     if: >-
       ${{
+        inputs.test_scenario == '' ||
         inputs.test_scenario == 'all' ||
         inputs.test_scenario == '810e-only' ||
         inputs.test_scenario == 'multi-card'
