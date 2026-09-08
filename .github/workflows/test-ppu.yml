@@ -32,7 +32,7 @@ jobs:
         inputs.test_scenario == '890p-only' ||
         inputs.test_scenario == 'single-card'
       }}
-    runs-on: [self-hosted, k8s-runner-group-cpu-thead]
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     steps:
@@ -67,7 +67,7 @@ jobs:
         inputs.test_scenario == '890p-only' ||
         inputs.test_scenario == 'multi-card'
       }}
-    runs-on: [self-hosted, k8s-runner-group-cpu-thead]
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     steps:
@@ -103,7 +103,7 @@ jobs:
         inputs.test_scenario == '890p-only' ||
         inputs.test_scenario == 'multi-node'
       }}
-    runs-on: [self-hosted, k8s-runner-group-cpu-thead]
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     steps:
@@ -142,7 +142,7 @@ jobs:
         inputs.test_scenario == '810e-only' ||
         inputs.test_scenario == 'single-card'
       }}
-    runs-on: [self-hosted, k8s-runner-group-cpu-thead]
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     steps:
@@ -177,7 +177,7 @@ jobs:
         inputs.test_scenario == '810e-only' ||
         inputs.test_scenario == 'multi-card'
       }}
-    runs-on: [self-hosted, k8s-runner-group-cpu-thead]
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     steps:
