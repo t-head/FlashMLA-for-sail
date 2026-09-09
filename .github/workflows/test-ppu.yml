@@ -39,7 +39,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: "890P 单卡验证 (1 PPU)"
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: t-head/ppu-scheduler-action@main
         with:
           nnodes: 0
           nproc_per_node: 1
@@ -74,7 +74,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: "890P 多卡验证 (8 PPU)"
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: t-head/ppu-scheduler-action@main
         with:
           nnodes: 0
           nproc_per_node: 8
@@ -110,7 +110,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: "890P 多机验证 (2 nodes × 8 PPU)"
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: t-head/ppu-scheduler-action@main
         with:
           nnodes: 2
           nproc_per_node: 8
@@ -149,7 +149,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: "810E 单卡验证 (1 PPU)"
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: t-head/ppu-scheduler-action@main
         with:
           nnodes: 0
           nproc_per_node: 1
@@ -184,7 +184,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: "810E 多卡验证 (8 PPU)"
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: t-head/ppu-scheduler-action@main
         with:
           nnodes: 0
           nproc_per_node: 8
