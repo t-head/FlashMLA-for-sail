@@ -1045,27 +1045,14 @@ void run_flash_sparse_decode_fwd(Flash_fwd_params &params, hggcStream_t stream) 
 #endif
     CHECK_CUDA_KERNEL_LAUNCH();
 
-    dim3 grid_combine(params.b * params.h * params.seqlen_q);
-    MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, kMaxSplits, [&] {
-        auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel<Kernel_traits, kMaxSplits>;
-#ifdef __HGGCCC__
-        const void *flash_func = reinterpret_cast<const void*>(combine_kernel);
-        HGfunction func = static_cast<HGfunction>(NULL);
-        hggcGetFuncBySymbol(reinterpret_cast<hggcFunction_t*>(&func), flash_func);
-
-        void* kernel_args[] = {&params};
-        HGlaunchAttributeAD LaunchAttr = {HGAD_LAUNCH_ATTRIBUTE_IGNORE}; //HGAD_LAUNCH_ATTRIBUTE_SCHED_PREFERENCE
-        HGlaunchConfigAD LaunchCfg = {grid_combine.x, grid_combine.y, grid_combine.z, 128, 1, 1, 0, stream, &LaunchAttr, 0};
-        // LaunchAttr.value.schedPreference.blocksPerMultiprocessor = 1;//schedule.bits.tb_per_cu;
-        // LaunchAttr.value.schedPreference.gridStepX = 2;
-        // LaunchAttr.value.schedPreference.gridStepY = 2;
-        // LaunchAttr.value.schedPreference.flags = 2;
-        CUDA_DRIVER_CHECK(hgLaunchKernelExAD(&LaunchCfg, func, kernel_args, nullptr));
-#else
-        combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
-#endif
-    });
-    CHECK_CUDA_KERNEL_LAUNCH();
+    // Reuse the warp-per-q-seq combine kernel that the warp-group decode path uses:
+    // one CTA handles BLOCK_SIZE_M q-seqs instead of one CTA per q-seq, which shrinks
+    // the combine grid by BLOCK_SIZE_M (dominant cost at large batch / MTP s_q).
+    // The splitkv epilogue (kerutils softmax.cuh normalize_softmax_lse_per_warp)
+    // stores LSE in natural log, hence lse_in_log2=false.
+    // InputT (not Element) is required here: this is host code and
+    // Kernel_traits::Element resolves to half_t on the host pass.
+    run_flash_mla_combine_kernel<typename Kernel_traits::InputT>(params, stream, /*lse_in_log2=*/false);
 }
 
 template<typename T, bool IsFP8, int Headdim, int Headdim_V>

@@ -113,6 +113,12 @@ template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_r
          int kBlockNPagedPerAiuLoad_ = kBlockN_, int kStages_ = 2, int kNWarps0_ = kNWarps_, bool page_pow2_ = false,
          bool CvtGemm0SwzlLd_ = false, typename Base=Flash_kernel_traits<USE_MMA_M8_, elem_type>>
 struct Flash_fwd_kernel_traits : public Base {
+    // Base::Element degrades to cutlass::half_t when the device-arch macro is
+    // undefined, which is the case during the host pass.  Host code that needs the
+    // real input type (e.g. to pick a kernel instantiation to launch) must use
+    // InputT, otherwise host and device disagree and a half_t kernel gets launched
+    // on a bf16 tensor.
+    using InputT = elem_type;
     using Element = typename Base::Element;
     using ElementAccum = typename Base::ElementAccum;
     using index_t = typename Base::index_t;

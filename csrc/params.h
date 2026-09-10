@@ -71,6 +71,7 @@ struct Flash_fwd_params {
 
     void *__restrict__ softmax_lseaccum_ptr;
     void *__restrict__ oaccum_ptr;
+    float lse_to_log2 = 1.0f;  // 1.0f if softmax_lseaccum_ptr holds log2, M_LOG2E if natural log
 
     // For Holmes-LLM
     int64_t *__restrict__ hllm_block_table;

@@ -54,11 +54,15 @@ flash_fwd_mla_combine_kernel_small_size(__grid_constant__ const Flash_fwd_params
     int warp_idx = cutlass::canonical_warp_idx_sync();
     if (warp_idx == 0) {
         constexpr int kNLsePerThread = cute::ceil_div(kMaxSplits, 32);
+        // The warp-group decode epilogue stores LSE in log2 domain, the splitkv
+        // epilogue (normalize_softmax_lse_per_warp) stores it in natural log.
+        // All math below is done in log2, so convert on load.
+        const float kLseToLog2 = params.lse_to_log2;
 
         float local_lse[kNLsePerThread];
         for (int i = 0; i < kNLsePerThread; ++i) {
             const int split = i * 32 + tidx;
-            local_lse[i] = split < actual_num_splits ? gLSEaccum(split) : -INFINITY;
+            local_lse[i] = split < actual_num_splits ? gLSEaccum(split) * kLseToLog2 : -INFINITY;
         }
 
         float max_lse = -INFINITY;
@@ -203,12 +207,14 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const Flash_fwd_params params) {
     float my_global_lse;  // visible to both LSE reduction and O accumulation
     {
         constexpr int NUM_LSE_PER_THREAD = cute::ceil_div(MAX_SPLITS, 32);
+        // See flash_fwd_mla_combine_kernel_small_size: convert natural-log LSE to log2.
+        const float kLseToLog2 = params.lse_to_log2;
 
         float local_lse[NUM_LSE_PER_THREAD];
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < NUM_LSE_PER_THREAD; ++i) {
             const int split_idx = i*32 + lane_idx;
-            local_lse[i] = split_idx < my_num_splits ? sLseScale(warp_idx, split_idx) : -INFINITY;
+            local_lse[i] = split_idx < my_num_splits ? sLseScale(warp_idx, split_idx) * kLseToLog2 : -INFINITY;
         }
 
         float max_lse = -INFINITY;
@@ -419,7 +425,10 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_params pa
 
 
 template<typename ElementT>
-void run_flash_mla_combine_kernel(Flash_fwd_mla_params &params, hggcStream_t stream) {
+void run_flash_mla_combine_kernel(Flash_fwd_mla_params &params, hggcStream_t stream, bool lse_in_log2) {
+    // lse_in_log2 tells which log domain softmax_lseaccum_ptr holds: the warp-group
+    // decode epilogue writes log2, the splitkv epilogue writes natural log.
+    params.lse_to_log2 = lse_in_log2 ? 1.0f : (float)M_LOG2E;
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
         if (params.b <= 2) {
             // small input use one block per head
