@@ -575,7 +575,8 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
     // Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
     Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK)));
 
-    auto smem_tiled_copy_S = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
+    auto smem_tiled_copy_S = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{},
+                                               typename Kernel_traits::TiledMmaSPStore{});
     auto smem_thr_copy_S = smem_tiled_copy_S.get_thread_slice(tidx);
     Tensor tSsS = smem_thr_copy_S.partition_D(sP);
 
@@ -882,18 +883,22 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
             softmax.template softmax_rescale_o(acc_o, smem_row_scale);
         }
 
-        if (!have_zero_seqlen_k)
-        if (masking_step == 0 && CvtGemm0SwzlLd) {
-            // FIXME: to avoid cute::clear(sK)
-            flash::gemm_pv_offset(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
-                smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V, remain_k_offset);
-        } else {
-        (CvtGemm0SwzlLd || PageLargerThankBlockN)
-            ? flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num),
-                 tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V)
-            : flash::gemm_pagedkv<kBlockNPagedPerAiuLoad, kBlockNPagedPerAiuLoad*kHeadDim, 0>(
-                acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
-                smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V);
+        if (!have_zero_seqlen_k) {
+            if constexpr (Kernel_traits::QKV_FP8) {
+                flash::gemm_pv_fp8_vdirect<Kernel_traits>(acc_o, tOrP, tOrVt, tOsP,
+                    sK.data().get(), kv_load_num, tiled_mma_o, smem_tiled_copy_P, smem_thr_copy_P);
+            } else if (masking_step == 0 && CvtGemm0SwzlLd) {
+                // FIXME: to avoid cute::clear(sK)
+                flash::gemm_pv_offset(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
+                    smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V, remain_k_offset);
+            } else {
+                (CvtGemm0SwzlLd || PageLargerThankBlockN)
+                    ? flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num),
+                         tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V)
+                    : flash::gemm_pagedkv<kBlockNPagedPerAiuLoad, kBlockNPagedPerAiuLoad*kHeadDim, 0>(
+                        acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
+                        smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V);
+            }
         }
         kv_load_num = kv_load_num < kStages -1 ? kv_load_num + 1 : 0;
 
@@ -936,12 +941,17 @@ __forceinline__ __device__ void compute_attn_cross_cut_splitkv(const Params &par
         //                  + (bidh / params.h_h_k_ratio) * params.k_head_stride;
 
         softmax.template softmax_rescale_o(acc_o, smem_row_scale);
-        (CvtGemm0SwzlLd || PageLargerThankBlockN)
-            ? flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
-                smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V)
-            : flash::gemm_pagedkv<kBlockNPagedPerAiuLoad, kBlockNPagedPerAiuLoad*kHeadDim, 0>(
-                acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
-                smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V);
+        if constexpr (Kernel_traits::QKV_FP8) {
+            flash::gemm_pv_fp8_vdirect<Kernel_traits>(acc_o, tOrP, tOrVt, tOsP,
+                sK.data().get(), kv_load_num, tiled_mma_o, smem_tiled_copy_P, smem_thr_copy_P);
+        } else {
+            (CvtGemm0SwzlLd || PageLargerThankBlockN)
+                ? flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
+                    smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V)
+                : flash::gemm_pagedkv<kBlockNPagedPerAiuLoad, kBlockNPagedPerAiuLoad*kHeadDim, 0>(
+                    acc_o, tOrP, tOrVt, tOsP, tOsVt(_, _, _, kv_load_num), tiled_mma_o,
+                    smem_tiled_copy_P, smem_tiled_copy_V, smem_thr_copy_P, smem_thr_copy_V);
+        }
 
         // FIXME: row_offset_k_nxt move here to avoid Stall Memory Dependency
         block_table_offset_nxt = (n_block - kStages) * kBlockN - block_table_idx_nxt * page_block_size;

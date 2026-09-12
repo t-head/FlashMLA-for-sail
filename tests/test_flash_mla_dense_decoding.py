@@ -142,13 +142,17 @@ def reference_torch(
 
 
 @torch.inference_mode()
-def test_flash_mla(t: TestParam):
+def test_flash_mla(t: TestParam, qkv_fp8: bool = False):
     print('-------------------------------')
     print(f"Running on {t}...")
 
     # Generating test data
     torch.cuda.synchronize()
     cache_seqlens, q, block_table, blocked_k, = generate_test_data(t)
+
+    if qkv_fp8:
+        q = q.float().to(torch.float8_e4m3fn)
+        blocked_k = blocked_k.float().to(torch.float8_e4m3fn)
 
     tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata()
 
@@ -165,10 +169,22 @@ def test_flash_mla(t: TestParam):
         )
 
     out_ans, lse_ans = run_flash_mla()
-    out_ref, lse_ref = reference_torch(cache_seqlens, block_table, q, blocked_k, t.dv, t.is_causal)
+    # For fp8 the reference runs on the de-quantized inputs.
+    q_ref = q.float() if qkv_fp8 else q
+    blocked_k_ref = blocked_k.float() if qkv_fp8 else blocked_k
+    out_ref, lse_ref = reference_torch(cache_seqlens, block_table, q_ref, blocked_k_ref, t.dv, t.is_causal)
+    if qkv_fp8:
+        out_ref = out_ref.to(out_ans.dtype)
+
+    if qkv_fp8:
+        out_tol = dict(abs_tol=2e-2, rel_tol=5e-2, cos_diff_tol=1e-3)
+        lse_tol = dict(abs_tol=5e-3, rel_tol=1e-3, cos_diff_tol=1e-6)
+    else:
+        out_tol = dict(abs_tol=8e-4, rel_tol=2.01 / 128, cos_diff_tol=5e-6)
+        lse_tol = dict(abs_tol=1e-6, rel_tol=8.01 / 65536)
     is_correct = True
-    is_correct &= kk.check_is_allclose("out", out_ans, out_ref, abs_tol=8e-4, rel_tol=2.01 / 128, cos_diff_tol=5e-6)
-    is_correct &= kk.check_is_allclose("lse", lse_ans, lse_ref, abs_tol=1e-6, rel_tol=8.01 / 65536)
+    is_correct &= kk.check_is_allclose("out", out_ans, out_ref, **out_tol)
+    is_correct &= kk.check_is_allclose("lse", lse_ans, lse_ref, **lse_tol)
     assert is_correct
 
     if t.test_performance:
@@ -179,12 +195,13 @@ def test_flash_mla(t: TestParam):
             2 * t.d * mean_attended_seqlens,   # Q * K^T
             2 * mean_attended_seqlens * t.dv,  # attention * V
         ])
-        q_elem_size = torch.bfloat16.itemsize
-        kv_token_size = t.d * torch.bfloat16.itemsize
+        q_elem_size = q.element_size()
+        kv_token_size = t.d * blocked_k.element_size()
+        out_elem_size = out_ans.element_size()
         memory_volume_B = t.b * sum([
             t.s_q * t.h_q * (t.d * q_elem_size),    # Q
             mean_attended_seqlens * t.h_kv * kv_token_size,    # K/V
-            t.s_q * t.h_q * (t.dv * q_elem_size),   # Output
+            t.s_q * t.h_q * (t.dv * out_elem_size),   # Output
         ])
         achieved_tflops = compute_volume_flop / time_usage / 1e12
         achieved_gBps = memory_volume_B / time_usage / 1e9
@@ -192,7 +209,7 @@ def test_flash_mla(t: TestParam):
         print(f"{time_usage * 1000:.3f} ms, {achieved_tflops:.0f} TFLOPS, {achieved_gBps:.0f} GB/s")
 
 
-def main(torch_dtype, loops=1):
+def main(torch_dtype, loops=1, qkv_fp8: bool = False):
     device = torch.device("cuda:0")
     torch.set_default_dtype(torch_dtype)
     torch.set_default_device(device)
@@ -200,6 +217,9 @@ def main(torch_dtype, loops=1):
 
     cc_major, cc_minor = torch.cuda.get_device_capability()
     # assert cc_major == 9, "Dense MLA decoding is only supported on sm90 (Hopper) currently."
+
+    # fp8 dense decode requires page_block_size to be a multiple of 64
+    block_sizes = [64, 256] if qkv_fp8 else [16, 64, 256]
 
     correctness_cases = [
         TestParam(b, s_q, s_k, is_varlen, is_causal, test_performance=False, have_zero_seqlen_k=False, block_size=block_size, h_q=h_q, h_kv=h_kv)
@@ -210,7 +230,7 @@ def main(torch_dtype, loops=1):
         for h_kv in [1, 2, 3, 8]
         for is_varlen in [False, True]
         for is_causal in [False, True]
-        for block_size in [16, 64, 256]
+        for block_size in block_sizes
         if h_q % h_kv == 0
     ]
 
@@ -233,9 +253,9 @@ def main(torch_dtype, loops=1):
     testcases = correctness_cases + corner_cases + performance_cases
 
     for i in range(loops):
-        print(f'LOOP ROUND {i} START:')
+        print(f'LOOP ROUND {i} START (dtype={"fp8_e4m3" if qkv_fp8 else torch_dtype}):')
         for testcase in testcases:
-            test_flash_mla(testcase)
+            test_flash_mla(testcase, qkv_fp8)
         print(f'LOOP ROUND {i} FINISH')
 
 
@@ -244,9 +264,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["bf16", "fp16"],
+        choices=["bf16", "fp16", "fp8"],
         default="bf16",
-        help="Data type to use for testing (bf16 or fp16)",
+        help="Data type to use for testing (bf16, fp16, or fp8: q and kvcache are quantized to fp8_e4m3, output is bf16)",
     )
 
     parser.add_argument(
@@ -259,7 +279,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     torch_dtype = torch.bfloat16
+    qkv_fp8 = False
     if args.dtype == "fp16":
         torch_dtype = torch.float16
+    elif args.dtype == "fp8":
+        # Data is generated in bf16 and cast to fp8_e4m3 per case
+        qkv_fp8 = True
 
-    main(torch_dtype, int(args.loops))
+    main(torch_dtype, int(args.loops), qkv_fp8)

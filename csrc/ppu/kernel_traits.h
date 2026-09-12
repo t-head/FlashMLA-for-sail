@@ -20,6 +20,31 @@
 
 #ifdef USE_PPU
 #include "ppu/ppu_include.hpp"
+#if ACOMPUTE_VERSION >= 10500
+namespace cute {
+
+// fp8 V-direct store-only twins of the PPU1.5 atoms: same fragments, only the
+// C coordinate map permuted. It reads (thr=(q4,g8), val=(v0,v1,v2)) -> m+16n
+// with m = g+8v1, n: v0+2q+8v2 -> 4q+v0+2v2 (see gemm_pv_fp8_vdirect).
+using PPU0015_EpiPermCLayout = Layout<Shape <Shape < _4,_8>,Shape < _2,_2,_2>>,
+                                      Stride<Stride<_64,_1>,Stride<_16,_8,_32>>>;
+
+struct PPU0015_16x16x32_F32E4M3E4M3F32_TN_EpiPerm : PPU0015_16x16x32_F32E4M3E4M3F32_TN {};
+template <>
+struct MMA_Traits<PPU0015_16x16x32_F32E4M3E4M3F32_TN_EpiPerm>
+    : MMA_Traits<PPU0015_16x16x32_F32E4M3E4M3F32_TN> {
+    using CLayout = PPU0015_EpiPermCLayout;
+};
+
+struct PPU0015_16x16x16_F32BF16BF16F32_TN_EpiPerm : PPU0015_16x16x16_F32BF16BF16F32_TN {};
+template <>
+struct MMA_Traits<PPU0015_16x16x16_F32BF16BF16F32_TN_EpiPerm>
+    : MMA_Traits<PPU0015_16x16x16_F32BF16BF16F32_TN> {
+    using CLayout = PPU0015_EpiPermCLayout;
+};
+
+} // namespace cute
+#endif // ACOMPUTE_VERSION >= 10500
 #endif
 
 #if !USE_AIU
@@ -228,10 +253,29 @@ struct Flash_fwd_kernel_traits : public Base {
         Tile<Int<MMA_ATOM_M * AtomLayoutQ>, Int<16 * kNWarps0/AtomLayoutQ>, Int<QKV_FP8 ? 32 : 16>>>;
 
     /// The second gemm in CrossCut; gemm in !CrossCut ///
+    /// fp8 V-direct: pair-blocked N mode, each warp owns the adjacent tile pair
+    /// {2np, 2np+1}; needs even per-warp n-tiles (static_asserted in gemm_pv_fp8_vdirect).
+    using TiledMmaNMode = std::conditional_t<QKV_FP8,
+        Layout<Shape<_16, Int<kNWarps/AtomLayoutP>, _2>, Stride<_1, _32, _16>>,
+        Int<16 * kNWarps/AtomLayoutP>>;
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<AtomLayoutP>, Int<kNWarps/AtomLayoutP>, _1>>,
-        Tile<Int<MMA_ATOM_M * AtomLayoutP>, Int<16 * kNWarps/AtomLayoutP>, Int<QKV_FP8 ? 32 : 16>>>;
+        Tile<Int<MMA_ATOM_M * AtomLayoutP>, TiledMmaNMode, Int<QKV_FP8 ? 32 : 16>>>;
+
+    /// fp8 V-direct store-only twin of TiledMmaS: EpiPerm CLayout for the pi_k
+    /// sP order (see gemm_pv_fp8_vdirect); aliases TiledMmaS on non-fp8/ppu0015 configs.
+#if defined(USE_PPU) && ACOMPUTE_VERSION >= 10500
+    using TiledMmaSPStore = std::conditional_t<
+        QKV_FP8,
+        TiledMMA<
+            MMA_Atom<PPU0015_16x16x32_F32E4M3E4M3F32_TN_EpiPerm>,
+            Layout<Shape<Int<AtomLayoutQ>, Int<kNWarps0/AtomLayoutQ>, _1>>,
+            Tile<Int<MMA_ATOM_M * AtomLayoutQ>, Int<16 * kNWarps0/AtomLayoutQ>, _32>>,
+        TiledMmaS>;
+#else
+    using TiledMmaSPStore = TiledMmaS;
+#endif
 
 #if USE_AIU
     using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>;
@@ -456,15 +500,17 @@ struct Flash_fwd_kernel_traits : public Base {
                Stride< _16, _1>>
 #endif
     >;
-    using TiledMmaStoreFP8 = TiledMMA<
-#if ACOMPUTE_VERSION == 10500
-          MMA_Atom<PPU0015_16x16x16_F32BF16BF16F32_TN>,
-#else
-          MMA_Atom<PPU_16x16x16_F32BF16BF16F32_TN>,
-#endif
+    /// fp8 V-direct epilogue store mma: EpiPerm CLayout maps the
+    /// permute_output_fp8-ordered acc back to natural sO columns (N mode
+    /// shared with TiledMma); aliases TiledMma on non-ppu0015 passes.
+#if defined(USE_PPU) && ACOMPUTE_VERSION >= 10500
+    using TiledMmaStoreEpiO = TiledMMA<
+        MMA_Atom<PPU0015_16x16x16_F32BF16BF16F32_TN_EpiPerm>,
         Layout<Shape<Int<AtomLayoutP>, Int<kNWarps/AtomLayoutP>, _1>>,
-        Tile<Int<MMA_ATOM_M * AtomLayoutP>, Int<16 * kNWarps / AtomLayoutP>, _16>
-    >;
+        Tile<Int<MMA_ATOM_M * AtomLayoutP>, TiledMmaNMode, _16>>;
+#else
+    using TiledMmaStoreEpiO = TiledMma;
+#endif
     using GmemTiledCopyOaccum = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<QKV_FP8 ? 128 : 32>, ElementAccum>{},
                         GmemLayoutAtomOaccum{},

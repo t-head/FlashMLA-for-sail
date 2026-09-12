@@ -411,6 +411,121 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// PV gemm with register-direct V load: acc (MMA, MMA_M, MMA_N) fp32 in pi_n
+// order; tCrA/tCsA: pi_k-ordered P fragment / smem view; tCrB: V assembly
+// destination; smem_k/stage: raw sK base + kv stage. Tail rows of a partial
+// chunk read as V stay zfill zeros (bounded gmem copy never overwrites them)
+// with exact-0 P entries, contributing exactly 0 to acc.
+template<typename Kernel_traits, typename Tensor0, typename Tensor1, typename Tensor2,
+         typename Tensor3, typename TiledMma, typename TiledCopyA, typename ThrCopyA>
+CUTLASS_DEVICE void gemm_pv_fp8_vdirect(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
+                                        Tensor3 const& tCsA, void *smem_k, int stage,
+                                        TiledMma tiled_mma, TiledCopyA smem_tiled_copy_A,
+                                        ThrCopyA smem_thr_copy_A) {
+#if defined(USE_PPU) && ACOMPUTE_VERSION >= 10500
+    // ISA/layout constants, not tunables: atom dims come from the atom's
+    // Shape_MNK; V is read as bf16 pairs (2 fp8 per 16-bit lane); TSM cube =
+    // 64 rows x 64 bf16 cols (the 128B swizzle row); a TSM_LD covers 16 rows.
+    using AtomShape = typename Kernel_traits::MMA_Atom_Arch::Shape_MNK;
+    constexpr int kAtomK = get<2>(AtomShape{});    // 32
+    constexpr int kAtomN = get<1>(AtomShape{});    // 16
+    constexpr int kPairN = 2;              // paired n-tiles share one TSM strip
+    constexpr int kCubeH = 64;             // TSM cube rows
+    constexpr int kCubeW = 64;             // TSM cube cols, in bf16 lanes
+    constexpr int kCubeWFp8 = 2 * kCubeW;  // fp8 elems per cube col-block (128B)
+    constexpr int kTsmRows = 16;           // rows per TSM_LD issue
+    // kHeadDim is fp8-padded to a 128-byte multiple (e.g., 576->640, 512->512, 384->384):
+    // a kCubeH-row band spans kVTilesPerRow cubes.
+    constexpr int kVTilesPerRow = Kernel_traits::kHeadDim / kCubeWFp8;
+    using TsmOp = cute::PPU0015_TSM_LD_SWZL<cute::bfloat16_t, kCubeH, kCubeW,
+                                            true /*Swap*/, true /*Trans*/,
+                                            (Kernel_traits::kBlockN / kCubeH) * kVTilesPerRow>;
+    constexpr int MMA_K = Kernel_traits::kBlockN / kAtomK;
+    constexpr int NW_N  = Kernel_traits::kNWarps / Kernel_traits::AtomLayoutP;  // warps along N
+    constexpr int MMA_N = Kernel_traits::kHeadDimV / (kAtomN * NW_N);           // n-tiles per warp
+    static_assert(decltype(size<2>(tCrA))::value == MMA_K, "tCrA MMA_K mismatch");
+    static_assert(decltype(size<1>(tCrB))::value == MMA_N, "tCrB MMA_N mismatch");
+    static_assert(decltype(size<2>(tCrB))::value == MMA_K, "tCrB MMA_K mismatch");
+    static_assert(MMA_N % kPairN == 0, "paired N tile needs even MMA_N");
+    // V-direct reads V as the leading kHeadDimV columns of the sK (K) stage.
+    static_assert(Kernel_traits::kHeadDimV <= Kernel_traits::kHeadDim,
+                  "fp8 V-direct requires V to be a prefix of K");
+
+    Tensor tCrB32 = cute::recast<uint32_t>(tCrB);
+    CUTE_STATIC_ASSERT_V(size<0>(tCrB32) == Int<4>{});
+    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+
+    const int n_w = (threadIdx.x / 32) / Kernel_traits::AtomLayoutP;
+
+    // Pair-blocked N tile: warp n_w owns n_it = 2t+h <-> atom
+    // mn = 2*(n_w + NW_N*t) + h, so one TSM pair (the 32-byte strip
+    // at j0 = 32*(n_w + NW_N*t)) feeds both h halves.
+    #pragma unroll
+    for (int mk = 0; mk < MMA_K; ++mk) {
+        // A side: sP is stored in pi_k order, the plain TSM load is exact.
+        cute::copy(smem_tiled_copy_A, tCsA(_, _, mk), tCrA_copy_view(_, _, mk));
+        #pragma unroll
+        for (int t = 0; t < MMA_N / kPairN; ++t) {
+            const int kv0 = kAtomK * mk;
+            const int j0 = kAtomN * kPairN * (n_w + NW_N * t);  // fp8 elems = bytes
+            const int cube = (kv0 / kCubeH) * kVTilesPerRow + j0 / kCubeWFp8;
+            const int wcoord = (j0 % kCubeWFp8) / 2;            // bytes -> bf16 lanes
+            uint32_t rA[4], rB[4];
+            TsmOp::copy(rA, smem_k, (kv0 % kCubeH),            wcoord, cube, stage);
+            TsmOp::copy(rB, smem_k, (kv0 % kCubeH) + kTsmRows, wcoord, cube, stage);
+            #pragma unroll
+            for (int h = 0; h < kPairN; ++h) {
+                const int n_it = kPairN * t + h;
+                // Zero-shfl pi_k/pi_n B-fragment assembly: byte pairs
+                // (2t, 2t+1) of rows (kv0+2q, kv0+2q+1 | +8 | +16)
+                // -> slots (w0..w3, kq0..3). The 0x6420/0x7531 byte_perm
+                // selectors extract even/odd byte lanes {0,2,4,6}/{1,3,5,7}.
+                tCrB32(0, n_it, mk) = __byte_perm(rA[2 * h + 0], rA[2 * h + 1], 0x6420u);
+                tCrB32(1, n_it, mk) = __byte_perm(rB[2 * h + 0], rB[2 * h + 1], 0x6420u);
+                tCrB32(2, n_it, mk) = __byte_perm(rA[2 * h + 0], rA[2 * h + 1], 0x7531u);
+                tCrB32(3, n_it, mk) = __byte_perm(rB[2 * h + 0], rB[2 * h + 1], 0x7531u);
+                // Emit this n-tile's MMAs immediately so the B slot dies here.
+                #pragma unroll
+                for (int m = 0; m < size<1>(acc); ++m) {
+                    cute::gemm(tiled_mma, tCrA(_, m, mk), tCrB(_, n_it, mk), acc(_, m, n_it));
+                }
+            }
+        }
+    }
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// fp8 V-direct epilogue helper: swap d1<->d4 and d3<->d6 (v0<->v2 within each
+// v1 row pair) of the pi_n-ordered acc ((2,2,2), MMA_M, MMA_N) fp32, obtaining
+// the EpiPerm order n = 4q+v0+2*v2 (see gemm_pv_fp8_vdirect). PPU1.5-only body;
+// ppu_10's bf16-atom acc is ((4,2),...) and gets an empty stub, so the call
+// site dispatches on QKV_FP8 alone.
+template <typename Fragment>
+CUTLASS_DEVICE void permute_output_fp8(Fragment &out) {
+#if defined(USE_PPU) && ACOMPUTE_VERSION >= 10500
+    static_assert(decltype(size<0, 0>(out))::value == 2);
+    static_assert(decltype(size<0, 1>(out))::value == 2);
+    static_assert(decltype(size<0, 2>(out))::value % 2 == 0);
+    static_assert(decltype(stride<0, 0>(out))::value == 1);
+    static_assert(sizeof(typename Fragment::value_type) == 4);
+    Tensor frag = group_modes<1, 3>(out);  // ((2, 2, 2), (MMA_M, MMA_N))
+    #pragma unroll
+    for (int mi = 0; mi < size<1>(frag); ++mi) {
+        #pragma unroll
+        for (int j = 0; j < size<0, 1>(frag); ++j) {
+            #pragma unroll
+            for (int i = 0; i < size<0, 2>(frag) / 2; ++i) {
+                auto tmp = frag(make_coord(_1{}, j, 2 * i), mi);
+                frag(make_coord(_1{}, j, 2 * i), mi) = frag(make_coord(_0{}, j, 2 * i + 1), mi);
+                frag(make_coord(_0{}, j, 2 * i + 1), mi) = tmp;
+            }
+        }
+    }
+#endif
+}
+
 template<typename Kernel_traits, bool Split, bool CrossCut = false, bool IsSparse = false, typename AccO, typename Softmax>
 __forceinline__ __device__ void store(const Flash_fwd_params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
                                       __shared__ char* smem_,  AccO acc_o, Softmax softmax) {
@@ -434,6 +549,10 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
     // Epilogue
     const int split_offset = __ldg(params.num_splits_ptr + bidb);
 
+    // fp8 V-direct: permute acc_o into the EpiPerm order that TiledMmaStoreEpiO below
+    // maps back to natural columns; row-wise lse/normalization is unaffected by it.
+    if constexpr (Kernel_traits::QKV_FP8) { permute_output_fp8(acc_o); }
+
     Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax);
 
     using ElementO = std::conditional_t<!Split, Element, typename Kernel_traits::ElementAccum>;
@@ -447,7 +566,7 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
 
     using TiledMmaStore = std::conditional_t<
         Kernel_traits::QKV_FP8,
-        typename Kernel_traits::TiledMmaStoreFP8,
+        typename Kernel_traits::TiledMmaStoreEpiO,
         typename Kernel_traits::TiledMma
     >;
 
