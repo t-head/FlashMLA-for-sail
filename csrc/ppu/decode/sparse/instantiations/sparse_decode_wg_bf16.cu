@@ -8,6 +8,6 @@ template void run_flash_sparse_decode_wg_kernel<cutlass::bfloat16_t, 89, true, 1
 // KV cache is contiguous BF16; no dequant needed.
 template void run_flash_sparse_decode_wg_kernel<cutlass::bfloat16_t, 89, false, 128>(Flash_fwd_params &params, hggcStream_t stream);
 
-// BlockM=64 Cross layout instantiations
+// BF16 M64 is instantiated by sparse_decode_wg_hs64_bf16.cu. Keep the
+// original generic BlockM=64 instantiation only for the unchanged FP8 path.
 template void run_flash_sparse_decode_wg_kernel<cutlass::bfloat16_t, 89, true, 64>(Flash_fwd_params &params, hggcStream_t stream);
-template void run_flash_sparse_decode_wg_kernel<cutlass::bfloat16_t, 89, false, 64>(Flash_fwd_params &params, hggcStream_t stream);

@@ -4,11 +4,21 @@
  ******************************************************************************/
 #pragma once
 
+#include <type_traits>
+
 #include "params.h"
 #include "kerutils/host/host.h"
 
 #include "prefill/sparse/sparse_prefill_wg.cuh"
 #include "prefill/sparse/sparse_prefill_std.cuh"
+
+namespace flashmla::dsa::hs64 {
+
+// Implemented alongside decode to share the M64N64 attention pipeline.
+template<int HeadDim>
+void run_flash_sparse_prefill_fwd_hs64(SparsePrefillParams &params);
+
+} // namespace flashmla::dsa::hs64
 
 template<typename T>
 void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
@@ -22,8 +32,22 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
     FLASH_ASSERT(params.topk > 0);
     // FLASH_ASSERT(params.h_q % B_H == 0);
 
-    bool warp_interleave = ((params.s_q % 128 == 0) || (params.s_q > 256)) && (params.h_q == 128)
-        && (params.s_kv >= params.topk);
+    // The double-warpgroup pipeline amortizes its setup on long topk;
+    // retain the standard prefill kernel for short sparse rows.
+    const bool use_hs64 = params.h_q == 64 && params.h_kv == 1 &&
+        params.topk >= 512 && is_sm89_or_newer();
+    const bool warp_interleave = ((params.s_q % 128 == 0) || (params.s_q > 256)) &&
+        params.h_q == 128 && params.s_kv >= params.topk;
+
+    if constexpr (std::is_same_v<T, cutlass::bfloat16_t>) {
+        if (use_hs64) {
+            DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+                flashmla::dsa::hs64::run_flash_sparse_prefill_fwd_hs64<HEAD_DIM_QK>(params);
+            });
+            return;
+        }
+    }
+
     if (warp_interleave) {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             if (!is_sm89_or_newer()) {

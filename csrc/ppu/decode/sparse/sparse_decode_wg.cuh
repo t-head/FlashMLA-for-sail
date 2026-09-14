@@ -23,11 +23,10 @@
 #include <cutlass/numeric_types.h>
 #include <cute/util/debug.hpp>
 
-#include "params.h"
-// Reuse splitkv config / traits verbatim (kBlockM=128, kBlockN=32,
-// NUM_K_BUFS=3, etc). Sparse-specific SMEM extensions are added in a follow-up
-// stage; for the skeleton fork we use the splitkv layout 1:1.
-#include "decode/dense/traits.h"
+#include "decode/sparse/sparse_decode_wg.h"
+// M128 traits inherit the dense splitkv layout; M64 traits live alongside them
+// in the sparse WG traits header.
+#include "decode/sparse/sparse_decode_wg_traits.h"
 #include "acc_vreg_fraga.h"
 #include "ppuxx/decode/combine/combine.h"
 
@@ -93,216 +92,6 @@ __forceinline__ __device__ void launch_kv_tiles_wg(
 }
 
 } // namespace flash
-
-// =============================================================================
-// Traits_v2<InputT>: inherits from splitkv Traits<InputT> and shadows
-// SharedMemoryPlan to add FP8-specific K-barrier count. FP8 nope/scales and
-// BF16 rope are read directly from global memory into registers and
-// dequantized in-thread (see load_and_dequant_sparse_K).
-// All other typedefs are inherited 1:1 from splitkv.
-// =============================================================================
-template<typename InputT_, int HeadDimK = 576, bool IsFP8_ = true, int BlockM_ = 128>
-struct Traits_v2 : public Traits<InputT_> {
-    using Base = Traits<InputT_>;
-    using InputT = typename Base::InputT;
-
-    // Whether the KV cache stores FP8 (with dequant) or BF16 (direct read).
-    static constexpr bool IsFP8 = IsFP8_;
-
-    // Shadow Base::kHeadDim with template parameter
-    static constexpr int kHeadDim = HeadDimK;
-
-    // Shadow kBlockM for BlockM=64 Cross layout support
-    static constexpr int kBlockM = BlockM_;
-    static constexpr int BLOCK_SIZE_M = BlockM_;
-
-    // (4,1) for BlockM=64; (8,1) original for BlockM=128
-    static constexpr int kAtomLayoutM = (BlockM_ == 64) ? 4 : 8;
-    static constexpr int kAtomLayoutN = 1;  // Always 1: all N columns in one warp
-    static constexpr bool kIsCrossCut = false;  // No cross-N-warp split needed
-    // Number of threads covered by TiledMMA; used for wrapping idx_in_warpgroup
-    static constexpr int kMmaThreads = kAtomLayoutM * 32;
-
-    using TiledMma = TiledMMA<
-        typename Base::MMA_Atom_Arch,
-        Layout<Shape<Int<kAtomLayoutM>, _1, _1>>,
-        Tile<Int<16 * kAtomLayoutM>, _16, _16>>;
-
-    // Shadow SmemCopyOpQ/AtomQ for BlockM_ dimension
-    using SmemCopyOpQ = PPU_TSM_LD_SWZL<typename Base::InputT, kBlockM, Base::kBlockKSmem, false, false, 1>;
-    using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, typename Base::InputT>;
-
-    // Shadow SmemLayoutP0 for BlockM_ dimension
-    using SmemLayoutAtomP0 = decltype(
-#if ACOMPUTE_VERSION == 10000
-        composition(PPU_Swizzle<2, 3, 3>{},
-#else
-        composition(Swizzle<2, 3, 3>{},
-#endif
-        Layout<Shape<Int<kBlockM>, Int<Base::kBlockN>>,
-                        Stride<Int<Base::kBlockN>, _1>>{}));
-    using SmemLayoutP0 = decltype(tile_to_shape(
-        SmemLayoutAtomP0{},
-        Shape<Int<kBlockM>, Int<Base::kBlockN>>{}));
-
-    // Shadow SmemLayoutO for BlockM_ dimension
-    using SmemLayoutAtomO = decltype(
-        composition(Swizzle<3, 3, 3>{},
-                    Layout<Shape<Int<8>, Int<Base::kBlockKSmem>>,
-                           Stride<Int<Base::kBlockKSmem>, _1>>{}));
-    using SmemLayoutO = decltype(tile_to_shape(
-        SmemLayoutAtomO{},
-        Shape<Int<kBlockM>, Int<Base::kHeadDimV>>{}));
-
-    // Half-V output layout for two-pass float32 epilogue (BlockM>=128).
-    // Full SmemLayoutO (128×512×4 = 256KB) exceeds the PPU M890P SMEM ceiling;
-    // 128×256 (128KB) keeps smem_size within device limit.
-    using SmemLayoutO_Half = decltype(tile_to_shape(
-        SmemLayoutAtomO{},
-        Shape<Int<kBlockM>, Int<Base::kHeadDimV / 2>>{}));
-
-    // Shadow SharedMemoryOutPut for BlockM_ dimension
-    struct SharedMemoryOutPut {
-        // For BlockM>=128: half-V float buffer (two-pass store_o).
-        // For BlockM<128:  full float buffer (single-pass, fits easily).
-        static constexpr int kOutBufElems = (kBlockM >= 128)
-            ? cosize_v<SmemLayoutO_Half>   // 128×256 = 32768 floats = 131072 bytes
-            : cosize_v<SmemLayoutO>;        // 64×512  = 32768 floats = 131072 bytes
-        cute::array_aligned<float, kOutBufElems> smem_out;
-    };
-
-    // Shadow GmemTiledCopyQ for BlockM_ dimension
-    static constexpr int bits_per_aiu_Q = kBlockM * Base::kBlockKSmem * sizeof(typename Base::InputT) * 8;
-    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, typename Base::InputT, false, kBlockM, Base::kBlockKSmem>;
-    using GmemTiledCopyQ = decltype(
-        make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, typename Base::InputT>{},
-                    Layout<Shape <_1,_1>,
-                           Stride<_1,_1>>{},
-                    Layout<Shape <Int<kBlockM>, Int<Base::kBlockKSmem>>>{}));
-
-    // -----------------------------------------------------------------------
-    // FP8 KV cache layout constants.
-    //
-    // Two layouts are dispatched on HeadDimK:
-    //
-    //   * V3.2 (HeadDimK == 576):  per-token interleaved, 656 bytes/token
-    //     [0,   512)  FP8 nope        (512 e4m3 bytes, 1 byte/elem)
-    //     [512, 528)  FP32 scales     (4 floats; one per 128 nope dims)
-    //     [528, 656)  BF16 rope       (64 elems * 2 bytes)
-    //
-    //   * MODEL1 (HeadDimK == 512):  block-level segmented FP8 cache.
-    //     Per-token contiguous payload (576 bytes):
-    //       [0,   448)  FP8 nope      (448 e4m3 bytes)
-    //       [448, 576)  BF16 rope     (64 elems * 2 bytes)
-    //     Block tail (page_block_size * 8 bytes) of e8m0 scales follows the
-    //     per-token payload area:
-    //       offset_in_block = page_block_size * 576 + off_in_page * 8;
-    //       8 bytes per token = 7 used e8m0 scales (one per 64 nope dims) + 1 pad.
-    //     PyTorch shape stride is bytes_per_token = 584 (= 576 + 8) per token.
-    // -----------------------------------------------------------------------
-    static constexpr bool kModel1Layout         = (HeadDimK == 512);
-
-    // -----------------------------------------------------------------------
-    // KV cache layout constants -- conditioned on IsFP8.
-    //
-    // When IsFP8=true (existing FP8 path):
-    //   Token is split into nope(FP8) + scales + rope(BF16), dequant required.
-    //
-    // When IsFP8=false (BF16 direct-read path):
-    //   Token is HeadDimK contiguous BF16 values, no dequant/scales.
-    //   kBytesPerToken = HeadDimK * 2 (all BF16).
-    // -----------------------------------------------------------------------
-    static constexpr int kFp8NopeBytesPerToken  = IsFP8
-        ? (kModel1Layout ? 448 : 512)
-        : 0;  // BF16 path: no FP8 nope segment
-    static constexpr int kFp8ScaleBytesPerToken = IsFP8
-        ? (kModel1Layout ? 8 : 16)
-        : 0;  // BF16 path: no scales
-    static constexpr int kRopeElems             = 64;                          // 64 BF16 rope elems in both layouts
-    static constexpr int kBf16RopeBytesPerToken = IsFP8 ? (kRopeElems * 2) : 0; // BF16 path: rope is part of contiguous token
-    static constexpr bool kHasRope              = IsFP8;  // BF16 path: no separate rope segment
-    // Whether there is an EXTRA tile 8 beyond the first 8 tiles in the QK GEMM.
-    // HeadDimK=576 (both FP8 V3.2 and BF16): tiles 0-7 cover dims [0,512), tile 8
-    // covers dims [512,576) — needed for full dot-product. MODEL1 (512): only 8
-    // tiles, no extra tile needed.
-    static constexpr bool kHasExtraRopeTile      = !kModel1Layout;
-    // Per-token contiguous-payload stride.
-    // BF16 path: HeadDimK * sizeof(BF16) = HeadDimK * 2 bytes per token.
-    static constexpr int kBytesPerToken = IsFP8
-        ? (kModel1Layout
-            ? (kFp8NopeBytesPerToken + kRopeElems * 2)                                      // 576 (MODEL1 FP8)
-            : (kFp8NopeBytesPerToken + kFp8ScaleBytesPerToken + kRopeElems * 2))            // 656 (V3.2 FP8)
-        : (HeadDimK * 2);                                                                   // 1152 (BF16, 576*2)
-    // Byte offset of BF16 rope inside the per-token payload (FP8 paths only).
-    static constexpr int kRopeOffsetBytes = IsFP8
-        ? (kModel1Layout
-            ? kFp8NopeBytesPerToken                                                          // 448 (rope right after nope)
-            : (kFp8NopeBytesPerToken + kFp8ScaleBytesPerToken))                              // 528 (after nope + per-token scales)
-        : 0;  // BF16 path: no separate rope offset
-    // Number of nope elements per FP8 scale (one e8m0/fp32 entry covers a
-    // contiguous tile of nope dims).  V3.2: 128 dims/scale (4 fp32 scales);
-    // MODEL1: 64 dims/scale (7 e8m0 scales + 1 pad byte).
-    static constexpr int kScaleTileSize = IsFP8 ? (kModel1Layout ? 64 : 128) : 1;  // BF16: unused, avoid div-by-zero
-    static constexpr int kNumScaleTiles = IsFP8 ? (kFp8NopeBytesPerToken / kScaleTileSize) : 0;
-
-    // Shadow SmemLayoutQ to use the correct HeadDimK and kBlockM
-    using SmemLayoutQ = decltype(tile_to_shape(
-        typename Base::SmemLayoutAtom{},
-        Shape<Int<kBlockM>, Int<HeadDimK>>{}));
-
-    // Shadow SmemLayoutK to use the correct HeadDimK
-    using SmemLayoutK = decltype(tile_to_shape(
-        typename Base::SmemLayoutAtom{},
-        Shape<Int<Base::kBlockN>, Int<HeadDimK>, Int<Base::NUM_K_BUFS>>{}));
-
-    // Independent V buffer layout -- mirrors dequant.h's approach.
-    // SmemLayoutAtomV uses Swizzle<3,3,3> so that scalar writes are compatible
-    // with TSM_LD_SWZL hardware reads. The V buffer physically overlays sK buf 2
-    // (unused for topk=32), so no extra SMEM is needed.
-    static constexpr int kBlockKSmem_v = 64;
-    static constexpr int kSwizzle_v    = 3;
-    using SmemLayoutAtomV = decltype(composition(Swizzle<kSwizzle_v, 3, 3>{},
-        Layout<Shape<_8, Int<kBlockKSmem_v>>, Stride<Int<kBlockKSmem_v>, _1>>{}));
-    using SmemLayoutVDirect = decltype(tile_to_shape(
-        SmemLayoutAtomV{},
-        Shape<Int<Base::kBlockN>, Int<Base::kHeadDimV>>{}));  // (32, 512)
-    using SmemLayoutVtDirect = decltype(composition(
-        SmemLayoutVDirect{},
-        make_layout(Shape<Int<Base::kHeadDimV>, Int<Base::kBlockN>>{}, GenRowMajor{})));  // (512, 32) transposed view
-
-    // K scalar-store compatible layout -- same pattern as SmemLayoutAtomV.
-    // Scalar stores address through Swizzle<kSwizzle_v,3,3> so that TSM_LD_SWZL reads
-    // see correctly formatted data (same fix applied to V).
-    using SmemLayoutAtomK_Direct = decltype(composition(Swizzle<kSwizzle_v, 3, 3>{},
-        Layout<Shape<_8, Int<kBlockKSmem_v>>, Stride<Int<kBlockKSmem_v>, _1>>{}));
-    using SmemLayoutKDirect = decltype(tile_to_shape(
-        SmemLayoutAtomK_Direct{},
-        Shape<Int<Base::kBlockN>, Int<HeadDimK>, Int<Base::NUM_K_BUFS>>{}));
-
-    struct SharedMemoryPlan {
-        cute::array_aligned<InputT, cosize_v<SmemLayoutQ>> smem_sQ;
-        cute::array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK;
-        cute::array_aligned<float, kBlockM>     smem_sM;
-        cute::array_aligned<float, kBlockM + 128> sL_reduction_wksp;  // max index = my_row_max + 8 + 128
-        cute::array_aligned<float, kBlockM>     smem_sScale0;
-        cute::array_aligned<float, kBlockM>     smem_sScale1;
-
-        // MODEL1 (d_qk=512): sQ has exactly 8 tiles (HeadDimK/64) — no spare
-        // tile 8 to overlap sP0/sP1. Dedicate space for 2 × SmemLayoutP0.
-        // V3.2 (d_qk=576): sP0/sP1 overlap with the consumed sQ tile 8 (rope).
-        static constexpr int kSPModel1Elems = kModel1Layout
-            ? (2 * kBlockM * Base::kBlockN) : 1;
-        cute::array_aligned<InputT, kSPModel1Elems> smem_sP_model1;
-        // Valid indices mask: (4 buffers, kBlockN tokens per block)
-        // Cross-WG: each WG uses 2 buffers (alternating preload/softmax)
-        //   WG0: bufs 0/1, WG1: bufs 2/3
-        cute::array_aligned<int, 4 * Base::kBlockN> smem_valid_indices;
-        static constexpr int kNumKBarriers = 2;  // Two sub-stages: tiles 0-3 and tiles 4-7/8
-        __mbarrier_t barrier_Q;
-        __mbarrier_t barriers_K0[kNumKBarriers];
-        __mbarrier_t barriers_K1[kNumKBarriers];
-    };
-};
 
 // Here we use MAX_INIT_VAL_SM to initialize sM, and MAX_INIT_VAL for masking
 // The reason is that, we need to calculate new_max = max(sM(row_idx), cur_max*scale_softmax_log2)
@@ -1615,6 +1404,18 @@ __forceinline__ __device__ typename T::InputT* compute_K_addr_bf16_dynamic(
     }
 }
 
+template<bool UseExtra, typename T>
+__forceinline__ __device__ const int* wg_query_indices_bf16(
+    const Flash_fwd_mla_params &params)
+{
+    // Dispatch requires complete head tiles; several M blocks may share a query.
+    const int query_idx = static_cast<int>(blockIdx.x) / (params.ngroups / T::kBlockM);
+    const int* indices = UseExtra ? params.extra_indices_ptr : params.indices_ptr;
+    const auto row_stride = UseExtra
+        ? params.extra_indices_row_stride : params.indices_row_stride;
+    return indices + static_cast<int64_t>(query_idx) * row_stride;
+}
+
 // Phase 2: Issue cp.async using precomputed token_ptr + prefetch next token index.
 // LOAD_USE_EXTRA removed: k_base_ptr is dummy (overwritten by token_ptr), only PREFETCH_USE_EXTRA matters
 template<int S, int E, bool PREFETCH_USE_EXTRA, typename T, bool DO_PREFETCH = true, typename TensorSK>
@@ -1662,10 +1463,10 @@ __forceinline__ __device__ void issue_K_load_bf16(
             const int *next_idx_base;
             if constexpr (PREFETCH_USE_EXTRA) {
                 next_eff_block = next_block_idx - ori_block_max;
-                next_idx_base = params.extra_indices_ptr + static_cast<int64_t>(batch_idx) * params.extra_indices_batch_stride + next_eff_block * kBlockN;
+                next_idx_base = wg_query_indices_bf16<true, T>(params) + static_cast<int64_t>(batch_idx) * params.extra_indices_batch_stride + next_eff_block * kBlockN;
             } else {
                 next_eff_block = next_block_idx;
-                next_idx_base = params.indices_ptr + static_cast<int64_t>(batch_idx) * params.indices_batch_stride + next_eff_block * kBlockN;
+                next_idx_base = wg_query_indices_bf16<false, T>(params) + static_cast<int64_t>(batch_idx) * params.indices_batch_stride + next_eff_block * kBlockN;
             }
             int token_id = tidx / 8;
             *pre_token_idx = __ldg(next_idx_base + token_id);
@@ -1892,7 +1693,8 @@ __forceinline__ __device__ void load_and_dequant_sparse_K_staged(
     // ---- 3. Warpgroup-level sync ----
     {
         int _bar_id = 6 + (int)(tidx >> 8);
-        asm volatile("ppu.bar.sync %0, %1;" :: "r"(_bar_id), "r"(kThreadsPerWg));
+        NamedBarrier::sync(
+            kThreadsPerWg, static_cast<cutlass::arch::ReservedNamedBarriers>(_bar_id));
     }
     __threadfence_block();
 
@@ -2105,7 +1907,9 @@ __forceinline__ __device__ void wg0_subroutine(
         // (4,2) layout: each N-warp only has 16/32 P columns, localP broken.
         // Save rPb to sP0 temporarily, per-WG barrier, then remoteP from SMEM.
         save_rP0_to_sP<T>(rPb, sP0, idx_in_warpgroup);
-        { int _cbar = 6 + (int)(threadIdx.x >> 8); asm volatile("ppu.bar.sync %0, %1;" :: "r"(_cbar), "r"(256)); }
+        const int barrier_id = 6 + static_cast<int>(threadIdx.x >> 8);
+        NamedBarrier::sync(
+            256, static_cast<cutlass::arch::ReservedNamedBarriers>(barrier_id));
         warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0L, rO0, idx_in_warpgroup, wg_idx);
     } else {
         warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV0L, rO0, idx_in_warpgroup, wg_idx);
@@ -2345,7 +2149,9 @@ __forceinline__ __device__ void wg1_subroutine(
         if constexpr (T::kIsCrossCut) {
             // (4,2) layout: each N-warp only has 16/32 P columns, localP broken.
             // sP1 already saved above, use per-WG barrier then remoteP from SMEM.
-            { int _cbar = 6 + (int)(threadIdx.x >> 8); asm volatile("ppu.bar.sync %0, %1;" :: "r"(_cbar), "r"(256)); }
+            const int barrier_id = 6 + static_cast<int>(threadIdx.x >> 8);
+            NamedBarrier::sync(
+                256, static_cast<cutlass::arch::ReservedNamedBarriers>(barrier_id));
             warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1R, rO1, idx_in_warpgroup, wg_idx);
         } else {
             warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, idx_in_warpgroup, wg_idx);
@@ -2583,8 +2389,8 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
                 bool _use_extra = (ori_block_max >= 0) && (_blk >= ori_block_max);
                 int _eff = _use_extra ? (_blk - ori_block_max) : _blk;
                 const int *_base = _use_extra
-                    ? (params.extra_indices_ptr + static_cast<int64_t>(batch_idx) * params.extra_indices_batch_stride + _eff * T::kBlockN)
-                    : (params.indices_ptr + static_cast<int64_t>(batch_idx) * params.indices_batch_stride + _eff * T::kBlockN);
+                    ? (wg_query_indices_bf16<true, T>(params) + static_cast<int64_t>(batch_idx) * params.extra_indices_batch_stride + _eff * T::kBlockN)
+                    : (wg_query_indices_bf16<false, T>(params) + static_cast<int64_t>(batch_idx) * params.indices_batch_stride + _eff * T::kBlockN);
                 return __ldg(_base + _token_id);
             };
             if (warpgroup_idx == 0) {
@@ -3087,6 +2893,9 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
 template <typename InputT, int Arch, bool IsFP8, int BlockM>
 void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_t stream)
 {
+    if constexpr (!IsFP8) {
+        FLASH_ASSERT(params.ngroups > 0 && params.ngroups % BlockM == 0);
+    }
     // [SPARSE-WI Stage B] BOOL_SWITCH on is_causal removed -- only one
     // instantiation; sparse path ignores params.is_causal.
     if (params.d == 576) {
@@ -3195,4 +3004,3 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
         run_flash_mla_combine_kernel<InputT>(params, stream);
     }
 }
-

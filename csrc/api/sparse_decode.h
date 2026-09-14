@@ -9,6 +9,7 @@
 #include "common.h"
 #include "params.h"
 #include "kerutils/common/static_switch.h"
+#include "decode/sparse/sparse_decode_wg.h"
 
 template<typename T, bool IsFP8, int Headdim, int Headdim_V>
 void run_sparse_decode_fwd_dispatch(Flash_fwd_params &params, hggcStream_t stream);
@@ -36,6 +37,7 @@ sparse_attn_decode_interface(
 
     // ========== Phase 1: Lazy metadata ==========
     if (!tile_scheduler_metadata.has_value()) {
+        at::cuda::CUDAGuard metadata_device_guard{q.device()};
         const auto sizes = q.sizes();
         const int batch_size = sizes[0];
         const int num_heads_ori = sizes[2];
@@ -45,15 +47,16 @@ sparse_attn_decode_interface(
 
         int num_sm_parts = get_num_sm_parts(ngroups, num_heads_k, batch_size, /*is_sparse_attn=*/true);
 
-        // btv105 only use cross_cut method.
-        int block_size_n = 64;
+        // HS64 advances by 128 tokens.  FP8, PPU1.0 and the M128 WG kernel
+        // preserve main's original 64-token scheduler quantum.
+        int block_size_n = flashmla::dsa::sparse_decode_metadata_block_size_n(
+            ngroups, is_fp8, is_sm89_or_newer());
 
         static constexpr int fixed_overhead_num_blocks = 5;
         auto options = q.options().dtype(torch::kInt32);
         auto tile_scheduler_metadata_t = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
         auto num_splits_t = torch::empty({batch_size + 1}, options);
 
-        at::cuda::CUDAGuard device_guard{(char)q.get_device()};
         auto meta_stream = at::cuda::getCurrentCUDAStream().stream();
         Mla_metadata_params meta_params = {};
         meta_params.seqlens_k_ptr = nullptr;
