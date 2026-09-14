@@ -88,6 +88,83 @@ __forceinline__ __device__ void launch_kv_tiles_dsa_wg(
     cutlass::arch::cpasync_barrier_arrive_noinc(barriers_K);
 }
 
+// mirrors decode sparse_decode_wg.cuh:1533-1591 (compute_K_addr_bf16) -- Phase 1
+// of the K-address two-phase split (Opt-C): pure address computation + valid
+// mask write. Does NOT issue cp.async, so it can be placed in TC idle windows.
+// Key adaptation vs decode: prefill addressing is flat --
+//   gK_base + token_idx * stride_kv_s_kv + (idx_in_warpgroup % 8) * 8
+// with NO page-table two-level decomposition and no USE_EXTRA branch; only the
+// two-phase STRUCTURE is ported, not decode's paged address math.
+// WRITE_VI: whether this call site owns the block's flag slot (WG0 owns even
+// blocks -> slots 0/1, WG1 owns odd blocks -> slots 2/3). The cross-WG call
+// (same block, other half of the tiles) passes false and skips the flag store.
+template<typename T, bool WRITE_VI, typename TensorVI>
+__forceinline__ __device__ void dsa_compute_K_addr(
+    const SparsePrefillParams &params,
+    typename T::InputT *gK_base,
+    int token_idx,                 // prefetched token index (this thread's column)
+    int block_idx,                 // block being computed (border fold-in base)
+    int seqlen_k,
+    int idx_in_warpgroup,
+    TensorVI &smem_valid_indices,
+    int vi_buf,
+    typename T::InputT *&precomp_ptr,
+    bool &precomp_valid)
+{
+    using InputT = typename T::InputT;
+    bool is_token_valid = token_idx >= 0 && token_idx < params.s_kv;
+    precomp_ptr = gK_base + token_idx * (int64_t)params.stride_kv_s_kv + (idx_in_warpgroup % 8) * 8;
+    precomp_valid = is_token_valid;
+    // Same flag value as the legacy inline write points: per-token validity with
+    // the topk_length right border folded in (absolute topk position
+    // block_idx*kBlockN + col < seqlen_k). The store guard (idx%8==0) and the
+    // value formula are identical to the pre-split code -- only the TIMING moves
+    // one iteration earlier (vi slot invariant (b) is preserved by the matching
+    // runtime guards at the call sites; see traits.h L193-202).
+    if constexpr (WRITE_VI) {
+        if (idx_in_warpgroup % 8 == 0) {
+            smem_valid_indices(vi_buf, idx_in_warpgroup / 8) =
+                is_token_valid && (block_idx * T::kBlockN + idx_in_warpgroup / 8 < seqlen_k);
+        }
+    }
+}
+
+// mirrors decode sparse_decode_wg.cuh:1620-1674 (issue_K_load_bf16) -- Phase 2
+// of the split: issue cp.async with the precomputed pointer, fused with the
+// __ldg prefetch of the NEXT block's token index. No address math, no vi store.
+// DO_PREFETCH=false is for the prolog (which does its own guarded prefetch of
+// the next two block indices).
+template<int S, int E, typename T, bool DO_PREFETCH = true,
+         typename TiledCopy, typename Engine0, typename Layout0,
+         typename Engine1, typename Layout1>
+__forceinline__ __device__ void dsa_issue_K_load(
+    TiledCopy tiled_copy,
+    Tensor<Engine0, Layout0> &tKgK,   // partitioned gmem src (data ptr overwritten)
+    Tensor<Engine1, Layout1> &tKsK,   // partitioned smem dst
+    __mbarrier_t *barriers_K,
+    typename T::InputT *precomp_ptr,
+    bool precomp_valid,
+    int *gIndices_ptr,                // per-thread prefetch base (incl. idx/8 offset)
+    int prefetch_block,               // block whose token index is prefetched next
+    int real_end_block_idx,           // [Even-align] REAL topk block count -- the only
+                                      // safe bound for gIndices reads (see kernel prolog)
+    int &nxt_token_idx)
+{
+    tKgK.data() = precomp_ptr;
+    tiled_copy.pred = precomp_valid;
+    launch_kv_tiles_dsa_wg<S, E>(tiled_copy, tKgK, tKsK, barriers_K);
+    if constexpr (DO_PREFETCH) {
+        // [Even-align] guard by the REAL block count: a padding block (beyond
+        // real_end_block_idx) has no backing gIndices memory, so fabricate
+        // token_idx = -1 -> invalid -> pred=false cp.async + vi-flag=false.
+        if (prefetch_block < real_end_block_idx) {
+            nxt_token_idx = __ldg(gIndices_ptr + prefetch_block * T::kBlockN);
+        } else {
+            nxt_token_idx = -1;
+        }
+    }
+}
+
 template <bool Is_even_MN = true, bool Is_even_K = true, bool Clear_OOB_MN = true, bool Clear_OOB_K = true,
           typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
@@ -423,7 +500,8 @@ template<
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
     typename Engine3, typename Layout3,
-    typename Engine4, typename Layout4
+    typename Engine4, typename Layout4,
+    typename EngineVI, typename LayoutVI
 >
 __forceinline__ __device__ auto wg0_bunch_0(
     Tensor<Engine1, Layout1> &rP0,
@@ -431,13 +509,34 @@ __forceinline__ __device__ auto wg0_bunch_0(
     Tensor<Engine3, Layout3> &sScale0,
     Tensor<Engine4, Layout4> &sM,
     float rL[2],
-    int rRightBorderForQSeq[2],
     float scale_softmax_log2,
     int start_token_idx,
-    int idx_in_warpgroup
+    int idx_in_warpgroup,
+    Tensor<EngineVI, LayoutVI> &smem_valid_indices,
+    int valid_indices_buf
 ) {
+    int r_valid[8];
     if constexpr (T::Arch_value == 80) {
-        // This piece of code is tightly coupled [Accumulate's layout](https://docs.nvidia.com/cuda/parallel-thread-execution/_images/wgmma-64N16-D.png)
+        int lane4 = idx_in_warpgroup % 4;
+        CUTLASS_PRAGMA_UNROLL
+        for (int k = 0; k < 2; k++) {
+            int base = (k * 16 + lane4) % T::kBlockN;
+            r_valid[k*4]   = smem_valid_indices(valid_indices_buf, base);
+            r_valid[k*4+1] = smem_valid_indices(valid_indices_buf, (base + 4) % T::kBlockN);
+            r_valid[k*4+2] = smem_valid_indices(valid_indices_buf, (base + 8) % T::kBlockN);
+            r_valid[k*4+3] = smem_valid_indices(valid_indices_buf, (base + 12) % T::kBlockN);
+        }
+    } else {
+        // each thread needs 8 values (4 groups of 2)
+        int lane4 = idx_in_warpgroup % 4;
+        CUTLASS_PRAGMA_UNROLL
+        for (int k = 0; k < 4; k++) {
+            int base = (k * 8 + lane4 * 2) % T::kBlockN;
+            r_valid[k*2]   = smem_valid_indices(valid_indices_buf, base);
+            r_valid[k*2+1] = smem_valid_indices(valid_indices_buf, (base + 1) % T::kBlockN);
+        }
+    }
+    if constexpr (T::Arch_value == 80) {
         CUTLASS_PRAGMA_UNROLL
         for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
             int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
@@ -445,13 +544,11 @@ __forceinline__ __device__ auto wg0_bunch_0(
             float cur_max = MAX_INIT_VAL;
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 4 : 0; i < size(rP0); i += 8) {
-                if constexpr (DO_OOB_FILLING) {
-                    int token_idx = start_token_idx + (i/8)*16 + idx_in_warpgroup%4;
-                    rP0(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP0(i) : MAX_INIT_VAL;
-                    rP0(i+1) = token_idx+4 < rRightBorderForQSeq[local_row_idx] ? rP0(i+1) : MAX_INIT_VAL;
-                    rP0(i+2) = token_idx+8 < rRightBorderForQSeq[local_row_idx] ? rP0(i+2) : MAX_INIT_VAL;
-                    rP0(i+3) = token_idx+12 < rRightBorderForQSeq[local_row_idx] ? rP0(i+3) : MAX_INIT_VAL;
-                }
+                int k_base = ((i/8) % 2) * 4;
+                rP0(i)   = r_valid[k_base]     ? rP0(i)   : MAX_INIT_VAL;
+                rP0(i+1) = r_valid[k_base + 1] ? rP0(i+1) : MAX_INIT_VAL;
+                rP0(i+2) = r_valid[k_base + 2] ? rP0(i+2) : MAX_INIT_VAL;
+                rP0(i+3) = r_valid[k_base + 3] ? rP0(i+3) : MAX_INIT_VAL;
                 cur_max = max(cur_max, max(max(rP0(i), rP0(i+1)), max(rP0(i+2), rP0(i+3))));
             }
 
@@ -496,11 +593,9 @@ __forceinline__ __device__ auto wg0_bunch_0(
             float cur_max = MAX_INIT_VAL;
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
-                if constexpr (DO_OOB_FILLING) {
-                    int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
-                    rP0(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP0(i) : MAX_INIT_VAL;
-                    rP0(i+1) = token_idx+1 < rRightBorderForQSeq[local_row_idx] ? rP0(i+1) : MAX_INIT_VAL;
-                }
+                int k_base = ((i/4) % 4) * 2;
+                rP0(i)   = r_valid[k_base]     ? rP0(i)   : MAX_INIT_VAL;
+                rP0(i+1) = r_valid[k_base + 1] ? rP0(i+1) : MAX_INIT_VAL;
                 cur_max = max(cur_max, max(rP0(i), rP0(i+1)));
             }
             cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
@@ -535,56 +630,87 @@ template<
     typename T,
     bool IS_BLK0_LAST,
     bool IS_BLK1_LAST,
-    bool IS_BLK2_LAST,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
     typename Engine3, typename Layout3,
     typename Engine4, typename Layout4,
-    typename Engine5, typename Layout5>
+    typename Engine5, typename Layout5,
+    typename EngineVI, typename LayoutVI
+>
 __forceinline__ __device__ auto wg1_bunch_0(
     Tensor<Engine1, Layout1> &sScale1,
     Tensor<Engine2, Layout2> &rO1,
     Tensor<Engine3, Layout3> &sM,
     float rL[2],
-    int rRightBorderForQSeq[2],
     Tensor<Engine4, Layout4> const &sScale0,
     Tensor<Engine5, Layout5> &rP1,
     float scale_softmax_log2,
     int start_token_idx,
-    int idx_in_warpgroup)
+    int idx_in_warpgroup,
+    Tensor<EngineVI, LayoutVI> &smem_valid_indices,
+    int valid_indices_buf, 
+    float r_cur_max_in[2] = nullptr
+)
 {
+    [[maybe_unused]] int r_valid[8];
+    if constexpr (!IS_BLK0_LAST) {
+        if (r_cur_max_in == nullptr) {
+            if constexpr (T::Arch_value == 80) {
+                int lane4 = idx_in_warpgroup % 4;
+                CUTLASS_PRAGMA_UNROLL
+                for (int k = 0; k < 2; k++) {
+                    int base = (k * 16 + lane4) % T::kBlockN;
+                    r_valid[k*4]   = smem_valid_indices(valid_indices_buf, base);
+                    r_valid[k*4+1] = smem_valid_indices(valid_indices_buf, (base + 4) % T::kBlockN);
+                    r_valid[k*4+2] = smem_valid_indices(valid_indices_buf, (base + 8) % T::kBlockN);
+                    r_valid[k*4+3] = smem_valid_indices(valid_indices_buf, (base + 12) % T::kBlockN);
+                }
+            } else {
+                // each thread needs 8 values (4 groups of 2)
+                int lane4 = idx_in_warpgroup % 4;
+                CUTLASS_PRAGMA_UNROLL
+                for (int k = 0; k < 4; k++) {
+                    int base = (k * 8 + lane4 * 2) % T::kBlockN;
+                    r_valid[k*2]   = smem_valid_indices(valid_indices_buf, base);
+                    r_valid[k*2+1] = smem_valid_indices(valid_indices_buf, (base + 1) % T::kBlockN);
+                }
+            }
+        }
+    }
     if constexpr (T::Arch_value == 80) {
         CUTLASS_PRAGMA_UNROLL
         for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx)
         {
             int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
 
-            // Mask, and get row-wise max
-            float cur_max = MAX_INIT_VAL;
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8)
-            {
-                if constexpr (IS_BLK1_LAST || IS_BLK2_LAST)
+            float cur_max;
+            if (r_cur_max_in) {
+                cur_max = r_cur_max_in[local_row_idx];
+            } else {
+                cur_max = MAX_INIT_VAL;
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8)
                 {
-                    // Need to apply the mask when either this block is the last one, or
-                    // the next block is the last one (because of the causal mask)
-                    // int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
-                    int token_idx = start_token_idx + (i / 8) * 16 + idx_in_warpgroup % 4;
-                    rP1(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP1(i) : MAX_INIT_VAL;
-                    rP1(i + 1) = token_idx + 4 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 1) : MAX_INIT_VAL;
-                    rP1(i + 2) = token_idx + 8 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 2) : MAX_INIT_VAL;
-                    rP1(i + 3) = token_idx + 12 < rRightBorderForQSeq[local_row_idx] ? rP1(i + 3) : MAX_INIT_VAL;
-                }
-                else if constexpr (IS_BLK0_LAST)
-                {
-                    rP1(i) = rP1(i + 1) = rP1(i + 2) = rP1(i + 3) = MAX_INIT_VAL;
-                }
-                cur_max = max(cur_max, max(max(rP1(i), rP1(i + 1)), max(rP1(i + 2), rP1(i + 3))));
-            }
-            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
-            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+                    if constexpr (IS_BLK0_LAST)
+                    {
+                        rP1(i) = rP1(i + 1) = rP1(i + 2) = rP1(i + 3) = MAX_INIT_VAL;
+                    }
 
-            cur_max *= scale_softmax_log2;
+                    if constexpr (!IS_BLK0_LAST)
+                    {
+                        int k_base = ((i/8) % 2) * 4;
+                        rP1(i)     = r_valid[k_base]     ? rP1(i)     : MAX_INIT_VAL;
+                        rP1(i + 1) = r_valid[k_base + 1] ? rP1(i + 1) : MAX_INIT_VAL;
+                        rP1(i + 2) = r_valid[k_base + 2] ? rP1(i + 2) : MAX_INIT_VAL;
+                        rP1(i + 3) = r_valid[k_base + 3] ? rP1(i + 3) : MAX_INIT_VAL;
+                    }
+                    cur_max = max(cur_max, max(max(rP1(i), rP1(i + 1)), max(rP1(i + 2), rP1(i + 3))));
+                }
+                cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
+                cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+
+                cur_max *= scale_softmax_log2;
+            }
 
             float old_max = sM(row_idx);
             float new_max = max(old_max, cur_max);
@@ -627,25 +753,29 @@ __forceinline__ __device__ auto wg1_bunch_0(
             int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
 
             // Mask, and get row-wise max
-            float cur_max = MAX_INIT_VAL;
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
-                if constexpr (IS_BLK1_LAST || IS_BLK2_LAST) {
-                    // Need to apply the mask when either this block is the last one, or
-                    // the next block is the last one (because of the causal mask)
-                    int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
-                    rP1(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP1(i) : MAX_INIT_VAL;
-                    rP1(i+1) = token_idx+1 < rRightBorderForQSeq[local_row_idx] ? rP1(i+1) : MAX_INIT_VAL;
+            float cur_max;
+            if (r_cur_max_in) {
+                cur_max = r_cur_max_in[local_row_idx];
+            } else {
+                cur_max = MAX_INIT_VAL;
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
+                    if constexpr (IS_BLK0_LAST) {
+                        rP1(i) = rP1(i+1) = MAX_INIT_VAL;
+                    }
 
-                } else if constexpr (IS_BLK0_LAST) {
-                    rP1(i) = rP1(i+1) = MAX_INIT_VAL;
+                    if constexpr (!IS_BLK0_LAST) {
+                        int k_base = ((i/4) % 4) * 2;
+                        rP1(i)   = r_valid[k_base]     ? rP1(i)   : MAX_INIT_VAL;
+                        rP1(i+1) = r_valid[k_base + 1] ? rP1(i+1) : MAX_INIT_VAL;
+                    }
+                    cur_max = max(cur_max, max(rP1(i), rP1(i+1)));
                 }
-                cur_max = max(cur_max, max(rP1(i), rP1(i+1)));
-            }
 
-            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
-            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
-            cur_max *= scale_softmax_log2;
+                cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
+                cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+                cur_max *= scale_softmax_log2;
+            }
 
             float old_max = sM(row_idx);
             float new_max = max(old_max, cur_max);
@@ -676,6 +806,94 @@ __forceinline__ __device__ auto wg1_bunch_0(
             rL[local_row_idx] = rL[local_row_idx]*cur_scale_for_o1 + cur_sum;
         }
         return rP1b;
+    }
+}
+
+// dsa_wg1_bunch_0_pre: compute cur_max before the sScale0Ready barrier
+template<
+    typename T,
+    bool IS_BLK0_LAST,
+    bool IS_BLK1_LAST,
+    typename Engine5, typename Layout5,
+    typename EngineVI, typename LayoutVI
+>
+__forceinline__ __device__ void dsa_wg1_bunch_0_pre(
+    float r_cur_max[2],               // output: per-row cur_max * scale_softmax_log2
+    Tensor<Engine5, Layout5> &rP1,    // ((2, 2, 8), 1, 1)
+    float scale_softmax_log2,
+    int start_token_idx,
+    int idx_in_warpgroup,
+    Tensor<EngineVI, LayoutVI> &smem_valid_indices,
+    int valid_indices_buf
+)
+{
+    // Same preload as wg1_bunch_0: identical vi slot and column mapping.
+    [[maybe_unused]] int r_valid[8];
+    if constexpr (!IS_BLK0_LAST) {
+        if constexpr (T::Arch_value == 80) {
+            int lane4 = idx_in_warpgroup % 4;
+            CUTLASS_PRAGMA_UNROLL
+            for (int k = 0; k < 2; k++) {
+                int base = (k * 16 + lane4) % T::kBlockN;
+                r_valid[k*4]   = smem_valid_indices(valid_indices_buf, base);
+                r_valid[k*4+1] = smem_valid_indices(valid_indices_buf, (base + 4) % T::kBlockN);
+                r_valid[k*4+2] = smem_valid_indices(valid_indices_buf, (base + 8) % T::kBlockN);
+                r_valid[k*4+3] = smem_valid_indices(valid_indices_buf, (base + 12) % T::kBlockN);
+            }
+        } else {
+            // each thread needs 8 values (4 groups of 2)
+            int lane4 = idx_in_warpgroup % 4;
+            CUTLASS_PRAGMA_UNROLL
+            for (int k = 0; k < 4; k++) {
+                int base = (k * 8 + lane4 * 2) % T::kBlockN;
+                r_valid[k*2]   = smem_valid_indices(valid_indices_buf, base);
+                r_valid[k*2+1] = smem_valid_indices(valid_indices_buf, (base + 1) % T::kBlockN);
+            }
+        }
+    }
+    if constexpr (T::Arch_value == 80) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+            float cur_max = MAX_INIT_VAL;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8) {
+                if constexpr (IS_BLK0_LAST)
+                {
+                    rP1(i) = rP1(i + 1) = rP1(i + 2) = rP1(i + 3) = MAX_INIT_VAL;
+                }
+                else
+                {
+                    int k_base = ((i/8) % 2) * 4;
+                    rP1(i)     = r_valid[k_base]     ? rP1(i)     : MAX_INIT_VAL;
+                    rP1(i + 1) = r_valid[k_base + 1] ? rP1(i + 1) : MAX_INIT_VAL;
+                    rP1(i + 2) = r_valid[k_base + 2] ? rP1(i + 2) : MAX_INIT_VAL;
+                    rP1(i + 3) = r_valid[k_base + 3] ? rP1(i + 3) : MAX_INIT_VAL;
+                }
+                cur_max = max(cur_max, max(max(rP1(i), rP1(i + 1)), max(rP1(i + 2), rP1(i + 3))));
+            }
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+            r_cur_max[local_row_idx] = cur_max * scale_softmax_log2;
+        }
+    } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+            float cur_max = MAX_INIT_VAL;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
+                if constexpr (IS_BLK0_LAST) {
+                    rP1(i) = rP1(i+1) = MAX_INIT_VAL;
+                } else {
+                    int k_base = ((i/4) % 4) * 2;
+                    rP1(i)   = r_valid[k_base]     ? rP1(i)   : MAX_INIT_VAL;
+                    rP1(i+1) = r_valid[k_base + 1] ? rP1(i+1) : MAX_INIT_VAL;
+                }
+                cur_max = max(cur_max, max(rP1(i), rP1(i+1)));
+            }
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+            r_cur_max[local_row_idx] = cur_max * scale_softmax_log2;
+        }
     }
 }
 
@@ -1007,14 +1225,8 @@ template <
     typename Engine10, typename Layout10,
     typename Engine11, typename Layout11,
     typename Engine12, typename Layout12,
-    typename Engine13, typename Layout13
-#if DSA_SIM_AIU
-    ,
-    typename Engine14, typename Layout14,
-    typename Engine15, typename Layout15,
-    typename Engine16, typename Layout16,
-    typename Engine17, typename Layout17
-#endif
+    typename Engine13, typename Layout13,
+    typename EngineVI, typename LayoutVI
 >
 __forceinline__ __device__ void dsa_wg0_subroutine(
     TiledCopy tiled_copy,
@@ -1032,14 +1244,7 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
     Tensor<Engine11, Layout11> &rQ8,
     Tensor<Engine12, Layout12> &rP0,
     Tensor<Engine13, Layout13> &rO0,
-#if DSA_SIM_AIU
-    Tensor<Engine14, Layout14> sKSim,
-    Tensor<Engine15, Layout15> &cur_sKSim0,
-    Tensor<Engine16, Layout16> &cur_sKSim1,
-    Tensor<Engine17, Layout17> &nxt_sKSim0,
-#endif
     float rL[2],
-    int rRightBorderForQSeq[2],
     __mbarrier_t barriers_K0[T::kHeadDim/256],
     __mbarrier_t barriers_K1[T::kHeadDim/256],
     bool &cur_phase_K0,
@@ -1047,12 +1252,18 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
     int* gIndices_ptr,
     int seqlen_k,
     int block_idx,
-    int end_block_idx,
+    int end_block_idx,       // [Even-align] ROUNDED-up (even) block count: loop/issue/compute guards
+    int real_end_block_idx,  // [Even-align] REAL topk block count: gIndices prefetch guards only
     int idx_in_warpgroup,
     int wg_idx,
     int &kv_idx,
     int& nxt_token_idx0,
-    int& nxt_token_idx1
+    int& nxt_token_idx1, 
+    typename T::InputT*& precomp_ptr0,
+    typename T::InputT*& precomp_ptr1,
+    bool& precomp_valid0,
+    bool& precomp_valid1,
+    Tensor<EngineVI, LayoutVI> &smem_valid_indices
 ) {
     using InputT = typename T::InputT;
     int start_token_idx = block_idx * T::kBlockN;
@@ -1065,7 +1276,8 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
 
     auto nxt_sK1 = cur_sK0;
 #if DSA_SIM_AIU
-    auto nxt_sKSim1 = cur_sKSim0;
+    auto nxt_sKSim0 = make_tensor(nxt_sK0.data(), (typename T::SmemLayoutKSim){})(_, _, 0);
+    auto nxt_sKSim1 = make_tensor(nxt_sK1.data(), (typename T::SmemLayoutKSim){})(_, _, 0);
     int sim_cross_tid;
     if constexpr (T::Arch_value == 80) {
         int cross_tid_h = (idx_in_warpgroup & 0xFFFFFFF8) >> 3;
@@ -1078,10 +1290,13 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
     }
 #endif
 
+    Tensor rPb = wg0_bunch_0< T, IS_BLK0_LAST || IS_BLK1_LAST > (rP0, rO0, sScale0, sM, rL,
+        params.sm_scale_div_log2, start_token_idx, idx_in_warpgroup,
+        smem_valid_indices, (block_idx/2)%2
+    );
+    NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale0Ready);
+
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        bool is_token_valid = nxt_token_idx0 >= 0 && nxt_token_idx0 < params.s_kv;
-        tKgK.data() = gK_base + nxt_token_idx0 * (int64_t)params.stride_kv_s_kv + (idx_in_warpgroup % 8) * 8;
-        tiled_copy.pred = is_token_valid;
 #if DSA_SIM_AIU
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(sim_cross_tid);
         Tensor tKsK0 = gmem_thr_copy_K.partition_D(nxt_sKSim0);
@@ -1089,14 +1304,9 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
         Tensor tKsK0 = gmem_thr_copy_K.partition_D(nxt_sK0);
 #endif
-        launch_kv_tiles_dsa_wg<0, 4>(tiled_copy, tKgK, tKsK0, &barriers_K0[0]);
-        if (nxt_block0 < end_block_idx) {
-            nxt_token_idx0 = __ldg(gIndices_ptr + nxt_block0 * T::kBlockN);
-        }
+        dsa_issue_K_load<0, 4, T>(tiled_copy, tKgK, tKsK0, &barriers_K0[0],
+            precomp_ptr0, precomp_valid0, gIndices_ptr, nxt_block0, real_end_block_idx, nxt_token_idx0);
     }
-    // Calc P0 = softmax(P0)
-    Tensor rPb = wg0_bunch_0< T, IS_BLK0_LAST || IS_BLK1_LAST > (rP0, rO0, sScale0, sM, rL, rRightBorderForQSeq, params.sm_scale_div_log2, start_token_idx, idx_in_warpgroup);
-    NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale0Ready);
 
     // Issue rO0 += rPb @ sV0L
     wg0_scale0_rO0<T>(rO0, sScale0, idx_in_warpgroup);
@@ -1106,9 +1316,6 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
     if (!IS_BLK0_LAST && !IS_BLK1_LAST && __builtin_expect(block_idx + 3 < end_block_idx, true)) {
-        bool is_token_valid = nxt_token_idx1 >= 0 && nxt_token_idx1 < params.s_kv;
-        tKgK.data() = gK_base + nxt_token_idx1 * (int64_t)params.stride_kv_s_kv + (idx_in_warpgroup % 8) * 8;
-        tiled_copy.pred = is_token_valid;
 #if DSA_SIM_AIU
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(sim_cross_tid);
         Tensor tKsK1 = gmem_thr_copy_K.partition_D(nxt_sKSim1);
@@ -1116,10 +1323,8 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
         Tensor tKsK1 = gmem_thr_copy_K.partition_D(nxt_sK1);
 #endif
-        launch_kv_tiles_dsa_wg<0, 4>(tiled_copy, tKgK, tKsK1, &barriers_K1[0]);
-        if (nxt_block1 < end_block_idx) {
-            nxt_token_idx1 = __ldg(gIndices_ptr + nxt_block1 * T::kBlockN);
-        }
+        dsa_issue_K_load<0, 4, T>(tiled_copy, tKgK, tKsK1, &barriers_K1[0],
+            precomp_ptr1, precomp_valid1, gIndices_ptr, nxt_block1, real_end_block_idx, nxt_token_idx1);
     }
 
     wg0_scale_rP0<T>(sScale1, rP0, rPb, idx_in_warpgroup);
@@ -1140,6 +1345,22 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
         dsa_warpgroup_cooperative_qkt_gemm<T, 0>(sQ, nxt_sK0, nxt_sK1, rP0, rQ8, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
     }
 
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // block_idx+4 (even, WG0-owned): this compute point writes its flag.
+        // vi slot (block_idx/2)%2 == ((block_idx+4)/2)%2 -- the same slot the
+        // top-of-subroutine softmax read for block_idx; that read is already
+        // done, so the in-place slot reuse is safe. 
+        if (block_idx + 4 < end_block_idx) {
+            dsa_compute_K_addr<T, true>(params, gK_base, nxt_token_idx0, block_idx + 4, seqlen_k, idx_in_warpgroup,
+                smem_valid_indices, (block_idx/2)%2, precomp_ptr0, precomp_valid0);
+        }
+        // block_idx+5 (odd, WG1-owned): address only 
+        if (block_idx + 5 < end_block_idx) {
+            dsa_compute_K_addr<T, false>(params, gK_base, nxt_token_idx1, block_idx + 5, seqlen_k, idx_in_warpgroup,
+                smem_valid_indices, 0, precomp_ptr1, precomp_valid1);
+        }
+    }
+
     // Issue P0 = Q @ K0^T
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST)
     {
@@ -1150,18 +1371,12 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
     cur_sK0 = sK(_, _, kv_idx);
     cur_sK1 = sK(_, _, (kv_idx + 1) % 3);
     nxt_sK0 = sK(_, _, (kv_idx + 2) % 3);
-#if DSA_SIM_AIU
-    cur_sKSim0 = sKSim(_, _, kv_idx);
-    cur_sKSim1 = sKSim(_, _, (kv_idx + 1) % 3);
-    nxt_sKSim0 = sKSim(_, _, (kv_idx + 2) % 3);
-#endif
 }
 
 template <
     typename T,
     bool IS_BLK0_LAST,
     bool IS_BLK1_LAST,
-    bool IS_BLK2_LAST,
     typename TiledCopy,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
@@ -1176,14 +1391,8 @@ template <
     typename Engine10, typename Layout10,
     typename Engine11, typename Layout11,
     typename Engine12, typename Layout12,
-    typename Engine13, typename Layout13
-#if DSA_SIM_AIU
-    ,
-    typename Engine14, typename Layout14,
-    typename Engine15, typename Layout15,
-    typename Engine16, typename Layout16,
-    typename Engine17, typename Layout17
-#endif
+    typename Engine13, typename Layout13,
+    typename EngineVI, typename LayoutVI
 >
 __forceinline__ __device__ void dsa_wg1_subroutine(
     TiledCopy tiled_copy,
@@ -1201,14 +1410,7 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
     Tensor<Engine11, Layout11> &rQ8,
     Tensor<Engine12, Layout12> &rP1,
     Tensor<Engine13, Layout13> &rO1,
-#if DSA_SIM_AIU
-    Tensor<Engine14, Layout14> sKSim,
-    Tensor<Engine15, Layout15> &cur_sKSim1,
-    Tensor<Engine16, Layout16> &cur_sKSim0,
-    Tensor<Engine17, Layout17> &nxt_sKSim1,
-#endif
     float rL[2],
-    int rRightBorderForQSeq[2],
     __mbarrier_t barriers_K0[T::kHeadDim/256],
     __mbarrier_t barriers_K1[T::kHeadDim/256],
     bool &cur_phase_K1,
@@ -1216,12 +1418,18 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
     int* gIndices_ptr,
     int seqlen_k,
     int block_idx,
-    int end_block_idx,
+    int end_block_idx,       // [Even-align] ROUNDED-up (even) block count: loop/issue/compute guards
+    int real_end_block_idx,  // [Even-align] REAL topk block count: gIndices prefetch guards only
     int idx_in_warpgroup,
     int wg_idx,
     int &kv_idx,
     int& nxt_token_idx0,
-    int& nxt_token_idx1
+    int& nxt_token_idx1, 
+    typename T::InputT*& precomp_ptr0,
+    typename T::InputT*& precomp_ptr1,
+    bool& precomp_valid0,
+    bool& precomp_valid1,
+    Tensor<EngineVI, LayoutVI> &smem_valid_indices
 ) {
     using InputT = typename T::InputT;
     int start_token_idx = block_idx * T::kBlockN;
@@ -1233,7 +1441,8 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
     Tensor sV0R = get_half_V<T, 1>(cur_sK0);
     Tensor sV1R = get_half_V<T, 1>(cur_sK1);
 #if DSA_SIM_AIU
-    auto nxt_sKSim0 = cur_sKSim1;
+    auto nxt_sKSim1 = make_tensor(nxt_sK1.data(), (typename T::SmemLayoutKSim){})(_, _, 0);
+    auto nxt_sKSim0 = make_tensor(nxt_sK0.data(), (typename T::SmemLayoutKSim){})(_, _, 0);
     int sim_cross_tid;
     if constexpr (T::Arch_value == 80) {
         int cross_tid_h = (idx_in_warpgroup & 0xFFFFFFF8) >> 3;
@@ -1247,10 +1456,7 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
 #endif
 
     // Wait for rO1 += rP1b @ sV1R, launch TMA for the next V1R
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST) {
-        bool is_token_valid = nxt_token_idx1 >= 0 && nxt_token_idx1 < params.s_kv;
-        tKgK.data() = gK_base + nxt_token_idx1 * (int64_t)params.stride_kv_s_kv + (idx_in_warpgroup % 8) * 8;
-        tiled_copy.pred = is_token_valid;
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
 #if DSA_SIM_AIU
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(sim_cross_tid);
         Tensor tKsK1 = gmem_thr_copy_K.partition_D(nxt_sKSim1);
@@ -1258,15 +1464,23 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
         Tensor tKsK1 = gmem_thr_copy_K.partition_D(nxt_sK1);
 #endif
-        launch_kv_tiles_dsa_wg<4, T::NUM_TILES>(tiled_copy, tKgK, tKsK1, &barriers_K1[1]);
-        if (nxt_block1 < end_block_idx) {
-            nxt_token_idx1 = __ldg(gIndices_ptr + nxt_block1 * T::kBlockN);
-        }
+        dsa_issue_K_load<4, T::NUM_TILES, T>(tiled_copy, tKgK, tKsK1, &barriers_K1[1],
+            precomp_ptr0, precomp_valid0, gIndices_ptr, nxt_block1, real_end_block_idx, nxt_token_idx1);
     }
+
+    float r_cur_max[2];
+    dsa_wg1_bunch_0_pre<T, IS_BLK0_LAST, IS_BLK1_LAST>(r_cur_max, rP1,
+        params.sm_scale_div_log2, start_token_idx+T::kBlockN, idx_in_warpgroup,
+        smem_valid_indices, 2+(block_idx/2)%2
+    );
+
     // Wait for rP1 and warpgroup 0, run bunch 1, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
 
-    Tensor rP1b = wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(sScale1, rO1, sM, rL, rRightBorderForQSeq, sScale0, rP1, params.sm_scale_div_log2, start_token_idx+T::kBlockN, idx_in_warpgroup);
+    Tensor rP1b = wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST>(sScale1, rO1, sM, rL,
+        sScale0, rP1, params.sm_scale_div_log2, start_token_idx+T::kBlockN, idx_in_warpgroup,
+        smem_valid_indices, 2+(block_idx/2)%2, r_cur_max
+    );
 
     // Save rPb to sP before arriving sScale1Ready, so that sScale1Ready also guarantees
     // that sP1 is ready for warpgroup 0's remote P V gemm (which reads sP1 after waiting
@@ -1285,9 +1499,6 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sP0Ready);
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        bool is_token_valid = nxt_token_idx0 >= 0 && nxt_token_idx0 < params.s_kv;
-        tKgK.data() = gK_base + nxt_token_idx0 * (int64_t)params.stride_kv_s_kv + (idx_in_warpgroup % 8) * 8;
-        tiled_copy.pred = is_token_valid;
 #if DSA_SIM_AIU
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(sim_cross_tid);
         Tensor tKsK0 = gmem_thr_copy_K.partition_D(nxt_sKSim0);
@@ -1295,17 +1506,30 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(idx_in_warpgroup);
         Tensor tKsK0 = gmem_thr_copy_K.partition_D(nxt_sK0);
 #endif
-        launch_kv_tiles_dsa_wg<4, T::NUM_TILES>(tiled_copy, tKgK, tKsK0, &barriers_K0[1]);
-        if (nxt_block0 < end_block_idx) {
-            nxt_token_idx0 = __ldg(gIndices_ptr + nxt_block0 * T::kBlockN);
+        dsa_issue_K_load<4, T::NUM_TILES, T>(tiled_copy, tKgK, tKsK0, &barriers_K0[1],
+            precomp_ptr1, precomp_valid1, gIndices_ptr, nxt_block0, real_end_block_idx, nxt_token_idx0);
+    }
+
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // block_idx+5 (odd, WG1-owned): this compute point writes its flag.
+        // vi slot 2+(block_idx/2)%2 == 2+((block_idx+5)/2)%2 -- the same slot
+        // this iteration's bunch_0_pre/wg1_bunch_0 read for block_idx+1; that
+        // read is already done (top of the subroutine), so the in-place slot
+        // reuse is safe. 
+        if (block_idx + 5 < end_block_idx) {
+            dsa_compute_K_addr<T, true>(params, gK_base, nxt_token_idx1, block_idx + 5, seqlen_k, idx_in_warpgroup,
+                smem_valid_indices, 2+(block_idx/2)%2, precomp_ptr0, precomp_valid0);
+        }
+        // block_idx+4 (even, WG0-owned): address only
+        if (block_idx + 4 < end_block_idx) {
+            dsa_compute_K_addr<T, false>(params, gK_base, nxt_token_idx0, block_idx + 4, seqlen_k, idx_in_warpgroup,
+                smem_valid_indices, 0, precomp_ptr1, precomp_valid1);
         }
     }
 
     dsa_warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup, wg_idx);
 
-
-
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST) {
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
         cute::clear(rP1);
         // Issue rP1 = sQ @ sK1, wait
         dsa_warpgroup_cooperative_qkt_gemm<T, 1>(sQ, nxt_sK0, nxt_sK1, rP1, rQ8, barriers_K1, cur_phase_K1, idx_in_warpgroup, wg_idx);
@@ -1315,11 +1539,6 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
     cur_sK1 = sK(_, _, kv_idx);
     cur_sK0 = sK(_, _, (kv_idx + 1) % 3);
     nxt_sK1 = sK(_, _, (kv_idx + 2) % 3);
-#if DSA_SIM_AIU
-    cur_sKSim1 = sKSim(_, _, kv_idx);
-    cur_sKSim0 = sKSim(_, _, (kv_idx + 1) % 3);
-    nxt_sKSim1 = sKSim(_, _, (kv_idx + 2) % 3);
-#endif
 }
 
 __forceinline__ __device__ int get_mask_len(const SparsePrefillParams &params, int m_block_idx, int local_seq_q_idx) {
@@ -1365,12 +1584,16 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
     Tensor sL_reduction_wksp = make_tensor(make_smem_ptr(plan.sL_reduction_wksp.data()), make_shape(Int<2 * T::BLOCK_SIZE_M>{}));
     Tensor sScale0 = make_tensor(make_smem_ptr(plan.smem_sScale0.data()), make_shape(Int<T::BLOCK_SIZE_M>{}));
     Tensor sScale1 = make_tensor(make_smem_ptr(plan.smem_sScale1.data()), make_shape(Int<T::BLOCK_SIZE_M>{}));
+    Tensor smem_valid_indices = make_tensor(make_smem_ptr(plan.smem_valid_indices.data()),
+        Shape<_4, Int<T::kBlockN>>{}, Stride<Int<T::kBlockN>, _1>{});
     char *sO_addr = (char *)plan.smem_sQ.data(); // Overlap with sK0 and sK1
     int q_idx = m_block_idx / (params.h_q / T::kBlockM);
     int* gIndices_ptr = params.indices + (int64_t)q_idx * params.stride_indices_s_q + idx_in_warpgroup / 8;
     InputT* gK_base = reinterpret_cast<InputT*>(params.kv);
     int nxt_token_idx0 = -1;
     int nxt_token_idx1 = -1;
+    InputT *precomp_ptr0 = nullptr, *precomp_ptr1 = nullptr;
+    bool precomp_valid0 = false, precomp_valid1 = false;
     constexpr int kBlockN = T::kBlockN;
 
     // Define TMA stuffs
@@ -1389,22 +1612,28 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
     }
     __syncthreads();
 
+    // [Even-align] seqlen_k and the block range are computed BEFORE the initial
+    // token-index reads so those reads can be guarded by the REAL block count.
+    // real_end_block_idx: true topk block count (ceil(seqlen_k/kBlockN)) -- the
+    //   ONLY bound ever used to guard gIndices reads; the indices row has
+    //   exactly topk entries, so the rounded-up padding block has no backing
+    //   memory there.
+    // end_block_idx: real_end rounded UP to an even block count (seqlen_k
+    //   rounded to 2 blocks = 64 tokens
+    int seqlen_k = params.topk_length ? __ldg(params.topk_length + q_idx) : params.topk;
+    int start_block_idx = 0;
+    int real_end_block_idx = cute::ceil_div(seqlen_k, kBlockN);
+    int end_block_idx = cute::ceil_div(cute::round_up(seqlen_k, 2 * kBlockN), kBlockN);
+
     if (warpgroup_idx == 0) {
-        nxt_token_idx0 = __ldg(gIndices_ptr);
+        nxt_token_idx0 = 0 < real_end_block_idx ? __ldg(gIndices_ptr) : -1;
     } else {
-        nxt_token_idx1 = __ldg(gIndices_ptr + kBlockN);
+        nxt_token_idx1 = 1 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN) : -1;
     }
 
     bool cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
-
-
     // Copy the first Q
     launch_q_dsa_prefill_wg<T>(params, m_block_idx, sQ, tidx, warp_idx, barrier_Q);
-
-    int seqlen_k = params.topk_length ? __ldg(params.topk_length + q_idx) : params.topk;
-    int start_block_idx = 0;
-    int end_block_idx = cute::ceil_div(seqlen_k, kBlockN);
-    int rRightBorderForQSeq[2] = {seqlen_k, seqlen_k};
 
     Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<InputT*>(params.kv)),
                         Shape<Int<kBlockN>, Int<T::kHeadDim>>{},
@@ -1435,7 +1664,6 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
 #if DSA_SIM_AIU
     Tensor cur_sKSim0 = sKSim(_, _, 0);
     Tensor cur_sKSim1 = sKSim(_, _, 1);
-    Tensor nxt_sKSim0 = sKSim(_, _, 2);
     Tensor tKsK0 = gmem_thr_copy_K.partition_D(cur_sKSim0);
     Tensor tKsK1 = gmem_thr_copy_K.partition_D(cur_sKSim1);
 #else
@@ -1444,24 +1672,59 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
 #endif
 
     if (warpgroup_idx == 0 && seqlen_k != 0) {
-        bool is_token_valid = nxt_token_idx0 >= 0 && nxt_token_idx0 < params.s_kv;
-        tKgK.data() = gK_base + nxt_token_idx0 * (int64_t)params.stride_kv_s_kv + (idx_in_warpgroup % 8) * 8;
-        gmem_tiled_copy_K.pred = is_token_valid; // !!!!!!!!!
-        launch_kv_tiles_dsa_wg<4, T::NUM_TILES>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K0[1]);
-        launch_kv_tiles_dsa_wg<0, 4>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K0[0]);
-        nxt_token_idx0 = __ldg(gIndices_ptr + kBlockN * 2);
-        nxt_token_idx1 = __ldg(gIndices_ptr + kBlockN * 3);
+        InputT *addr_blk0; bool valid_blk0;
+        dsa_compute_K_addr<T, true>(params, gK_base, nxt_token_idx0, start_block_idx, seqlen_k, idx_in_warpgroup,
+            smem_valid_indices, (start_block_idx/2)%2, addr_blk0, valid_blk0);
+        dsa_issue_K_load<4, T::NUM_TILES, T, false>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K0[1],
+            addr_blk0, valid_blk0, gIndices_ptr, 0, real_end_block_idx, nxt_token_idx0);
+        dsa_issue_K_load<0, 4, T, false>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K0[0],
+            addr_blk0, valid_blk0, gIndices_ptr, 0, real_end_block_idx, nxt_token_idx0);
+        // [Even-align] guarded by the REAL block count; padding blocks -> -1 (invalid).
+        nxt_token_idx0 = 2 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN * 2) : -1;
+        nxt_token_idx1 = 3 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN * 3) : -1;
+        // WG-scope barrier: makes the flag stores above visible to all 256 threads
+        // of WG0 before iteration-0's wg0_bunch_0 reads them (no other barrier sits
+        // between the prolog write and that read). WG0-only: does not couple the
+        // WG0/WG1 arrive/wait skew, hence no cross-WG sync stall.
+        NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup0);
+        if (start_block_idx + 2 < end_block_idx) {
+            dsa_compute_K_addr<T, true>(params, gK_base, nxt_token_idx0, start_block_idx + 2, seqlen_k, idx_in_warpgroup,
+                smem_valid_indices, (start_block_idx/2+1)%2, precomp_ptr0, precomp_valid0);
+        }
+        if (start_block_idx + 3 < end_block_idx) {
+            dsa_compute_K_addr<T, false>(params, gK_base, nxt_token_idx1, start_block_idx + 3, seqlen_k, idx_in_warpgroup,
+                smem_valid_indices, 0, precomp_ptr1, precomp_valid1);
+        }
     }
 
     if (start_block_idx+1 < end_block_idx) {
         if (warpgroup_idx == 1) {
-            bool is_token_valid = nxt_token_idx1 >= 0 && nxt_token_idx1 < params.s_kv;
-            tKgK.data() = gK_base + nxt_token_idx1 * (int64_t)params.stride_kv_s_kv + (idx_in_warpgroup % 8) * 8;
-            gmem_tiled_copy_K.pred = is_token_valid;
-            launch_kv_tiles_dsa_wg<4, T::NUM_TILES>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K1[1]);
-            launch_kv_tiles_dsa_wg<0, 4>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K1[0]);
-            nxt_token_idx0 = __ldg(gIndices_ptr + kBlockN * 2);
-            nxt_token_idx1 = __ldg(gIndices_ptr + kBlockN * 3);
+            InputT *addr_blk1; bool valid_blk1;
+            dsa_compute_K_addr<T, true>(params, gK_base, nxt_token_idx1, start_block_idx + 1, seqlen_k, idx_in_warpgroup,
+                smem_valid_indices, 2+(start_block_idx/2)%2, addr_blk1, valid_blk1);
+            dsa_issue_K_load<4, T::NUM_TILES, T, false>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K1[1],
+                addr_blk1, valid_blk1, gIndices_ptr, 0, real_end_block_idx, nxt_token_idx0);
+            dsa_issue_K_load<0, 4, T, false>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K1[0],
+                addr_blk1, valid_blk1, gIndices_ptr, 0, real_end_block_idx, nxt_token_idx0);
+            // [Even-align] guarded by the REAL block count; padding blocks -> -1 (invalid).
+            nxt_token_idx0 = 2 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN * 2) : -1;
+            nxt_token_idx1 = 3 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN * 3) : -1;
+            // [Opt-A] WG1-scope barrier, mirroring the mGroup0 one above:
+            // iteration-0's dsa_wg1_bunch_0_pre now reads the block-1 flags
+            // BEFORE the subroutine's sScale0Ready arrive_and_wait (which used
+            // to be the sole visibility cover -- see the comment at the flag
+            // store above), so the stores need their own WG1-scope barrier,
+            // exactly like WG0's mGroup0. WG1-only (256 threads): does not
+            // couple the WG0/WG1 arrive/wait skew, hence no cross-WG stall.
+            NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup1);
+            if (start_block_idx + 3 < end_block_idx) {
+                dsa_compute_K_addr<T, true>(params, gK_base, nxt_token_idx1, start_block_idx + 3, seqlen_k, idx_in_warpgroup,
+                    smem_valid_indices, 2+(start_block_idx/2+1)%2, precomp_ptr0, precomp_valid0);
+            }
+            if (start_block_idx + 2 < end_block_idx) {
+                dsa_compute_K_addr<T, false>(params, gK_base, nxt_token_idx0, start_block_idx + 2, seqlen_k, idx_in_warpgroup,
+                    smem_valid_indices, 0, precomp_ptr1, precomp_valid1);
+            }
         }
     }
 
@@ -1499,21 +1762,13 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
         }
 
         int idx = 0;
-#if DSA_SIM_AIU
         #define DSA_LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
             dsa_wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>(                            \
             gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
-            rP0, rO, sKSim, cur_sKSim0, cur_sKSim1, nxt_sKSim0, rL, rRightBorderForQSeq,                   \
-            barriers_K0, barriers_K1, cur_phase_K0, params, gIndices_ptr, seqlen_k,  \
-            block_idx, end_block_idx, idx_in_warpgroup, wg_idx, idx, nxt_token_idx0, nxt_token_idx1);
-#else
-        #define DSA_LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
-            dsa_wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>(                            \
-            gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
-            rP0, rO, rL, rRightBorderForQSeq,                   \
+            rP0, rO, rL,                   \
             barriers_K0, barriers_K1, cur_phase_K0, params, gIndices_ptr, seqlen_k, \
-            block_idx, end_block_idx, idx_in_warpgroup, wg_idx, idx, nxt_token_idx0, nxt_token_idx1);
-#endif
+            block_idx, end_block_idx, real_end_block_idx, idx_in_warpgroup, wg_idx, idx, nxt_token_idx0, nxt_token_idx1, precomp_ptr0, precomp_ptr1, precomp_valid0, precomp_valid1 \
+            , smem_valid_indices);
 
         int block_idx = start_block_idx;
 
@@ -1522,10 +1777,11 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
             DSA_LAUNCH_WG0_SUBROUTINE(false, false);
         }
 
-        if (block_idx+1 < end_block_idx) {
+        // [Even-align] end_block_idx is always even, so the loop leaves exactly
+        // one uniform 2-block tail; the IS_BLK0_LAST single-block branch is
+        // unreachable and removed (mirrors decode's single tail form).
+        if (block_idx < end_block_idx) {
             DSA_LAUNCH_WG0_SUBROUTINE(false, true);
-        } else if (block_idx < end_block_idx) {
-            DSA_LAUNCH_WG0_SUBROUTINE(true, false);
         }
     }
     else {
@@ -1540,38 +1796,25 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
         }
 
         int idx = 0;
-#if DSA_SIM_AIU
-        #define DSA_LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST)       \
-            dsa_wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(              \
+        #define DSA_LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
+            dsa_wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>(                            \
             gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
-            rP1, rO, sKSim, cur_sKSim0, cur_sKSim1, nxt_sKSim0, rL, rRightBorderForQSeq,                 \
+            rP1, rO, rL,                 \
             barriers_K0, barriers_K1, cur_phase_K1, params, gIndices_ptr, seqlen_k, \
-            block_idx, end_block_idx, idx_in_warpgroup, wg_idx, idx, nxt_token_idx0, nxt_token_idx1);
-#else
-        #define DSA_LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST)       \
-            dsa_wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(              \
-            gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
-            rP1, rO, rL, rRightBorderForQSeq,                 \
-            barriers_K0, barriers_K1, cur_phase_K1, params, gIndices_ptr, seqlen_k, \
-            block_idx, end_block_idx, idx_in_warpgroup, wg_idx, idx, nxt_token_idx0, nxt_token_idx1);
-#endif
+            block_idx, end_block_idx, real_end_block_idx, idx_in_warpgroup, wg_idx, idx, nxt_token_idx0, nxt_token_idx1, precomp_ptr0, precomp_ptr1, precomp_valid0, precomp_valid1 \
+            , smem_valid_indices);
 
         int block_idx = start_block_idx;
+        // [Even-align] end_block_idx is always even: bound end-2 gives the same
+        // trip count as the old end-3, and the loop leaves exactly one uniform
+        // 2-block tail. 
         #pragma unroll 1
-        for (; block_idx < end_block_idx-3; block_idx += 2) {
-            DSA_LAUNCH_WG1_SUBROUTINE(false, false, false);
+        for (; block_idx < end_block_idx-2; block_idx += 2) {
+            DSA_LAUNCH_WG1_SUBROUTINE(false, false);
         }
 
-        if (block_idx+2 < end_block_idx) {
-            DSA_LAUNCH_WG1_SUBROUTINE(false, false, true);
-            {
-                block_idx += 2;
-                DSA_LAUNCH_WG1_SUBROUTINE(true, false, false);
-            }
-        } else if (block_idx+1 < end_block_idx) {
-            DSA_LAUNCH_WG1_SUBROUTINE(false, true, false);
-        } else if (block_idx < end_block_idx) {
-            DSA_LAUNCH_WG1_SUBROUTINE(true, false, false);
+        if (block_idx < end_block_idx) {
+            DSA_LAUNCH_WG1_SUBROUTINE(false, true);
         }
     }
 
@@ -1583,6 +1826,12 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
 
     // Reduce rL across warpgroups
     int my_row = get_AorC_row_idx(0, idx_in_warpgroup);
+    float pre_sink0 = 0.0f, pre_sink1 = 0.0f;
+    if (params.attn_sink != nullptr && seqlen_k > 0) {
+        int head_block_idx = m_block_idx % (params.h_q / T::kBlockM);
+        pre_sink0 = __ldg(params.attn_sink + head_block_idx * T::BLOCK_SIZE_M + my_row);
+        pre_sink1 = __ldg(params.attn_sink + head_block_idx * T::BLOCK_SIZE_M + my_row + 8);
+    }
     if (idx_in_warpgroup % 4 == 0) {
         sL_reduction_wksp[my_row + warpgroup_idx * 128] = rL[0];
         sL_reduction_wksp[my_row + 8 + warpgroup_idx * 128] = rL[1];
@@ -1620,12 +1869,12 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
     // This ensures output = rO / rL_adjusted = sum(P*V) / (sum(P) + exp(attn_sink))
     // LSE and max_logits outputs are NOT affected (they read from sL_reduction_wksp, not rL)
     if (params.attn_sink != nullptr && seqlen_k > 0) {
-        int head_block_idx = m_block_idx % (params.h_q / T::kBlockM);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < 2; ++i) {
             int row_idx = get_AorC_row_idx(i, idx_in_warpgroup);
-            int head_idx = head_block_idx * T::BLOCK_SIZE_M + row_idx;
-            float sink_log2 = params.attn_sink[head_idx] * (float)M_LOG2E;
+            // attn_sink value pre-issued above (pre_sink0/pre_sink1, before the
+            // rL-reduction __syncthreads); only the arithmetic stays here.
+            float sink_log2 = (i == 0 ? pre_sink0 : pre_sink1) * (float)M_LOG2E;
             rL[i] += exp2f(sink_log2 - sM(row_idx));
         }
     }
@@ -1652,7 +1901,11 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
     if (i < num_valid_seq_q) {
         float cur_L = sL_reduction_wksp[i];
         gSoftmaxLse(i) = (cur_L == 0.0f || cur_L != cur_L) ? INFINITY : logf(cur_L) + sM(i) / (float)M_LOG2E;
-        gMLogits(i) = (seqlen_k == 0) ? -INFINITY : sM(i) * M_LN2;
+        // sM is monotonically non-decreasing from its init MAX_INIT_VAL_SM; staying at the
+        // init value means no column ever exceeded it, i.e. the row is entirely masked out
+        // (seqlen_k==0, or all selected tokens invalid / beyond the border). Emit -inf then,
+        // matching the reference max_logits semantics.
+        gMLogits(i) = (seqlen_k == 0 || sM(i) <= MAX_INIT_VAL_SM) ? -INFINITY : sM(i) * M_LN2;
     }
 }
 

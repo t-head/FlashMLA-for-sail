@@ -178,14 +178,29 @@ using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSm
         cute::array_aligned<float, 2*kBlockM> sL_reduction_wksp;
         cute::array_aligned<float, kBlockM> smem_sScale0;
         cute::array_aligned<float, kBlockM> smem_sScale1;
+        // NOTE: the mbarrier members MUST stay ahead of the valid-mask members
+        // below: their byte offsets are part of the measured perf baseline, and
+        // test_wait/arrive on them sits on the per-iteration critical path.
         __mbarrier_t barrier_Q;
         __mbarrier_t barriers_K0[kHeadDim/256];
         __mbarrier_t barriers_K1[kHeadDim/256];
+        // Per-token validity flags for the invalid-token mask in softmax; the
+        // topk_length right border is folded into each flag at the write points
+        // (absolute topk position < seqlen_k), so the flag is the single masking
+        // criterion and no separate border mask exists.
+        // 4 buffer slots: WG0 owns slots 0/1, WG1 owns slots 2/3.
+        cute::array_aligned<int, 4*kBlockN> smem_valid_indices;
     };
 
     struct SharedMemoryOutPut {
         cute::array_aligned<ElementAccum, cosize_v<SmemLayoutO>> smem_out;
     };
+
+    static constexpr size_t kSmemBudgetBytes = 256 * 1024;  // 262144
+    static_assert(sizeof(SharedMemoryPlan) <= kSmemBudgetBytes,
+                  "SharedMemoryPlan exceeds the 256 KiB PPU SMEM budget");
+    static_assert(sizeof(SharedMemoryOutPut) <= kSmemBudgetBytes,
+                  "SharedMemoryOutPut exceeds the 256 KiB PPU SMEM budget");
 
     static constexpr int bits_per_aiu_Q = kBlockM * kBlockKSmem * sizeof(InputT) * 8;
     using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, InputT, false, kBlockM, kBlockKSmem>;
