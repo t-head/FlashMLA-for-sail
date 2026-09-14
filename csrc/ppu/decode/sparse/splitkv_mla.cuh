@@ -508,7 +508,7 @@ template<typename Kernel_traits, typename Params>
 __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     const Params &params, const int batch_id, const int bidh, const int m_block,
     const int n_split_idx, const int n_block_min, int n_block_max, const bool NoSplit,
-    const int ori_klen, const int ori_block_max, const int ext_klen) {
+    const int ori_klen, const int ori_block_max, const int ext_klen, char *smem_) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
@@ -522,9 +522,6 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     constexpr int AtomLayoutP = Kernel_traits::AtomLayoutP;
     constexpr bool USE_MMA_M8 = Kernel_traits::USE_MMA_M8;
     constexpr int MMA_ATOM_M = USE_MMA_M8 ? 8 : 16;
-
-    // Shared memory.
-    extern __shared__ char smem_[];
 
     // The thread index.
     const int tidx = threadIdx.x;
@@ -923,11 +920,20 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     }
 }
 
-template<typename Kernel_traits, bool IsFP8 = false>
+template<typename Kernel_traits, bool IsFP8 = false,
+         int MetadataBlockN = Kernel_traits::kBlockN>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
 flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    extern __shared__ char smem_[];
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+    // Isolate metadata-128 address inference to preserve PPU1.0 legacy codegen.
+    extern __shared__ char smem_metadata128_[];
+    char *const bf16_smem = MetadataBlockN == 128 ? smem_metadata128_ : smem_;
+#else
+    char *const bf16_smem = smem_;
+#endif
     const int m_block = blockIdx.x;
     const int bidh = blockIdx.y;
     const int partition_idx = blockIdx.z;
@@ -956,8 +962,9 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
             // int seqlen_kpad = seqlen_k;
 
             int extra_seqlen_k = 0;
-            if (params.extra_topk >= 0) {
-                seqlen_kpad = cute::round_up(seqlen_kpad, kBlockN);
+            // Match metadata: an empty extra index array adds no padding.
+            if (params.extra_topk > 0) {
+                seqlen_kpad = cute::round_up(seqlen_kpad, MetadataBlockN);
                 extra_seqlen_k = params.extra_topk_len_ptr ? params.extra_topk_len_ptr[batch_id] : params.extra_topk;
             }
             const int total_k = seqlen_kpad + extra_seqlen_k;
@@ -975,7 +982,7 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
                 compute_attn_bf16_sparse_splitkv<Kernel_traits>(
                     params, batch_id, bidh, m_block, n_split_idx,
                     n_block_min, n_block_max, NoSplit, seqlen_k,
-                    ori_block_max, extra_seqlen_k);
+                    ori_block_max, extra_seqlen_k, bf16_smem);
             }
 
             __syncthreads();  // Barrier between two tiles.
@@ -997,7 +1004,7 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
                 compute_attn_bf16_sparse_splitkv<Kernel_traits>(
                     params, batch_id, bidh, m_block, n_split_idx,
                     n_block_min, n_block_max, NoSplit, seqlen_k,
-                    ori_block_max, 0);
+                    ori_block_max, 0, bf16_smem);
             }
 
             __syncthreads();  // Barrier between two tiles.
@@ -1008,13 +1015,14 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
 } // namespace flash
 
 ////
-template<typename Kernel_traits, bool IsFP8>
+template<typename Kernel_traits, bool IsFP8,
+         int MetadataBlockN = Kernel_traits::kBlockN>
 void run_flash_sparse_decode_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     // TODO.
     constexpr size_t smem_size = Kernel_traits::kSmemSizeAccum + Kernel_traits::kBlockN * 2 * sizeof(int);
     const int num_m_block = (params.seqlen_q / params.ngroups) * cute::ceil_div(params.ngroups, Kernel_traits::kBlockM);
 
-        auto kernel = &flash::flash_sparse_decode_fwd_kernel<Kernel_traits, IsFP8>;
+        auto kernel = &flash::flash_sparse_decode_fwd_kernel<Kernel_traits, IsFP8, MetadataBlockN>;
         flash::printf_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size, false, true, IsFP8);
         //CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         if (smem_size >= 48 * 1024) {
@@ -1116,32 +1124,42 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
         constexpr bool USE_MMA_M8 = 0;
         constexpr bool KeepQ = true;
         constexpr static int kBlockN = 64;
-        // BF16 sparse decode — WI v2 supported with same runtime constraints as FP8.
-        // BlockM=128 path: ngroups >= 128
-        // BlockM=64 path:  64 <= ngroups < 128 (cross-cut layout)
-        // WI v2 requires page_block_size == 2'power
+        // Align per-query grouped heads, not the folded query length.
+        // M128 requires complete head tiles and supports multiple queries.
+        // HS64 handles an odd number of complete M64 head tiles per query.
+        // Both paths require power-of-two page sizes; other cases fall back.
         const bool kCanWI = is_sm89_or_newer();
         const bool wi_enable_m128 = kCanWI
-            && (params.ngroups >= 128)
-            && (params.seqlen_q == params.ngroups)
-            && (params.page_block_size > 0);
+            && (params.ngroups > 0 && params.ngroups % 128 == 0)
+            && (params.page_block_size > 0)
+            && flashmla::dsa::sparse_decode_m128_index_tiles_supported(params);
         const bool wi_enable_m64 = kCanWI
-            && (params.ngroups >= 64)
-            && (params.ngroups < 128)
-            && (params.seqlen_q == params.ngroups)
-            && (params.page_block_size > 0);
+            && (params.ngroups % 128 == 64)
+            && (params.page_block_size > 0)
+            && flashmla::dsa::sparse_decode_hs64_addressing_supported(params);
         IS_PAGE_POWER2(params.page_block_size, params.extra_page_block_size, [&] {
             if (wi_enable_m128 && kPagePow2) {
                 run_flash_sparse_decode_wg_kernel<T, 89, false, 128>(params, stream);
+            } else if (wi_enable_m64 && kPagePow2) {
+                flashmla::dsa::hs64::run_flash_sparse_decode_wg_kernel_hs64(
+                    params, stream);
             } else {
                 SEQLENG_SWITCH_ALIGN(params.seqlen_q, [&] {
                     constexpr int AtomLayoutQ = kBlockM / 16;
                     constexpr int kNwarps = AtomLayoutQ * (kBlockN / 16);
                     constexpr int AtomLayoutP = kBlockM == 64 ? 2 : 1;
-                    run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
+                    using FallbackTraits = Flash_fwd_kernel_traits<
                         Headdim, kBlockM, kBlockN, kNwarps, KeepQ/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
                         T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP
-                        >, IsFP8>(params, stream);
+                        >;
+                    if constexpr (kBlockM == 64) {
+                        if (flashmla::dsa::sparse_decode_needs_128_token_quantum(
+                                params.ngroups, false, kCanWI)) {
+                            run_flash_sparse_decode_fwd<FallbackTraits, false, 128>(params, stream);
+                            return;
+                        }
+                    }
+                    run_flash_sparse_decode_fwd<FallbackTraits, false>(params, stream);
                 });
             }
         });
