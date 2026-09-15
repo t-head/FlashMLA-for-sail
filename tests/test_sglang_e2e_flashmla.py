@@ -6,7 +6,8 @@ send one simple generation request, and verify the response.
 
 Covered FlashMLA entry points (on PPU):
 
-- ``dense_decode_fwd``      — Kimi-K2.5: ``--decode-attention-backend flashmla``;
+- ``dense_decode_fwd``      — DeepSeek-V2-Lite and Kimi-K2.5:
+  ``--decode-attention-backend flashmla``;
   GLM-5.1: NSA decode via ``flashmla_kv`` (gathered top-k KV, DSA attention)
 - ``sparse_decode_fwd``     — DeepSeek-V4-Flash: DSA sparse decode (EAGLE,
   CUDA graph, dp-attention), i.e. the production deployment config
@@ -22,14 +23,22 @@ Usage:
     python tests/test_sglang_e2e_flashmla.py                    # all cases
     python tests/test_sglang_e2e_flashmla.py --case kimi-k2.5   # single case
 
+    # Lightweight single-GPU dense decode case:
+    python tests/test_sglang_e2e_flashmla.py --case deepseek-v2-lite
+
 Environment overrides:
 
+    FLASHMLA_E2E_DSV2_PATH   model path for the deepseek-v2-lite case
     FLASHMLA_E2E_KIMI_PATH   model path for the kimi-k2.5 case
     FLASHMLA_E2E_DSV4_PATH   model path for the deepseek-v4-flash case
+    FLASHMLA_E2E_DSV4_INT8_PATH  model path for the deepseek-v4-flash-int8 case
     FLASHMLA_E2E_GLM_PATH    model path for the glm-5.1 case
     FLASHMLA_E2E_PORT        server port (default 8999)
     FLASHMLA_E2E_TIMEOUT     server startup timeout in seconds (default 1800)
     FLASHMLA_E2E_LOG_DIR     directory for server logs (default tests/logs)
+
+DeepSeek-V2-Lite defaults to models/DeepSeek-V2-Lite under the repository
+root. Set FLASHMLA_E2E_DSV2_PATH to an existing local checkpoint directory.
 
 Cases may also carry case-specific env vars for the server process (glm-5.1
 sets ``SGLANG_NSA_DUAL_STREAM=0`` and
@@ -55,9 +64,13 @@ from pathlib import Path
 _TEST_DIR = Path(__file__).resolve().parent
 _LOG_DIR = Path(os.environ.get("FLASHMLA_E2E_LOG_DIR", _TEST_DIR / "logs"))
 
+_DEFAULT_DSV2_PATH = "/ppusw/datasets/checkpoints/LLM/DeepSeek/V2/DeepSeek-V2-Lite"
 _DEFAULT_KIMI_PATH = "/ppusw/datasets/checkpoints/LLM/kimi/v2.5/Kimi-K2.5"
 _DEFAULT_DSV4_PATH = (
     "/ppusw/datasets/checkpoints/LLM/deepseek-ai/v1.0/DeepSeek-V4-Flash-0731-w8a8"
+)
+_DEFAULT_DSV4_INT8_PATH = (
+    "/ppusw/datasets/checkpoints/LLM/deepseek/v4/DeepSeek-V4-Flash-W8A8-INT8"
 )
 _DEFAULT_GLM_PATH = "/ppusw/datasets/checkpoints/LLM/zhipu/v5.1/GLM-5.1-W8A8-INT8"
 
@@ -85,6 +98,33 @@ class E2ECase:
 
 
 _CASES = {
+    "deepseek-v2-lite": E2ECase(
+        name="deepseek-v2-lite",
+        model_path=os.environ.get("FLASHMLA_E2E_DSV2_PATH", _DEFAULT_DSV2_PATH),
+        extra_args=(
+            "--served-model-name",
+            "DeepSeek-V2-Lite",
+            "--dtype",
+            "bfloat16",
+            "--decode-attention-backend",
+            "flashmla",
+            "--prefill-attention-backend",
+            "fa3",
+            # Keep startup and graph capture small for the smoke request.
+            "--context-length",
+            "4096",
+            "--max-running-requests",
+            "8",
+            "--cuda-graph-max-bs-decode",
+            "8",
+            "--cuda-graph-backend-prefill",
+            "disabled",
+            "--max-total-tokens",
+            "16384",
+        ),
+        covers="dense_decode_fwd (MLA dense decode)",
+        tp_size=2,
+    ),
     "kimi-k2.5": E2ECase(
         name="kimi-k2.5",
         model_path=os.environ.get("FLASHMLA_E2E_KIMI_PATH", _DEFAULT_KIMI_PATH),
@@ -146,6 +186,62 @@ _CASES = {
             "sparse_decode_fwd (DSA sparse decode + EAGLE target_verify / "
             "draft_extend_v2, CUDA graph), flash_mla_sparse_fwd (sparse prefill)"
         ),
+    ),
+    "deepseek-v4-flash-int8": E2ECase(
+        name="deepseek-v4-flash-int8",
+        model_path=os.environ.get(
+            "FLASHMLA_E2E_DSV4_INT8_PATH", _DEFAULT_DSV4_INT8_PATH
+        ),
+        extra_args=(
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "2",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "3",
+            "--deepep-mode",
+            "auto",
+            "--enable-dp-attention",
+            "--dp-size",
+            "4",
+            "--quantization",
+            "w8a8_int8",
+            "--watchdog-timeout",
+            "60000",
+            "--soft-watchdog-timeout",
+            "60000",
+            "--dist-timeout",
+            "60000",
+            "--served-model-name",
+            "DeepSeek-V4",
+            "--reasoning-parser",
+            "deepseek-v4",
+            "--tool-call-parser",
+            "deepseekv4",
+            "--speculative-attention-mode",
+            "decode",
+            "--moe-a2a-backend",
+            "deepep",
+            "--moe-dense-tp-size",
+            "1",
+            "--cuda-graph-max-bs",
+            "64",
+            "--disable-custom-all-reduce",
+            "--enable-dp-lm-head",
+            "--disable-piecewise-cuda-graph",
+            "--disable-shared-experts-fusion",
+        ),
+        covers=(
+            "sparse_decode_fwd (DSA sparse decode + EAGLE target_verify / "
+            "draft_extend_v2, CUDA graph), flash_mla_sparse_fwd (sparse prefill)"
+        ),
+        tp_size=4,
+        # Leave room for both target and EAGLE draft CUDA graphs on 96 GiB PPU.
+        mem_fraction_static="0.85",
+        # Target verification captures 64 requests * 3 draft tokens = 192.
+        env={"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256"},
     ),
     "glm-5.1": E2ECase(
         name="glm-5.1",
