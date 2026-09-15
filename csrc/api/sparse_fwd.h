@@ -100,7 +100,17 @@ sparse_attn_prefill_interface(
         hggcStreamIsCapturing(params.stream, &captureStatus);
         std::string topk_len_str = "";
         if (params.topk_length) {
-            topk_len_str = fmha_prof_params.nvtx_param2str<int>(params.topk_length, params.s_q, params.stream);
+            if (captureStatus != hggcStreamCaptureStatusNone) {
+                GraphCaptureModeSuspender protector(hggcStreamCaptureModeRelaxed);
+                // Read profiling parameters on a side stream to avoid synchronizing the capture stream.
+                hggcStream_t side_stream;
+                if (hggcStreamCreateWithFlags(&side_stream, hggcStreamNonBlocking) == hggcSuccess) {
+                    topk_len_str = fmha_prof_params.nvtx_param2str<int>(params.topk_length, params.s_q, side_stream);
+                    hggcStreamDestroy(side_stream);
+                }
+            } else {
+                topk_len_str = fmha_prof_params.nvtx_param2str<int>(params.topk_length, params.s_q, params.stream);
+            }
         }
         fmha_prof_params.set_flash_attn_sparse_prefill_params(
             q.dtype() == torch::kBFloat16/*data_type*/,
