@@ -29,6 +29,9 @@
 #include "ppu/cute/arch/mma_ppu0015.hpp"
 #include "ppu/cute/atom/mma_traits_ppu0015.hpp"
 #pragma pop_macro("ACOMPUTE_VERSION")
+#include "ppu/cute/arch/mma_ppu.hpp"
+#include "ppu/cute/atom/mma_traits_ppu.hpp"
+#include "ppu/cute/swizzle_layout.hpp"
 #endif
 
 #if !USE_AIU
@@ -252,7 +255,10 @@ namespace flashmla::dsa::hs64 {
 
 using namespace cute;
 
+template<int Arch>
 struct Hs64BaseTraits {
+    static_assert(Arch == 80 || Arch == 89);
+    static constexpr int kArch = Arch;
     using InputT = cutlass::bfloat16_t;
     using ElementAccum = float;
 
@@ -261,7 +267,17 @@ struct Hs64BaseTraits {
 
     static constexpr int NUM_THREADS = 512;
 
-    using MMA_Atom_Arch = MMA_Atom<PPU0015_16x16x16_F32BF16BF16F32_TN>;
+    using MMA_Atom_Arch = MMA_Atom<std::conditional_t<Arch == 80,
+        PPU_16x16x16_F32BF16BF16F32_TN,
+        PPU0015_16x16x16_F32BF16BF16F32_TN>>;
+    // Match the SM80 M128 simulated-AIU layout: four 16-column slabs.
+    using SmemLayoutOperandAtom = std::conditional_t<Arch == 80,
+        decltype(tile_to_shape(composition(Swizzle<1, 3, 3>{},
+            Layout<Shape<_8, _16>, Stride<_16, _1>>{}), Shape<_64, _64>{})),
+        decltype(composition(Swizzle<3, 3, 3>{},
+            Layout<Shape<_8, _64>, Stride<_64, _1>>{}))>;
+    static constexpr int kScoreLaneStride = Arch == 80 ? 1 : 2;
+    using PStoreWord = std::conditional_t<Arch == 80, uint16_t, uint32_t>;
 
     static constexpr int kBlockKSmem = 64;
 
@@ -306,11 +322,11 @@ struct Hs64BaseTraits {
 
 // The private HS64 instance is BF16/M64-only. Other data types and block sizes
 // remain on the existing generic kernels.
-template<int HeadDimK, bool GuardIndices = true>
-struct Hs64Traits : public Hs64BaseTraits {
+template<int HeadDimK, bool GuardIndices = true, int Arch = 89>
+struct Hs64Traits : public Hs64BaseTraits<Arch> {
     static_assert(HeadDimK == 512 || HeadDimK == 576);
 
-    using Base = Hs64BaseTraits;
+    using Base = Hs64BaseTraits<Arch>;
     using InputT = typename Base::InputT;
 
     // Unchecked prefetch is reserved for the host-selected full-tile path.
@@ -390,13 +406,16 @@ struct Hs64Traits : public Hs64BaseTraits {
     // all three swizzle bits to match TSM_LD_SWZL, including m-bit-2 -> k-bit-5.
     static_assert(kBlockM == 64 && kBlockN == 64, "HS64 requires M64N64 tiles");
     static constexpr int kSwizzleP0 = 3;
-    using SmemLayoutAtomP0 = decltype(
+    using SmemLayoutAtomP0 = std::conditional_t<Arch == 80,
+        typename Base::SmemLayoutOperandAtom, decltype(
         composition(Swizzle<kSwizzleP0, 3, 3>{},
         Layout<Shape<Int<kBlockM>, Int<kBlockN>>,
-                        Stride<Int<kBlockN>, _1>>{}));
+                        Stride<Int<kBlockN>, _1>>{}))>;
     using SmemLayoutP0 = decltype(tile_to_shape(
         SmemLayoutAtomP0{},
         Shape<Int<kBlockM>, Int<kBlockN>>{}));
+    using SmemLayoutPTsm = decltype(tile_to_shape(
+        typename Base::SmemLayoutAtom{}, Shape<Int<kBlockM>, Int<kBlockN>>{}));
 
     // Shadow SmemCopyAtomP for the (4,2) cross-cut P read: Base's
     // PPU_U32x4_LDSM_N partition mis-maps the N-warp half of sP under (4,2)
@@ -477,6 +496,8 @@ struct Hs64Traits : public Hs64BaseTraits {
     // V view layout over each current K buffer.
     static constexpr int kBlockKSmem_v = 64;
     static constexpr int kSwizzle_v    = 3;
+    // TSM descriptors use logical 64-column cubes, not the physical SM80
+    // async-copy layout. M128 likewise separates sK from its sKSim write view.
     using SmemLayoutAtomV = decltype(composition(Swizzle<kSwizzle_v, 3, 3>{},
         Layout<Shape<_8, Int<kBlockKSmem_v>>, Stride<Int<kBlockKSmem_v>, _1>>{}));
     using SmemLayoutVDirect = decltype(tile_to_shape(
@@ -487,11 +508,12 @@ struct Hs64Traits : public Hs64BaseTraits {
         make_layout(Shape<Int<Base::kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));  // transposed V view
 
     // K layout matching the TSM_LD_SWZL read pattern.
-    using SmemLayoutAtomK_Direct = decltype(composition(Swizzle<kSwizzle_v, 3, 3>{},
-        Layout<Shape<_8, Int<kBlockKSmem_v>>, Stride<Int<kBlockKSmem_v>, _1>>{}));
+    using SmemLayoutAtomK_Direct = SmemLayoutAtomV;
     using SmemLayoutKDirect = decltype(tile_to_shape(
         SmemLayoutAtomK_Direct{},
         Shape<Int<kBlockN>, Int<HeadDimK>, Int<NUM_K_BUFS>>{}));
+    using SmemLayoutKStore = decltype(tile_to_shape(
+        typename Base::SmemLayoutOperandAtom{}, Shape<Int<kBlockN>, Int<HeadDimK>>{}));
 
     // Four contiguous 64-dim tiles. For D576 the same layout is rebound either
     // to buf0 tile4 or to the raw sQ4 base, allowing the even high half to
@@ -500,6 +522,8 @@ struct Hs64Traits : public Hs64BaseTraits {
     using SmemLayoutKHigh4 = decltype(tile_to_shape(
         SmemLayoutAtomK_Direct{},
         Shape<Int<kBlockN>, Int<kHigh4Dim>>{}));
+    using SmemLayoutKHigh4Store = decltype(tile_to_shape(
+        typename Base::SmemLayoutOperandAtom{}, Shape<Int<kBlockN>, Int<kHigh4Dim>>{}));
     using SmemLayoutVtHigh4 = decltype(composition(
         SmemLayoutKHigh4{},
         make_layout(Shape<Int<kHigh4Dim>, Int<kBlockN>>{}, GenRowMajor{})));
@@ -546,8 +570,8 @@ struct Hs64Traits : public Hs64BaseTraits {
 };
 
 // Prefill assigns one complete sparse query to each CTA, without split-KV.
-template<int HeadDimK>
-struct Hs64PrefillTraits : public Hs64Traits<HeadDimK, false> {
+template<int HeadDimK, int Arch = 89>
+struct Hs64PrefillTraits : public Hs64Traits<HeadDimK, false, Arch> {
     static constexpr bool kIsPrefill = true;
 };
 

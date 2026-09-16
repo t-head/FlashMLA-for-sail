@@ -19,19 +19,19 @@ void run_flash_sparse_decode_wg_kernel_hs64(
 } // namespace hs64
 
 // HS64 consumes two 64-token blocks per scheduler iteration. Keep that
-// metadata quantum limited to BF16 PPU1.5; FP8 and PPU1.0 retain the original
+// metadata quantum limited to BF16 HS64; FP8 retains the original
 // 64-token scheduler contract. An HS64 fallback must use the same quantum
 // when padding the main cache before extra KV, despite its 64-token tile.
 inline bool sparse_decode_needs_128_token_quantum(
-        int ngroups, bool is_fp8_kvcache, bool is_sm89_or_newer) {
-    return !is_fp8_kvcache && is_sm89_or_newer &&
+        int ngroups, bool is_fp8_kvcache) {
+    return !is_fp8_kvcache &&
            ngroups % 128 == 64;
 }
 
 inline int sparse_decode_metadata_block_size_n(
-        int ngroups, bool is_fp8_kvcache, bool is_sm89_or_newer) {
+        int ngroups, bool is_fp8_kvcache) {
     return sparse_decode_needs_128_token_quantum(
-               ngroups, is_fp8_kvcache, is_sm89_or_newer)
+               ngroups, is_fp8_kvcache)
         ? 128
         : 64;
 }
