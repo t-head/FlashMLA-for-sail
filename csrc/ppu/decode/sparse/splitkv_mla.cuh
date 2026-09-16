@@ -1133,8 +1133,7 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
             && (params.ngroups > 0 && params.ngroups % 128 == 0)
             && (params.page_block_size > 0)
             && flashmla::dsa::sparse_decode_m128_index_tiles_supported(params);
-        const bool wi_enable_m64 = kCanWI
-            && (params.ngroups % 128 == 64)
+        const bool wi_enable_m64 = (params.ngroups % 128 == 64)
             && (params.page_block_size > 0)
             && flashmla::dsa::sparse_decode_hs64_addressing_supported(params);
         IS_PAGE_POWER2(params.page_block_size, params.extra_page_block_size, [&] {
@@ -1154,7 +1153,7 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
                         >;
                     if constexpr (kBlockM == 64) {
                         if (flashmla::dsa::sparse_decode_needs_128_token_quantum(
-                                params.ngroups, false, kCanWI)) {
+                                params.ngroups, false)) {
                             run_flash_sparse_decode_fwd<FallbackTraits, false, 128>(params, stream);
                             return;
                         }

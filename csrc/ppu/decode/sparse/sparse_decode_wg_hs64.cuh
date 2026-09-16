@@ -100,16 +100,49 @@ namespace flashmla::dsa::hs64 {
 
 using namespace cute;
 
-template<typename Layout>
+// SM80 simulated AIU storage rotates the four rows of each 16-column slab.
+// Match M128's sim_cross_tid mapping: slab 0/1/2/3 uses bias 0/2/1/3.
+__forceinline__ __device__ int hs64_sm80_store_row(int row, int col) {
+    const int slab = (col / 16) & 3;
+    const int bias = ((slab & 1) << 1) | (slab >> 1);
+    return (row & ~3) | ((row + bias) & 3);
+}
+
+template<typename T>
+__forceinline__ __device__ int hs64_store_thread(int tid) {
+    if constexpr (T::kArch == 80) {
+        return hs64_sm80_store_row(tid / 8, (tid & 7) * 8) * 8 + (tid & 7);
+    } else {
+        return tid;
+    }
+}
+
+// Expose the same two-row iteration on either native C fragment. The index
+// permutation folds at compile time; no lane shuffle or format conversion.
+template<typename T, typename Tensor>
+__forceinline__ __device__ decltype(auto) hs64_acc(Tensor &acc, int i) {
+    if constexpr (T::kArch == 80) {
+        return acc((i & ~6) | ((i & 2) << 1) | ((i & 4) >> 1));
+    } else {
+        return acc(i);
+    }
+}
+
+template<typename T, typename Layout>
 __forceinline__ __device__ auto hs64_convert_layout_acc_rowcol(Layout acc_layout)
 {
     static_assert(decltype(rank(acc_layout))::value == 3);
     auto atom_div = logical_divide(acc_layout, Shape<_4>{});
+    if constexpr (T::kArch == 80) {
+        return make_layout(make_layout(get<0, 1>(atom_div), get<1>(atom_div)),
+                           make_layout(get<0, 0>(atom_div), get<2>(atom_div)));
+    } else {
     auto row_div = logical_divide(atom_div, Shape<Shape<_2>>{});
     return make_layout(
         make_layout(get<0, 0, 1>(row_div), get<1>(row_div)),
         make_layout(get<0, 0, 0>(row_div),
                     make_layout(get<0, 1>(row_div), get<2>(row_div))));
+    }
 }
 
 // Build tag printed once per kernel launch, for log attribution.
@@ -156,7 +189,10 @@ void
 hs64_load_valid_pair(
     TensorVI &smem_valid_indices, int valid_indices_buf, int token_idx,
     int &valid0, int &valid1) {
-    if constexpr (T::kHasExtraKTile) {
+    if constexpr (T::kArch == 80) {
+        valid0 = hs64_load_valid<T>(smem_valid_indices, valid_indices_buf, token_idx);
+        valid1 = hs64_load_valid<T>(smem_valid_indices, valid_indices_buf, token_idx + 4);
+    } else if constexpr (T::kHasExtraKTile) {
         const unsigned owner = (static_cast<unsigned>(token_idx) >> 2) & 7u;
         const unsigned bits = smem_valid_indices(valid_indices_buf, owner);
         const unsigned shift = (static_cast<unsigned>(token_idx) & 3u) * 8u
@@ -177,6 +213,14 @@ __forceinline__ __device__ void hs64_load_valid_quad(
     TensorVI &smem_valid_indices, int buf, int lane4, int warp_n, int (&valid)[8]) {
     static_assert(T::kHasExtraKTile && T::kValidWords == 16);
     static_assert(offsetof(typename T::SharedMemoryPlan, smem_valid_indices) % 16 == 0);
+    if constexpr (T::kArch == 80) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int cg = 0; cg < 4; ++cg) {
+            const int base = (cg / 2) * 32 + warp_n * 16 + (cg % 2) * 8 + lane4;
+            hs64_load_valid_pair<T>(smem_valid_indices, buf, base,
+                                   valid[2 * cg], valid[2 * cg + 1]);
+        }
+    } else {
     const unsigned first_word = static_cast<unsigned>(warp_n) * 4u
                               + (static_cast<unsigned>(lane4) >> 1);
     const unsigned words[2] = {smem_valid_indices(buf, first_word),
@@ -186,6 +230,7 @@ __forceinline__ __device__ void hs64_load_valid_quad(
     for (int cg = 0; cg < 4; ++cg) {
         valid[2 * cg] = (words[cg & 1] >> (shift + (cg / 2) * 4)) & 1u;
         valid[2 * cg + 1] = (words[cg & 1] >> (shift + (cg / 2) * 4 + 8)) & 1u;
+    }
     }
 }
 
@@ -430,6 +475,109 @@ __forceinline__ __device__ void qkt_gemm_one_tile_rQ(
     cute::gemm(tiled_mma, thr_mma_rQ_tile(_, _, _3{}), rK_copy_view(_, _, _3{}), rP);
 }
 
+// Carry the four existing K=16 fragment slots across the already-ready low
+// half-bank. Each slot is refilled only after its previous MMA has consumed it.
+template <typename T, typename TiledMMA, typename CopyQ, typename CopyK,
+          typename ThrQ, typename ThrK, typename SQ, typename SK,
+          typename QSource, typename KSource, typename CachedQ, typename Accumulator>
+__forceinline__ __device__ void qkt_gemm_low_tiles_sm80(
+    TiledMMA &mma, CopyQ &copy_q, CopyK &copy_k, ThrQ &thr_q, ThrK &thr_k,
+    SQ &sQ_tiled, SK &sK_tiled, QSource const &q_source,
+    KSource const &k_source, CachedQ const &q_cached, Accumulator &rP, int tid)
+{
+    static_assert(T::kArch == 80);
+    auto thread_mma = mma.get_slice(tid);
+    auto q_seed = local_tile(sQ_tiled(_, _, _0{}),
+        Shape<Int<T::kBlockM>, _16>{}, Coord<_0, _0>{});
+    auto k_seed = local_tile(sK_tiled(_, _, _0{}),
+        Shape<Int<T::kBlockN>, _16>{}, Coord<_0, _0>{});
+    auto q_fragment = thread_mma.partition_fragment_A(q_seed);
+    auto k_fragment = thread_mma.partition_fragment_B(k_seed);
+    // Preserve two BF16 values per word across the loop backedge, avoiding
+    // scalar half-word PHIs and the corresponding unpack/repack instructions.
+    auto q_word_layout = recast<uint32_t>(q_fragment).layout();
+    auto k_word_layout = recast<uint32_t>(k_fragment).layout();
+    Tensor wQ0 = make_tensor<uint32_t>(q_word_layout);
+    Tensor wQ1 = make_tensor<uint32_t>(q_word_layout);
+    Tensor wQ2 = make_tensor<uint32_t>(q_word_layout);
+    Tensor wQ3 = make_tensor<uint32_t>(q_word_layout);
+    Tensor wK0 = make_tensor<uint32_t>(k_word_layout);
+    Tensor wK1 = make_tensor<uint32_t>(k_word_layout);
+    Tensor wK2 = make_tensor<uint32_t>(k_word_layout);
+    Tensor wK3 = make_tensor<uint32_t>(k_word_layout);
+    Tensor rQ0 = recast<typename T::InputT>(wQ0);
+    Tensor rQ1 = recast<typename T::InputT>(wQ1);
+    Tensor rQ2 = recast<typename T::InputT>(wQ2);
+    Tensor rQ3 = recast<typename T::InputT>(wQ3);
+    Tensor rK0 = recast<typename T::InputT>(wK0);
+    Tensor rK1 = recast<typename T::InputT>(wK1);
+    Tensor rK2 = recast<typename T::InputT>(wK2);
+    Tensor rK3 = recast<typename T::InputT>(wK3);
+    Tensor cQ0 = thr_q.retile_D(rQ0);
+    Tensor cQ1 = thr_q.retile_D(rQ1);
+    Tensor cQ2 = thr_q.retile_D(rQ2);
+    Tensor cQ3 = thr_q.retile_D(rQ3);
+    Tensor cK0 = thr_k.retile_D(rK0);
+    Tensor cK1 = thr_k.retile_D(rK1);
+    Tensor cK2 = thr_k.retile_D(rK2);
+    Tensor cK3 = thr_k.retile_D(rK3);
+    auto q_slot = [&](auto slot) -> decltype(auto) {
+        if constexpr (decltype(slot)::value == 0) return (cQ0);
+        else if constexpr (decltype(slot)::value == 1) return (cQ1);
+        else if constexpr (decltype(slot)::value == 2) return (cQ2);
+        else return (cQ3);
+    };
+    auto k_slot = [&](auto slot) -> decltype(auto) {
+        if constexpr (decltype(slot)::value == 0) return (cK0);
+        else if constexpr (decltype(slot)::value == 1) return (cK1);
+        else if constexpr (decltype(slot)::value == 2) return (cK2);
+        else return (cK3);
+    };
+    auto load = [&](auto step) {
+        constexpr int i = decltype(step)::value;
+        auto &q = q_slot(Int<i % 4>{});
+        auto &k = k_slot(Int<i % 4>{});
+        if constexpr (i >= 4) {
+            cute::copy(copy_q, q_source(_, _, Int<i % 4>{}, Int<i / 4>{}), q(_, _, _0{}));
+        }
+        cute::copy(copy_k, k_source(_, _, Int<i % 4>{}, Int<i / 4>{}), k(_, _, _0{}));
+    };
+    for_each(make_int_sequence<4>{}, [&](auto i) { load(i); });
+    for_each(make_int_sequence<4>{}, [&](auto step) {
+        constexpr int i = decltype(step)::value;
+        auto &k = k_slot(Int<i>{});
+        cute::gemm(mma, q_cached(_, _, Int<i>{}), k(_, _, _0{}), rP);
+    });
+    auto load_tile_slice = [&](int tile, auto slice) {
+        constexpr int i = decltype(slice)::value;
+        auto &q = q_slot(Int<i % 2>{});
+        auto &k = k_slot(Int<i % 2>{});
+        cute::copy(copy_q, q_source(_, _, slice, tile), q(_, _, _0{}));
+        cute::copy(copy_k, k_source(_, _, slice, tile), k(_, _, _0{}));
+    };
+    for_each(make_int_sequence<2>{}, [&](auto slice) { load_tile_slice(1, slice); });
+    // Carry two slices across each K64 backedge. Refill the consumed slot
+    // first from the current tile, then from the next already-ready tile.
+    #pragma unroll 1
+    for (int tile = 1; tile < 3; ++tile) {
+        for_each(make_int_sequence<4>{}, [&](auto slice) {
+            constexpr int i = decltype(slice)::value;
+            auto &q = q_slot(Int<i % 2>{});
+            auto &k = k_slot(Int<i % 2>{});
+            cute::gemm(mma, q(_, _, _0{}), k(_, _, _0{}), rP);
+            if constexpr (i < 2) load_tile_slice(tile, Int<i + 2>{});
+            else load_tile_slice(tile + 1, Int<i - 2>{});
+        });
+    }
+    for_each(make_int_sequence<4>{}, [&](auto slice) {
+        constexpr int i = decltype(slice)::value;
+        auto &q = q_slot(Int<i % 2>{});
+        auto &k = k_slot(Int<i % 2>{});
+        cute::gemm(mma, q(_, _, _0{}), k(_, _, _0{}), rP);
+        if constexpr (i < 2) load_tile_slice(3, Int<i + 2>{});
+    });
+}
+
 // Pipelined TMA wait and Q K^T gemm. Q and K are split into (BLOCK_SIZE_M, 64)
 // and (BLOCK_N, 64) tiles; each tile is waited on and multiplied in turn, so
 // later tiles get more time to arrive and the copy overlaps the computation.
@@ -456,6 +604,7 @@ template <
     typename Engine3, typename Layout3,
     typename Engine4, typename Layout4,
     typename Engine5, typename Layout5,
+    typename EngineQlow0, typename LayoutQlow0,
     typename BeforeQk>
 __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     Tensor<Engine0, Layout0> &sQ,   // (BLOCK_SIZE_M, HEAD_DIM_K)
@@ -465,6 +614,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     Tensor<Engine3, Layout3> &rQ8,  // The 8-th tile of Q. We store it separately to leave some room for storing sP1
     Tensor<Engine4, Layout4> &rQ6,  // Penultimate Q tile for the active d512 path
     Tensor<Engine5, Layout5> &rQ4,  // First high-half Q tile for the active d512 path
+    Tensor<EngineQlow0, LayoutQlow0> &rQlow0,
     __mbarrier_t *barriers,
     Hs64MbarPhase<T> &cur_phase,
     int idx_in_warpgroup,
@@ -474,19 +624,23 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     const int cute_idx = idx_in_warpgroup % T::kMmaThreads;
     // Per-warp uniform index via read_firstlane (no register spill, unlike
     // __builtin_ppu_to_uniform_b32). Shared by the Q and K/V copy slices.
-    const int warp_base = __ppu_read_firstlane(idx_in_warpgroup / 32);
+    using QkCopyIndex = std::conditional_t<T::kArch == 80, unsigned, int>;
+    const QkCopyIndex warp_base = __ppu_read_firstlane(
+        static_cast<QkCopyIndex>(idx_in_warpgroup) / QkCopyIndex(32));
     // Q is M-partitioned: fold the N-warp with % kAtomLayoutM.
-    const int cute_warp_Q = (warp_base % T::kAtomLayoutM) * 32;
+    const QkCopyIndex cute_warp_Q =
+        (warp_base % QkCopyIndex(T::kAtomLayoutM)) * QkCopyIndex(32);
     ThrMMA thr_mma = tiled_mma.get_slice(cute_idx);
 
     auto smem_tiled_copy_K = make_tiled_copy_B(
-        Copy_Atom<HS64_TSM_K_UNIT16, typename T::InputT>{}, tiled_mma);
+        std::conditional_t<T::kArch == 80, typename T::SmemCopyAtomK,
+            Copy_Atom<HS64_TSM_K_UNIT16, typename T::InputT>>{}, tiled_mma);
 
     // K/V slice keeps the full warp index (warp_base*32). M128's cute_warp_Q
     // coincides with this (kAtomLayoutM==8), but M64 crosscut needs the unfolded
     // value to distinguish the two N-warps. read_firstlane avoids the spill that
     // __builtin_ppu_to_uniform_b32 triggers (verg 256 spill 132 -> verg 248 stack 0).
-    const int cute_warp_kv = warp_base * 32;
+    const QkCopyIndex cute_warp_kv = warp_base * QkCopyIndex(32);
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(cute_warp_kv);
 
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename T::SmemCopyAtomQ{}, tiled_mma);
@@ -509,10 +663,10 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     Tensor rQ5_prefetch = thr_mma.partition_fragment_A(
         sQ_tiled(_, _, Int<kPrefetchedQTile>{}));
     if constexpr (kPrefetchQ5BeforeHighWait) {
-        const int warp_idx_Q_prefetch =
-            __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
-        const int cute_warp_Q_prefetch =
-            (warp_idx_Q_prefetch % T::kAtomLayoutM) * 32;
+        const QkCopyIndex warp_idx_Q_prefetch = __builtin_ppu_to_uniform_b32(
+            static_cast<QkCopyIndex>(idx_in_warpgroup) / QkCopyIndex(32));
+        const QkCopyIndex cute_warp_Q_prefetch =
+            (warp_idx_Q_prefetch % QkCopyIndex(T::kAtomLayoutM)) * QkCopyIndex(32);
         auto smem_thr_copy_Q_prefetch =
             smem_tiled_copy_Q.get_thread_slice(cute_warp_Q_prefetch);
         Tensor sQ5_prefetch_src = smem_thr_copy_Q_prefetch.partition_S(
@@ -557,16 +711,28 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
                     rP, idx_in_warpgroup); \
         }
 
+    auto qkt_gemm_low = [&]() {
+        if constexpr (T::kArch == 80) {
+            qkt_gemm_low_tiles_sm80<T>(tiled_mma,
+                smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K,
+                sQ_tiled, sKV0_tiled, thr_mma_sQ_tiled, thr_mma_sKV0_tiled,
+                rQlow0, rP, idx_in_warpgroup);
+        } else {
+            QKT_GEMM_ONE_TILE(0);
+            QKT_GEMM_ONE_TILE(1);
+            QKT_GEMM_ONE_TILE(2);
+            QKT_GEMM_ONE_TILE(3);
+        }
+    };
+
     if constexpr (PHASE_IDX == 0) {
         // In PHASE-0, warpgroup 0 calculates Q K^T for the first 4 tiles
         while (!cutlass::arch::test_wait(&barriers[0], cur_phase, 1)) {
             kernel_k_wait_sleep_ns<T>();
         };
 
-        QKT_GEMM_ONE_TILE(0);
-        QKT_GEMM_ONE_TILE(1);
-        QKT_GEMM_ONE_TILE(2);
-        QKT_GEMM_ONE_TILE(3);
+        qkt_gemm_low();
     } else if constexpr (PHASE_IDX == 1 || PHASE_IDX == 3) {
         // PHASE-1 computes the full WG1 QK. PHASE-3 computes only its high
         // half so independent PV/copy work can be woven before the low half.
@@ -602,10 +768,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
                     kernel_k_wait_sleep_ns<T>();
                 }
             }
-            QKT_GEMM_ONE_TILE(0);
-            QKT_GEMM_ONE_TILE(1);
-            QKT_GEMM_ONE_TILE(2);
-            QKT_GEMM_ONE_TILE(3);
+            qkt_gemm_low();
             if constexpr (T::kHasExtraKTile) {
                 cur_phase = (cur_phase + 1) & 1;
             } else {
@@ -625,10 +788,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
                 kernel_k_wait_sleep_ns<T>();
             }
         }
-        QKT_GEMM_ONE_TILE(0);
-        QKT_GEMM_ONE_TILE(1);
-        QKT_GEMM_ONE_TILE(2);
-        QKT_GEMM_ONE_TILE(3);
+        qkt_gemm_low();
         if constexpr (!LOCAL_LOW_GROUP) {
             if constexpr (T::kHasExtraKTile) {
                 cur_phase = (cur_phase + 1) & 1;
@@ -638,10 +798,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         }
     } else if constexpr (PHASE_IDX == 5) {
         // PHASE-5 consumes a K0-low epoch already polled by the caller.
-        QKT_GEMM_ONE_TILE(0);
-        QKT_GEMM_ONE_TILE(1);
-        QKT_GEMM_ONE_TILE(2);
-        QKT_GEMM_ONE_TILE(3);
+        qkt_gemm_low();
     } else if constexpr (PHASE_IDX == 6) {
         // PHASE-6 consumes a K1-high epoch already polled by the caller.
         QKT_GEMM_ONE_TILE(4);
@@ -680,7 +837,8 @@ template <
     typename Engine2, typename Layout2,
     typename Engine3, typename Layout3,
     typename Engine4, typename Layout4,
-    typename Engine5, typename Layout5>
+    typename Engine5, typename Layout5,
+    typename EngineQlow0, typename LayoutQlow0>
 __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     Tensor<Engine0, Layout0> &sQ,
     Tensor<Engine1, Layout1> &sKV0,
@@ -689,13 +847,14 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     Tensor<Engine3, Layout3> &rQ8,
     Tensor<Engine4, Layout4> &rQ6,
     Tensor<Engine5, Layout5> &rQ4,
+    Tensor<EngineQlow0, LayoutQlow0> &rQlow0,
     __mbarrier_t *barriers,
     Hs64MbarPhase<T> &cur_phase,
     int idx_in_warpgroup)
 {
     auto no_op = []() {};
     warpgroup_cooperative_qkt_gemm<T, PHASE_IDX, LOCAL_HIGH_GROUP, LOCAL_LOW_GROUP>(
-        sQ, sKV0, sKV1, rP, rQ8, rQ6, rQ4,
+        sQ, sKV0, sKV1, rP, rQ8, rQ6, rQ4, rQlow0,
         barriers, cur_phase, idx_in_warpgroup, no_op);
 }
 
@@ -731,16 +890,20 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_high4_tail(
     static_assert(T::kUseEvenHighBank);
     typename T::TiledMma tiled_mma;
     const int cute_idx = idx_in_warpgroup % T::kMmaThreads;
-    const int warp_base = __ppu_read_firstlane(idx_in_warpgroup / 32);
-    const int cute_warp_Q = (warp_base % T::kAtomLayoutM) * 32;
-    const int cute_warp_kv = warp_base * 32;
+    using QkCopyIndex = std::conditional_t<T::kArch == 80, unsigned, int>;
+    const QkCopyIndex warp_base = __ppu_read_firstlane(
+        static_cast<QkCopyIndex>(idx_in_warpgroup) / QkCopyIndex(32));
+    const QkCopyIndex cute_warp_Q =
+        (warp_base % QkCopyIndex(T::kAtomLayoutM)) * QkCopyIndex(32);
+    const QkCopyIndex cute_warp_kv = warp_base * QkCopyIndex(32);
 
     auto smem_tiled_copy_Q =
         make_tiled_copy_A(typename T::SmemCopyAtomQ{}, tiled_mma);
     auto smem_thr_copy_Q =
         smem_tiled_copy_Q.get_thread_slice(cute_warp_Q);
     auto smem_tiled_copy_K =
-        make_tiled_copy_B(Copy_Atom<HS64_TSM_K_UNIT16, typename T::InputT>{}, tiled_mma);
+        make_tiled_copy_B(std::conditional_t<T::kArch == 80, typename T::SmemCopyAtomK,
+            Copy_Atom<HS64_TSM_K_UNIT16, typename T::InputT>>{}, tiled_mma);
     auto smem_thr_copy_K =
         smem_tiled_copy_K.get_thread_slice(cute_warp_kv);
 
@@ -763,10 +926,10 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_high4_tail(
     Tensor rQ5_transient = thr_mma.partition_fragment_A(
         sQ_tiled(_, _, Int<5>{}));
     if constexpr (!T::kHasExtraKTile) {
-        const int warp_q5 =
-            __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
+        const QkCopyIndex warp_q5 = __builtin_ppu_to_uniform_b32(
+            static_cast<QkCopyIndex>(idx_in_warpgroup) / QkCopyIndex(32));
         auto copy_q5 = smem_tiled_copy_Q.get_thread_slice(
-            (warp_q5 % T::kAtomLayoutM) * 32);
+            (warp_q5 % QkCopyIndex(T::kAtomLayoutM)) * QkCopyIndex(32));
         Tensor src_q5 = copy_q5.partition_S(
             make_mix_tensor_like(sQ_tiled(_, _, Int<5>{})));
         Tensor dst_q5 = copy_q5.retile_D(rQ5_transient);
@@ -882,9 +1045,9 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
     // even though read_firstlane is correct+spill-free for the K/Vt B-operand slice.
     // (8,1) has a single N-warp, so it keeps the un-folded per-thread slice and
     // reads sP bare with Base's LDSM_N atom -- the pairing M128 was validated on.
-    // All slice IDs are nonnegative. D576 avoids CUTE's signed correction
-    // chain; D512 preserves its measured faster signed-index code generation.
-    using PvCopyIndex = std::conditional_t<T::kHasExtraKTile, unsigned, int>;
+    // All slice IDs are nonnegative. SM80 and D576 avoid CUTE's signed
+    // correction chain; SM89 D512 preserves its existing code generation.
+    using PvCopyIndex = std::conditional_t<T::kArch == 80 || T::kHasExtraKTile, unsigned, int>;
     const PvCopyIndex warp_idx_P = __builtin_ppu_to_uniform_b32(
         static_cast<PvCopyIndex>(idx_in_warpgroup) / PvCopyIndex(32));
     const PvCopyIndex cute_warp_P = T::kIsCrossCut
@@ -903,7 +1066,10 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
 
     // TSM_LD_SWZL needs a mix tensor source; LDSM_N needs the bare tensor.
     auto tSsP = [&]() {
-        if constexpr (T::kIsCrossCut) {
+        if constexpr (T::kArch == 80) {
+            auto descriptor_view = make_tensor(sP.data(), typename T::SmemLayoutPTsm{});
+            return smem_thr_copy_P.partition_S(make_mix_tensor_like(descriptor_view));
+        } else if constexpr (T::kIsCrossCut) {
             return smem_thr_copy_P.partition_S(make_mix_tensor_like(sP));
         } else {
             return smem_thr_copy_P.partition_S(sP);
@@ -937,12 +1103,22 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
         CUTE_STATIC_ASSERT_V(size<2>(cV0) == _1{});
 
         auto load0 = [&](auto k) {
+            if constexpr (T::kArch == 80) {
+                cute::copy(smem_tiled_copy_P, tSsP(_, _, k), cP0(_, _, _0{}));
+            }
             cute::copy(smem_tiled_copy_Vt, tSsVt(_, _, k), cV0(_, _, _0{}));
-            cute::copy(smem_tiled_copy_P, tSsP(_, _, k), cP0(_, _, _0{}));
+            if constexpr (T::kArch != 80) {
+                cute::copy(smem_tiled_copy_P, tSsP(_, _, k), cP0(_, _, _0{}));
+            }
         };
         auto load1 = [&](auto k) {
+            if constexpr (T::kArch == 80) {
+                cute::copy(smem_tiled_copy_P, tSsP(_, _, k), cP1(_, _, _0{}));
+            }
             cute::copy(smem_tiled_copy_Vt, tSsVt(_, _, k), cV1(_, _, _0{}));
-            cute::copy(smem_tiled_copy_P, tSsP(_, _, k), cP1(_, _, _0{}));
+            if constexpr (T::kArch != 80) {
+                cute::copy(smem_tiled_copy_P, tSsP(_, _, k), cP1(_, _, _0{}));
+            }
         };
         if constexpr (PRIME_FIRST_P) {
             static_assert(T::kHasExtraKTile);
@@ -1038,14 +1214,14 @@ __forceinline__ __device__ Wg0SoftmaxSums wg0_bunch_0(
         constexpr int NCG = T::kBlockN / 16;   // column groups: 2 (N32) / 4 (N64)
         #pragma unroll
         for (int cg = 0; cg < NCG; cg++) {
-            int base = (cg / 2) * 32 + warp_n_idx * 16 + (cg % 2) * 8 + lane4 * 2;
+            int base = (cg / 2) * 32 + warp_n_idx * 16 + (cg % 2) * 8 + lane4 * T::kScoreLaneStride;
             hs64_load_valid_pair<T>(smem_valid_indices, valid_indices_buf, base,
                                   r_valid[cg*2], r_valid[cg*2+1]);
         }
     } else {
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            int base = (k * 8 + lane4 * 2) % T::kBlockN;
+            int base = (k * 8 + lane4 * T::kScoreLaneStride) % T::kBlockN;
             hs64_load_valid_pair<T>(smem_valid_indices, valid_indices_buf, base,
                                   r_valid[k*2], r_valid[k*2+1]);
         }
@@ -1062,17 +1238,17 @@ __forceinline__ __device__ Wg0SoftmaxSums wg0_bunch_0(
             for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
                 int g = i / 4;
                 int rv_base = g * 2;
-                rP0(i)   = r_valid[rv_base]     ? rP0(i)   : MAX_INIT_VAL;
-                rP0(i+1) = r_valid[rv_base + 1] ? rP0(i+1) : MAX_INIT_VAL;
-                cur_max = max(cur_max, max(rP0(i), rP0(i+1)));
+                hs64_acc<T>(rP0, i)   = r_valid[rv_base]     ? hs64_acc<T>(rP0, i)   : MAX_INIT_VAL;
+                hs64_acc<T>(rP0, i+1) = r_valid[rv_base + 1] ? hs64_acc<T>(rP0, i+1) : MAX_INIT_VAL;
+                cur_max = max(cur_max, max(hs64_acc<T>(rP0, i), hs64_acc<T>(rP0, i+1)));
             }
         } else {
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
                 int k_base = ((i/4) % 4) * 2;
-                rP0(i)   = r_valid[k_base]     ? rP0(i)   : MAX_INIT_VAL;
-                rP0(i+1) = r_valid[k_base + 1] ? rP0(i+1) : MAX_INIT_VAL;
-                cur_max = max(cur_max, max(rP0(i), rP0(i+1)));
+                hs64_acc<T>(rP0, i)   = r_valid[k_base]     ? hs64_acc<T>(rP0, i)   : MAX_INIT_VAL;
+                hs64_acc<T>(rP0, i+1) = r_valid[k_base + 1] ? hs64_acc<T>(rP0, i+1) : MAX_INIT_VAL;
+                cur_max = max(cur_max, max(hs64_acc<T>(rP0, i), hs64_acc<T>(rP0, i+1)));
             }
         }
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
@@ -1120,11 +1296,11 @@ __forceinline__ __device__ Wg0SoftmaxSums wg0_bunch_0(
         float cur_sum = 0;
         CUTLASS_PRAGMA_UNROLL
         for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
-            rP0(i) = exp2f(rP0(i)*scale_softmax_log2 - new_max);
-            rP0(i+1) = exp2f(rP0(i+1)*scale_softmax_log2 - new_max);
-            rPb(i) = (typename T::InputT)rP0(i);
-            rPb(i+1) = (typename T::InputT)rP0(i+1);
-            cur_sum += rP0(i) + rP0(i+1);
+            hs64_acc<T>(rP0, i) = exp2f(hs64_acc<T>(rP0, i)*scale_softmax_log2 - new_max);
+            hs64_acc<T>(rP0, i+1) = exp2f(hs64_acc<T>(rP0, i+1)*scale_softmax_log2 - new_max);
+            hs64_acc<T>(rPb, i) = (typename T::InputT)hs64_acc<T>(rP0, i);
+            hs64_acc<T>(rPb, i+1) = (typename T::InputT)hs64_acc<T>(rP0, i+1);
+            cur_sum += hs64_acc<T>(rP0, i) + hs64_acc<T>(rP0, i+1);
         }
         if constexpr (T::kUsePv2x4) {
             if (local_row_idx == 0) {
@@ -1208,7 +1384,7 @@ __forceinline__ __device__ Wg0SoftmaxSums wg0_bunch_0_uniform_geometry(
             constexpr int NCG = T::kBlockN / 16;
             #pragma unroll
             for (int cg = 0; cg < NCG; cg++) {
-                int base = (cg / 2) * 32 + warp_n_idx * 16 + (cg % 2) * 8 + lane4 * 2;
+                int base = (cg / 2) * 32 + warp_n_idx * 16 + (cg % 2) * 8 + lane4 * T::kScoreLaneStride;
                 hs64_load_valid_pair<T>(smem_valid_indices, valid_indices_buf, base,
                                       r_valid[cg*2], r_valid[cg*2+1]);
             }
@@ -1216,7 +1392,7 @@ __forceinline__ __device__ Wg0SoftmaxSums wg0_bunch_0_uniform_geometry(
     } else {
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            int base = (k * 8 + lane4 * 2) % T::kBlockN;
+            int base = (k * 8 + lane4 * T::kScoreLaneStride) % T::kBlockN;
             hs64_load_valid_pair<T>(smem_valid_indices, valid_indices_buf, base,
                                   r_valid[k*2], r_valid[k*2+1]);
         }
@@ -1233,17 +1409,17 @@ __forceinline__ __device__ Wg0SoftmaxSums wg0_bunch_0_uniform_geometry(
             for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
                 int g = i / 4;
                 int rv_base = g * 2;
-                rP0(i)   = r_valid[rv_base]     ? rP0(i)   : MAX_INIT_VAL;
-                rP0(i+1) = r_valid[rv_base + 1] ? rP0(i+1) : MAX_INIT_VAL;
-                cur_max = max(cur_max, max(rP0(i), rP0(i+1)));
+                hs64_acc<T>(rP0, i)   = r_valid[rv_base]     ? hs64_acc<T>(rP0, i)   : MAX_INIT_VAL;
+                hs64_acc<T>(rP0, i+1) = r_valid[rv_base + 1] ? hs64_acc<T>(rP0, i+1) : MAX_INIT_VAL;
+                cur_max = max(cur_max, max(hs64_acc<T>(rP0, i), hs64_acc<T>(rP0, i+1)));
             }
         } else {
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
                 int k_base = ((i/4) % 4) * 2;
-                rP0(i)   = r_valid[k_base]     ? rP0(i)   : MAX_INIT_VAL;
-                rP0(i+1) = r_valid[k_base + 1] ? rP0(i+1) : MAX_INIT_VAL;
-                cur_max = max(cur_max, max(rP0(i), rP0(i+1)));
+                hs64_acc<T>(rP0, i)   = r_valid[k_base]     ? hs64_acc<T>(rP0, i)   : MAX_INIT_VAL;
+                hs64_acc<T>(rP0, i+1) = r_valid[k_base + 1] ? hs64_acc<T>(rP0, i+1) : MAX_INIT_VAL;
+                cur_max = max(cur_max, max(hs64_acc<T>(rP0, i), hs64_acc<T>(rP0, i+1)));
             }
         }
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
@@ -1291,11 +1467,11 @@ __forceinline__ __device__ Wg0SoftmaxSums wg0_bunch_0_uniform_geometry(
         float cur_sum = 0;
         CUTLASS_PRAGMA_UNROLL
         for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
-            rP0(i) = exp2f(rP0(i)*scale_softmax_log2 - new_max);
-            rP0(i+1) = exp2f(rP0(i+1)*scale_softmax_log2 - new_max);
-            rPb(i) = (typename T::InputT)rP0(i);
-            rPb(i+1) = (typename T::InputT)rP0(i+1);
-            cur_sum += rP0(i) + rP0(i+1);
+            hs64_acc<T>(rP0, i) = exp2f(hs64_acc<T>(rP0, i)*scale_softmax_log2 - new_max);
+            hs64_acc<T>(rP0, i+1) = exp2f(hs64_acc<T>(rP0, i+1)*scale_softmax_log2 - new_max);
+            hs64_acc<T>(rPb, i) = (typename T::InputT)hs64_acc<T>(rP0, i);
+            hs64_acc<T>(rPb, i+1) = (typename T::InputT)hs64_acc<T>(rP0, i+1);
+            cur_sum += hs64_acc<T>(rP0, i) + hs64_acc<T>(rP0, i+1);
         }
         if constexpr (T::kUsePv2x4) {
             if (local_row_idx == 0) {
@@ -1374,14 +1550,14 @@ __forceinline__ __device__ auto wg1_bunch_0(
                 constexpr int NCG = T::kBlockN / 16;   // column groups: 2 (N32) / 4 (N64)
                 #pragma unroll
                 for (int cg = 0; cg < NCG; cg++) {
-                    int base = (cg / 2) * 32 + warp_n_idx * 16 + (cg % 2) * 8 + lane4 * 2;
+                    int base = (cg / 2) * 32 + warp_n_idx * 16 + (cg % 2) * 8 + lane4 * T::kScoreLaneStride;
                     hs64_load_valid_pair<T>(smem_valid_indices, valid_indices_buf, base,
                                           r_valid[cg*2], r_valid[cg*2+1]);
                 }
             } else {
                 #pragma unroll
                 for (int k = 0; k < 4; k++) {
-                    int base = (k * 8 + lane4 * 2) % T::kBlockN;
+                    int base = (k * 8 + lane4 * T::kScoreLaneStride) % T::kBlockN;
                     hs64_load_valid_pair<T>(smem_valid_indices, valid_indices_buf, base,
                                           r_valid[k*2], r_valid[k*2+1]);
                 }
@@ -1391,18 +1567,18 @@ __forceinline__ __device__ auto wg1_bunch_0(
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
                 if constexpr (IS_BLK0_LAST) {
-                    rP1(i) = rP1(i+1) = MAX_INIT_VAL;
+                    hs64_acc<T>(rP1, i) = hs64_acc<T>(rP1, i+1) = MAX_INIT_VAL;
                 } else if constexpr (T::kIsCrossCut) {
                     int g = i / 4;
                     int rv_base = g * 2;
-                    rP1(i)   = r_valid[rv_base]     ? rP1(i)   : MAX_INIT_VAL;
-                    rP1(i+1) = r_valid[rv_base + 1] ? rP1(i+1) : MAX_INIT_VAL;
+                    hs64_acc<T>(rP1, i)   = r_valid[rv_base]     ? hs64_acc<T>(rP1, i)   : MAX_INIT_VAL;
+                    hs64_acc<T>(rP1, i+1) = r_valid[rv_base + 1] ? hs64_acc<T>(rP1, i+1) : MAX_INIT_VAL;
                 } else {
                     int k_base = ((i/4) % 4) * 2;
-                    rP1(i)   = r_valid[k_base]     ? rP1(i)   : MAX_INIT_VAL;
-                    rP1(i+1) = r_valid[k_base + 1] ? rP1(i+1) : MAX_INIT_VAL;
+                    hs64_acc<T>(rP1, i)   = r_valid[k_base]     ? hs64_acc<T>(rP1, i)   : MAX_INIT_VAL;
+                    hs64_acc<T>(rP1, i+1) = r_valid[k_base + 1] ? hs64_acc<T>(rP1, i+1) : MAX_INIT_VAL;
                 }
-                cur_max = max(cur_max, max(rP1(i), rP1(i+1)));
+                cur_max = max(cur_max, max(hs64_acc<T>(rP1, i), hs64_acc<T>(rP1, i+1)));
             }
 
             cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
@@ -1455,15 +1631,15 @@ __forceinline__ __device__ auto wg1_bunch_0(
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
                 if constexpr (T::kUsePv2x4) {
-                    rP1(i) = exp2f(rP1(i) - new_max);
-                    rP1(i + 1) = exp2f(rP1(i + 1) - new_max);
+                    hs64_acc<T>(rP1, i) = exp2f(hs64_acc<T>(rP1, i) - new_max);
+                    hs64_acc<T>(rP1, i + 1) = exp2f(hs64_acc<T>(rP1, i + 1) - new_max);
                 } else {
-                    rP1(i) = exp2f(rP1(i) * scale_softmax_log2 - new_max);
-                    rP1(i + 1) = exp2f(rP1(i + 1) * scale_softmax_log2 - new_max);
+                    hs64_acc<T>(rP1, i) = exp2f(hs64_acc<T>(rP1, i) * scale_softmax_log2 - new_max);
+                    hs64_acc<T>(rP1, i + 1) = exp2f(hs64_acc<T>(rP1, i + 1) * scale_softmax_log2 - new_max);
                 }
-                rP1b(i) = (typename T::InputT)rP1(i);
-                rP1b(i+1) = (typename T::InputT)rP1(i+1);
-                cur_sum += rP1(i) + rP1(i+1);
+                hs64_acc<T>(rP1b, i) = (typename T::InputT)hs64_acc<T>(rP1, i);
+                hs64_acc<T>(rP1b, i+1) = (typename T::InputT)hs64_acc<T>(rP1, i+1);
+                cur_sum += hs64_acc<T>(rP1, i) + hs64_acc<T>(rP1, i+1);
             }
         }
 
@@ -1481,8 +1657,8 @@ __forceinline__ __device__ auto wg1_bunch_0(
             // shared scales after bar2.
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rO1); i += 4) {
-                rO1(i) = rO1(i)*cur_scale_for_o1;
-                rO1(i+1) = rO1(i+1)*cur_scale_for_o1;
+                hs64_acc<T>(rO1, i) = hs64_acc<T>(rO1, i)*cur_scale_for_o1;
+                hs64_acc<T>(rO1, i+1) = hs64_acc<T>(rO1, i+1)*cur_scale_for_o1;
             }
         }
 
@@ -1518,7 +1694,7 @@ __forceinline__ __device__ void wg1_bunch_0_pre(
     int lane4 = idx_in_warpgroup % 4;
     #pragma unroll
     for (int k = 0; k < 4; k++) {
-        int base = (k * 8 + lane4 * 2) % T::kBlockN;
+        int base = (k * 8 + lane4 * T::kScoreLaneStride) % T::kBlockN;
         hs64_load_valid_pair<T>(smem_valid_indices, valid_indices_buf, base,
                               r_valid[k*2], r_valid[k*2+1]);
     }
@@ -1528,13 +1704,13 @@ __forceinline__ __device__ void wg1_bunch_0_pre(
         CUTLASS_PRAGMA_UNROLL
         for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
             if constexpr (IS_BLK0_LAST) {
-                rP1(i) = rP1(i+1) = MAX_INIT_VAL;
+                hs64_acc<T>(rP1, i) = hs64_acc<T>(rP1, i+1) = MAX_INIT_VAL;
             } else {
                 int k_base = ((i/4) % 4) * 2;
-                rP1(i)   = r_valid[k_base]     ? rP1(i)   : MAX_INIT_VAL;
-                rP1(i+1) = r_valid[k_base + 1] ? rP1(i+1) : MAX_INIT_VAL;
+                hs64_acc<T>(rP1, i)   = r_valid[k_base]     ? hs64_acc<T>(rP1, i)   : MAX_INIT_VAL;
+                hs64_acc<T>(rP1, i+1) = r_valid[k_base + 1] ? hs64_acc<T>(rP1, i+1) : MAX_INIT_VAL;
             }
-            cur_max = max(cur_max, max(rP1(i), rP1(i+1)));
+            cur_max = max(cur_max, max(hs64_acc<T>(rP1, i), hs64_acc<T>(rP1, i+1)));
         }
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
@@ -1570,7 +1746,7 @@ __forceinline__ __device__ void wg1_bunch_0_pre_crosscut(
     } else {
         #pragma unroll
         for (int cg = 0; cg < NCG; ++cg) {
-            int base = (cg / 2) * 32 + warp_n_idx * 16 + (cg % 2) * 8 + lane4 * 2;
+            int base = (cg / 2) * 32 + warp_n_idx * 16 + (cg % 2) * 8 + lane4 * T::kScoreLaneStride;
             hs64_load_valid_pair<T>(smem_valid_indices, valid_indices_buf, base,
                                   r_valid[cg * 2], r_valid[cg * 2 + 1]);
         }
@@ -1586,13 +1762,13 @@ __forceinline__ __device__ void wg1_bunch_0_pre_crosscut(
         CUTLASS_PRAGMA_UNROLL
         for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
             if constexpr (IS_BLK0_LAST) {
-                rP1(i) = rP1(i + 1) = MAX_INIT_VAL;
+                hs64_acc<T>(rP1, i) = hs64_acc<T>(rP1, i + 1) = MAX_INIT_VAL;
             } else {
                 int rv_base = (i / 4) * 2;
-                rP1(i) = r_valid[rv_base] ? rP1(i) : MAX_INIT_VAL;
-                rP1(i + 1) = r_valid[rv_base + 1] ? rP1(i + 1) : MAX_INIT_VAL;
+                hs64_acc<T>(rP1, i) = r_valid[rv_base] ? hs64_acc<T>(rP1, i) : MAX_INIT_VAL;
+                hs64_acc<T>(rP1, i + 1) = r_valid[rv_base + 1] ? hs64_acc<T>(rP1, i + 1) : MAX_INIT_VAL;
             }
-            cur_max = max(cur_max, max(rP1(i), rP1(i + 1)));
+            cur_max = max(cur_max, max(hs64_acc<T>(rP1, i), hs64_acc<T>(rP1, i + 1)));
         }
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
@@ -1601,8 +1777,8 @@ __forceinline__ __device__ void wg1_bunch_0_pre_crosscut(
         if constexpr (T::kUsePv2x4 && !IS_BLK0_LAST) {
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
-                rP1(i) *= scale_softmax_log2;
-                rP1(i + 1) *= scale_softmax_log2;
+                hs64_acc<T>(rP1, i) *= scale_softmax_log2;
+                hs64_acc<T>(rP1, i + 1) *= scale_softmax_log2;
             }
         }
         r_cur_max[local_row_idx] = cur_max;
@@ -1657,6 +1833,17 @@ __forceinline__ __device__ void save_rP1_to_sP(
     Tensor<Engine1, Layout1> &sP,
     int idx_in_warpgroup
 ) {
+    if constexpr (T::kArch == 80) {
+        auto coords = typename T::TiledMma{}.get_slice(idx_in_warpgroup).partition_C(
+            make_identity_tensor(Shape<Int<T::kBlockM>, Int<T::kBlockN>>{}));
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(rPb); ++i) {
+            int row = get<0>(coords(i));
+            int col = get<1>(coords(i));
+            sP(hs64_sm80_store_row(row, col), col) = rPb(i);
+        }
+        return;
+    }
     typename T::TiledMma tiled_mma;
     // C copy, same rationale as save_rP0_to_sP.
     auto r2s_copy = make_tiled_copy_C(typename T::SmemCopyAtomS{}, tiled_mma);
@@ -1671,9 +1858,21 @@ template <typename T, typename Engine, typename Layout>
 __forceinline__ __device__ auto hs64_prepare_p_store(
     Tensor<Engine, Layout> &sP, int idx_in_warpgroup)
 {
+    if constexpr (T::kArch == 80) {
+        auto coords = typename T::TiledMma{}.get_slice(idx_in_warpgroup).partition_C(
+            make_identity_tensor(Shape<Int<T::kBlockM>, Int<T::kBlockN>>{}));
+        cute::array<uint32_t, decltype(size(coords))::value> addresses;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(coords); ++i) {
+            int row = get<0>(coords(i));
+            int col = get<1>(coords(i));
+            addresses[i] = cast_smem_ptr_to_uint(&sP(hs64_sm80_store_row(row, col), col));
+        }
+        return addresses;
+    } else {
     auto r2s_copy = make_tiled_copy_C(typename T::SmemCopyAtomS{}, typename T::TiledMma{});
     auto thr_copy = r2s_copy.get_slice(idx_in_warpgroup);
-    auto dst = recast<uint32_t>(thr_copy.partition_D(sP));
+    auto dst = recast<typename T::PStoreWord>(thr_copy.partition_D(sP));
     cute::array<uint32_t, decltype(size(dst))::value> addresses;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(dst); ++i) {
@@ -1682,6 +1881,7 @@ __forceinline__ __device__ auto hs64_prepare_p_store(
         asm volatile("" : "+r"(addresses[i]));
     }
     return addresses;
+    }
 }
 
 template <typename T, typename Engine, typename Layout, size_t N>
@@ -1689,13 +1889,22 @@ __forceinline__ __device__ void hs64_save_prepared_p(
     Tensor<Engine, Layout> &rPb, cute::array<uint32_t, N> const &addresses,
     int idx_in_warpgroup)
 {
+    if constexpr (T::kArch == 80) {
+        auto src = recast<uint16_t>(rPb);
+        static_assert(decltype(size(src))::value == N);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < N; ++i) {
+            cutlass::arch::shared_store<2>(addresses[i], &src(i));
+        }
+        return;
+    }
     auto r2s_copy = make_tiled_copy_C(typename T::SmemCopyAtomS{}, typename T::TiledMma{});
     auto thr_copy = r2s_copy.get_slice(idx_in_warpgroup);
-    auto src = recast<uint32_t>(thr_copy.retile_S(rPb));
+    auto src = recast<typename T::PStoreWord>(thr_copy.retile_S(rPb));
     static_assert(decltype(size(src))::value == N);
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < N; ++i) {
-        cutlass::arch::shared_store<4>(addresses[i], &src(i));
+        cutlass::arch::shared_store<sizeof(typename T::PStoreWord)>(addresses[i], &src(i));
     }
 }
 
@@ -1709,6 +1918,10 @@ __forceinline__ __device__ void save_rP0_to_sP(
     Tensor<Engine1, Layout1> &sP,
     int idx_in_warpgroup)
 {
+    if constexpr (T::kArch == 80) {
+        save_rP1_to_sP<T>(rPb, sP, idx_in_warpgroup);
+        return;
+    }
     typename T::TiledMma tiled_mma;
     // rPb is the QK GEMM's C fragment, so the write side is a C copy (matches
     // the non-WI kernel and FlashMLA HS64). rPb MUST be shaped from
@@ -1767,7 +1980,7 @@ __forceinline__ __device__ void scale_rO_pv_one(
     Wg0ScaleFactors *qk_factors = nullptr
 ) {
     Tensor rO_rowcol = make_tensor(
-        rO.data(), hs64_convert_layout_acc_rowcol(rO.layout()));
+        rO.data(), hs64_convert_layout_acc_rowcol<T>(rO.layout()));
     static_assert(decltype(size<0>(rO_rowcol))::value == 4);
     static_assert(decltype(size<1>(rO_rowcol))::value == 16);
     CUTLASS_PRAGMA_UNROLL
@@ -1802,7 +2015,7 @@ __forceinline__ __device__ void scale_rO_pv_product(
     int idx_in_warpgroup
 ) {
     Tensor rO_rowcol = make_tensor(
-        rO.data(), hs64_convert_layout_acc_rowcol(rO.layout()));
+        rO.data(), hs64_convert_layout_acc_rowcol<T>(rO.layout()));
     static_assert(decltype(size<0>(rO_rowcol))::value == 4);
     static_assert(decltype(size<1>(rO_rowcol))::value == 16);
     CUTLASS_PRAGMA_UNROLL
@@ -1831,7 +2044,7 @@ __forceinline__ __device__ void scale_rO_pv_product_with_cache(
     int idx_in_warpgroup
 ) {
     Tensor rO_rowcol = make_tensor(
-        rO.data(), hs64_convert_layout_acc_rowcol(rO.layout()));
+        rO.data(), hs64_convert_layout_acc_rowcol<T>(rO.layout()));
     static_assert(decltype(size<0>(rO_rowcol))::value == 4);
     static_assert(decltype(size<1>(rO_rowcol))::value == 16);
     static_assert(T::kAtomLayoutM == 4 && T::kPvAtomLayoutM == 2);
@@ -1911,8 +2124,8 @@ __forceinline__ __device__ Wg0ScaleFactors wg0_scale_rP0(
         }
         CUTLASS_PRAGMA_UNROLL
         for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
-            rPb(i) = (typename T::InputT)(rP0(i)*scale_factor);
-            rPb(i+1) = (typename T::InputT)(rP0(i+1)*scale_factor);
+            hs64_acc<T>(rPb, i) = (typename T::InputT)(hs64_acc<T>(rP0, i)*scale_factor);
+            hs64_acc<T>(rPb, i+1) = (typename T::InputT)(hs64_acc<T>(rP0, i+1)*scale_factor);
         }
     }
     return factors;
@@ -1937,8 +2150,8 @@ __forceinline__ __device__ void wg0_rescale_rO0(
         float scale_factor = sScale1(row_idx);
         CUTLASS_PRAGMA_UNROLL
         for (int i = local_row_idx ? 2 : 0; i < size(rO0); i += 4) {
-            rO0(i) = rO0(i)*scale_factor;
-            rO0(i+1) = rO0(i+1)*scale_factor;
+            hs64_acc<T>(rO0, i) = hs64_acc<T>(rO0, i)*scale_factor;
+            hs64_acc<T>(rO0, i+1) = hs64_acc<T>(rO0, i+1)*scale_factor;
         }
         rL[local_row_idx] *= scale_factor;
     }
@@ -1959,8 +2172,8 @@ __forceinline__ __device__ void wg0_rescale_rO0_with_factors(
         float scale_factor = local_row_idx == 0 ? factors.row0 : factors.row1;
         CUTLASS_PRAGMA_UNROLL
         for (int i = local_row_idx ? 2 : 0; i < size(rO0); i += 4) {
-            rO0(i) = rO0(i)*scale_factor;
-            rO0(i+1) = rO0(i+1)*scale_factor;
+            hs64_acc<T>(rO0, i) = hs64_acc<T>(rO0, i)*scale_factor;
+            hs64_acc<T>(rO0, i+1) = hs64_acc<T>(rO0, i+1)*scale_factor;
         }
         rL[local_row_idx] *= scale_factor;
     }
@@ -1988,8 +2201,8 @@ __forceinline__ __device__ void wg1_scale0_rO1(
             float scale_factor = sScale0(row_idx) * sScale1(row_idx);
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rO1); i += 4) {
-                rO1(i) = (rO1(i)*scale_factor);
-                rO1(i+1) = (rO1(i+1)*scale_factor);
+                hs64_acc<T>(rO1, i) = (hs64_acc<T>(rO1, i)*scale_factor);
+                hs64_acc<T>(rO1, i+1) = (hs64_acc<T>(rO1, i+1)*scale_factor);
             }
         }
     }
@@ -2020,8 +2233,8 @@ __forceinline__ __device__ void wg0_scale0_rO0(
             float scale_factor = sScale0[row_idx];
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rO0); i += 4) {
-                rO0(i) *= scale_factor;
-                rO0(i+1) *= scale_factor;
+                hs64_acc<T>(rO0, i) *= scale_factor;
+                hs64_acc<T>(rO0, i+1) *= scale_factor;
             }
         }
     }
@@ -2061,9 +2274,9 @@ __forceinline__ __device__ void store_o(
 
     if constexpr (T::kUsePv2x4) {
         Tensor rO_rowcol = make_tensor(
-            rO.data(), hs64_convert_layout_acc_rowcol(rO.layout()));
+            rO.data(), hs64_convert_layout_acc_rowcol<T>(rO.layout()));
         Tensor rOb_rowcol = make_tensor(
-            rOb.data(), hs64_convert_layout_acc_rowcol(rOb.layout()));
+            rOb.data(), hs64_convert_layout_acc_rowcol<T>(rOb.layout()));
         static_assert(decltype(size<0>(rO_rowcol))::value == 4);
         static_assert(decltype(size<1>(rO_rowcol))::value == 16);
         CUTLASS_PRAGMA_UNROLL
@@ -2431,10 +2644,10 @@ __forceinline__ __device__ void hs64_copy_even_full_or_pass(
         } else {
             auto src = recast<cute::uint128_t>(g_cur);
             CUTE_STATIC_ASSERT_V(size(src) == Int<1>{});
-            const uint32_t tid = static_cast<uint32_t>(tidx) & 255u;
-            const uint32_t lane_offset = typename T::SmemLayoutKHigh4{}(
-                tid / 8, (tid % 8) * 8) * sizeof(typename T::InputT);
-            const uint32_t dst = lane_offset | 0x18000u | (P * 0x1000u) |
+            const uint32_t tid = static_cast<uint32_t>(hs64_store_thread<T>(tidx)) & 255u;
+            const uint32_t lane_offset = typename T::SmemLayoutKHigh4Store{}(
+                tid / 8 + (T::kArch == 80 ? P * 32 : 0), (tid % 8) * 8) * sizeof(typename T::InputT);
+            const uint32_t dst = lane_offset | 0x18000u | (T::kArch == 80 ? 0u : P * 0x1000u) |
                                  ((TILE - 4) * 0x2000u) | high_bank_mask;
             PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
                 src[0], *static_cast<cute::uint128_t*>(__cvta_shared_to_generic(dst)),
@@ -2445,10 +2658,10 @@ __forceinline__ __device__ void hs64_copy_even_full_or_pass(
     } else {
         auto src = recast<cute::uint128_t>(g_cur);
         CUTE_STATIC_ASSERT_V(size(src) == Int<1>{});
-        const uint32_t tid = static_cast<uint32_t>(tidx) & 255u;
-        const uint32_t lane_offset = typename T::SmemLayoutKHigh4{}(
-            tid / 8, (tid % 8) * 8) * sizeof(typename T::InputT);
-        const uint32_t dst = lane_offset | 0x18000u | (P * 0x1000u) |
+        const uint32_t tid = static_cast<uint32_t>(hs64_store_thread<T>(tidx)) & 255u;
+        const uint32_t lane_offset = typename T::SmemLayoutKHigh4Store{}(
+            tid / 8 + (T::kArch == 80 ? P * 32 : 0), (tid % 8) * 8) * sizeof(typename T::InputT);
+        const uint32_t dst = lane_offset | 0x18000u | (T::kArch == 80 ? 0u : P * 0x1000u) |
                              ((TILE - 4) * 0x2000u) | high_bank_mask;
         PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
             src[0], *static_cast<cute::uint128_t*>(__cvta_shared_to_generic(dst)),
@@ -2466,17 +2679,17 @@ __forceinline__ __device__ uint32_t hs64_even_bundle_dst(
         using Plan = typename T::SharedMemoryPlan;
         static_assert(T::kHasExtraKTile && T::kNumKTiles == 9);
         static_assert(offsetof(Plan, smem_sK) == 0x12000);
-        const uint32_t tid = static_cast<uint32_t>(tidx) & 255u;
-        const uint32_t lane_offset = typename T::SmemLayoutKHigh4{}(
-            tid / 8, (tid % 8) * 8) * sizeof(typename T::InputT);
+        const uint32_t tid = static_cast<uint32_t>(hs64_store_thread<T>(tidx)) & 255u;
+        const uint32_t lane_offset = typename T::SmemLayoutKHigh4Store{}(
+            tid / 8 + (T::kArch == 80 ? P * 32 : 0), (tid % 8) * 8) * sizeof(typename T::InputT);
         constexpr uint32_t prefix = offsetof(Plan, smem_sK)
-            + TILE * 0x2000u + P * 0x1000u;
+            + TILE * 0x2000u + (T::kArch == 80 ? 0u : P * 0x1000u);
         return prefix | lane_offset;
     } else {
-        const uint32_t tid = static_cast<uint32_t>(tidx) & 255u;
-        const uint32_t lane_offset = typename T::SmemLayoutKHigh4{}(
-            tid / 8, (tid % 8) * 8) * sizeof(typename T::InputT);
-        return (high_base + (TILE - 4) * 0x2000u + P * 0x1000u) | lane_offset;
+        const uint32_t tid = static_cast<uint32_t>(hs64_store_thread<T>(tidx)) & 255u;
+        const uint32_t lane_offset = typename T::SmemLayoutKHigh4Store{}(
+            tid / 8 + (T::kArch == 80 ? P * 32 : 0), (tid % 8) * 8) * sizeof(typename T::InputT);
+        return (high_base + (TILE - 4) * 0x2000u + (T::kArch == 80 ? 0u : P * 0x1000u)) | lane_offset;
     }
 }
 
@@ -2614,7 +2827,14 @@ __forceinline__ __device__ void issue_K_load_bf16(
     // Dummy k_base_ptr — actual address comes from token_ptr[p] (set per pass)
     InputT* k_base_ptr = reinterpret_cast<InputT*>(params.k_ptr);
     auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(tidx);
-    Tensor tKsK = gmem_thr_copy_K.partition_D(sK_buf);
+    Tensor tKsK = [&]() {
+        if constexpr (T::kArch == 80) {
+            auto store_view = make_tensor(sK_buf.data(), typename T::SmemLayoutKStore{});
+            return gmem_tiled_copy_K.get_thread_slice(hs64_store_thread<T>(tidx)).partition_D(store_view);
+        } else {
+            return gmem_thr_copy_K.partition_D(sK_buf);
+        }
+    }();
     Tensor gK_tok = make_tensor(make_gmem_ptr(k_base_ptr),
         Shape<Int<T::kGmemTokPerPass>, Int<T::kHeadDim>>{},
         make_stride(params.k_row_stride, _1{}));
@@ -2847,7 +3067,12 @@ __forceinline__ __device__ void launch_q_copy(
 
     Tensor tQgQ = gmem_thr_copy_Q.partition_S(gQ);
 
-    gmem_tiled_copy_Q.desc_.init(nullptr, params.seqlen_q, params.d, params.q_row_stride);
+    if constexpr (T::kArch == 80) {
+        gmem_tiled_copy_Q.desc_ = AiuDesc{nullptr, params.seqlen_q, params.q_row_stride,
+                                       T::kBlockM, T::kBlockKSmem, 0};
+    } else {
+        gmem_tiled_copy_Q.desc_.init(nullptr, params.seqlen_q, params.d, params.q_row_stride);
+    }
     Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
 
     if (warp_idx == 0) {
@@ -2909,6 +3134,7 @@ template <
     typename EngineQ4, typename LayoutQ4,
     typename EngineQ5, typename LayoutQ5,
     typename EngineQMid6, typename LayoutQMid6,
+    typename EngineQlow0, typename LayoutQlow0,
     typename EngineVI, typename LayoutVI
 >
 __forceinline__ __device__ void wg0_subroutine(
@@ -2926,6 +3152,7 @@ __forceinline__ __device__ void wg0_subroutine(
     Tensor<EngineQ4, LayoutQ4> &rQ4,
     Tensor<EngineQ5, LayoutQ5> &rQ5,
     Tensor<EngineQMid6, LayoutQMid6> &rQmid6,
+    Tensor<EngineQlow0, LayoutQlow0> &rQlow0,
     Tensor<Engine12, Layout12> &rP0,
     Tensor<Engine13, Layout13> &rO0,
     float rL[2],
@@ -3145,9 +3372,9 @@ __forceinline__ __device__ void wg0_subroutine(
                     pre_token_idx_b, nxt_block1 + 2, end_block_idx, extra_seqlen_k);
             }
             // K0-low readiness was published by the preceding WG0 bar6.
-            warpgroup_cooperative_qkt_gemm<T, 5>(sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, barriers_K0, cur_phase_K0, idx_in_warpgroup);
+            warpgroup_cooperative_qkt_gemm<T, 5>(sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, rQlow0, barriers_K0, cur_phase_K0, idx_in_warpgroup);
         } else {
-            warpgroup_cooperative_qkt_gemm<T, 0>(sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, barriers_K0, cur_phase_K0, idx_in_warpgroup);
+            warpgroup_cooperative_qkt_gemm<T, 0>(sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, rQlow0, barriers_K0, cur_phase_K0, idx_in_warpgroup);
         }
     }
 
@@ -3196,7 +3423,7 @@ __forceinline__ __device__ void wg0_subroutine(
             even_high_in_scratch ^= 1u;
         } else {
             warpgroup_cooperative_qkt_gemm<T, 2>(
-                sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4,
+                sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, rQlow0,
                 barriers_K0, cur_phase_K0, idx_in_warpgroup);
         }
     }
@@ -3230,6 +3457,7 @@ template <
     typename EngineQ4, typename LayoutQ4,
     typename EngineQ5, typename LayoutQ5,
     typename EngineQMid6, typename LayoutQMid6,
+    typename EngineQlow0, typename LayoutQlow0,
     typename EngineVI, typename LayoutVI
 >
 __forceinline__ __device__ void wg1_subroutine(
@@ -3247,6 +3475,7 @@ __forceinline__ __device__ void wg1_subroutine(
     Tensor<EngineQ4, LayoutQ4> &rQ4,
     Tensor<EngineQ5, LayoutQ5> &rQ5,
     Tensor<EngineQMid6, LayoutQMid6> &rQmid6,
+    Tensor<EngineQlow0, LayoutQlow0> &rQlow0,
     Tensor<Engine12, Layout12> &rP1,
     Tensor<Engine13, Layout13> &rO1,
     float rL[2],
@@ -3456,7 +3685,7 @@ __forceinline__ __device__ void wg1_subroutine(
                     nxt_block0 + 2, end_block_idx, extra_seqlen_k);
             };
             warpgroup_cooperative_qkt_gemm<T, 6>(
-                sQ, cur_sK0, cur_sK0, rP1, rQ8, rQ6, rQ4,
+                sQ, cur_sK0, cur_sK0, rP1, rQ8, rQ6, rQ4, rQlow0,
                 barriers_K1, cur_phase_K1, idx_in_warpgroup,
                 phase6_wait_and_issue_k0);
         }
@@ -3483,7 +3712,7 @@ __forceinline__ __device__ void wg1_subroutine(
     if constexpr (T::kIsCrossCut && T::kUseQkWeave &&
                   !IS_BLK0_LAST && !IS_BLK1_LAST) {
         warpgroup_cooperative_qkt_gemm<T, 4, false, T::kHasExtraKTile>(
-            sQ, cur_sK0, cur_sK0, rP1, rQ8, rQ6, rQ4,
+            sQ, cur_sK0, cur_sK0, rP1, rQ8, rQ6, rQ4, rQlow0,
             barriers_K1, cur_phase_K1, idx_in_warpgroup);
     }
 
@@ -3492,7 +3721,7 @@ __forceinline__ __device__ void wg1_subroutine(
                   && (!T::kIsCrossCut || !T::kUseQkWeave)
     ) {
         cute::clear(rP1);
-        warpgroup_cooperative_qkt_gemm<T, 1>(sQ, cur_sK0, cur_sK0, rP1, rQ8, rQ6, rQ4, barriers_K1, cur_phase_K1, idx_in_warpgroup);
+        warpgroup_cooperative_qkt_gemm<T, 1>(sQ, cur_sK0, cur_sK0, rP1, rQ8, rQ6, rQ4, rQlow0, barriers_K1, cur_phase_K1, idx_in_warpgroup);
     }
 
     // Precompute the next addresses after QK<1>, once the current loads have
@@ -3949,6 +4178,16 @@ __forceinline__ __device__ void hs64_attention(
                 idx_in_warpgroup);
         }
 
+        // SM80 reuses Q0 across KV blocks rather than issuing four TSM loads
+        // in every low-half QK. Other architectures eliminate this fragment.
+        Tensor rQlow0 = thr_mma_rQ8.partition_fragment_A(
+            local_tile(sQ, Shape<Int<T::kBlockM>, _64>{}, Coord<_0, _0>{}));
+        if constexpr (T::kArch == 80) {
+            retrieve_rP_from_sP<T>(rQlow0,
+                local_tile(sQ, Shape<Int<T::kBlockM>, _64>{}, Coord<_0, _0>{}),
+                idx_in_warpgroup);
+        }
+
         if (warpgroup_idx == 0) {
             // Warpgroup 0
             Tensor rP0 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kBlockN>>{});  // MMA, MMA_M, MMA_K
@@ -3962,7 +4201,7 @@ __forceinline__ __device__ void hs64_attention(
 
                 cute::clear(rP0);
 
-                warpgroup_cooperative_qkt_gemm<T, 1, false, true>(sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, barriers_K0, cur_phase_K0, idx_in_warpgroup);
+                warpgroup_cooperative_qkt_gemm<T, 1, false, true>(sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, rQlow0, barriers_K0, cur_phase_K0, idx_in_warpgroup);
 
             }
 
@@ -4009,7 +4248,7 @@ __forceinline__ __device__ void hs64_attention(
 
             #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA)    \
                 wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA>(                \
-                sQ, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, rQ6, rQ4, rQ5, rQmid6, \
+                sQ, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, rQ6, rQ4, rQ5, rQmid6, rQlow0, \
                 rP0, rO, rL,                                     \
                 barriers_K0, barriers_K1, cur_phase_K0, even_high_in_scratch, params, \
                 seqlen_k, block_idx, end_block_idx, idx_in_warpgroup, wg_idx, \
@@ -4049,7 +4288,7 @@ __forceinline__ __device__ void hs64_attention(
 
             if (start_block_idx+1 < end_block_idx) {
 
-                warpgroup_cooperative_qkt_gemm<T, 1, true>(sQ, cur_sK1, cur_sK1, rP1, rQ8, rQ6, rQ4, barriers_K1, cur_phase_K1, idx_in_warpgroup);
+                warpgroup_cooperative_qkt_gemm<T, 1, true>(sQ, cur_sK1, cur_sK1, rP1, rQ8, rQ6, rQ4, rQlow0, barriers_K1, cur_phase_K1, idx_in_warpgroup);
 
             } else {
                 // When wg1 has no initial K block, rP1 must be zero-
@@ -4100,7 +4339,7 @@ __forceinline__ __device__ void hs64_attention(
 
             #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA)  \
                 wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA>(          \
-                sQ, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, rQ6, rQ4, rQ5, rQmid6, \
+                sQ, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, rQ6, rQ4, rQ5, rQmid6, rQlow0, \
                 rP1, rO, rL,                                     \
                 barriers_K0, barriers_K1, cur_phase_K1, even_high_in_scratch, params, \
                 seqlen_k, block_idx, end_block_idx, idx_in_warpgroup, wg_idx, \
@@ -4334,7 +4573,7 @@ __forceinline__ __device__ void hs64_attention(
             if (params.attn_sink_ptr != nullptr) {
                 if constexpr (T::kUsePv2x4) {
                     Tensor rO_rowcol = make_tensor(
-                        rO.data(), hs64_convert_layout_acc_rowcol(rO.layout()));
+                        rO.data(), hs64_convert_layout_acc_rowcol<T>(rO.layout()));
                     static_assert(decltype(size<0>(rO_rowcol))::value == 4);
                     static_assert(decltype(size<1>(rO_rowcol))::value == 16);
                     CUTLASS_PRAGMA_UNROLL
@@ -4508,12 +4747,22 @@ __forceinline__ __device__ void hs64_attention(
 template<typename T, bool ALLOW_EXTRA>
 __global__ void __launch_bounds__(T::NUM_THREADS, 1, 1)
 flash_sparse_decode_wg_kernel_hs64(__grid_constant__ const Flash_fwd_mla_params params) {
+#if ACOMPUTE_VERSION == 10000
+    if constexpr (T::kArch == 80)
+#else
+    if constexpr (T::kArch == 89)
+#endif
     hs64_attention<T, ALLOW_EXTRA>(params);
 }
 
 template<typename T>
 __global__ void __launch_bounds__(T::NUM_THREADS, 1, 1)
 flash_sparse_prefill_fwd_hs64(__grid_constant__ const SparsePrefillParams params) {
+#if ACOMPUTE_VERSION == 10000
+    if constexpr (T::kArch == 80) {
+#else
+    if constexpr (T::kArch == 89) {
+#endif
     // Specialize geometry here, where inlining can fold the fixed M64 and
     // one-token-page layout into Q copy, KV addressing and the epilogue.
     Flash_fwd_params p{};
@@ -4544,16 +4793,17 @@ flash_sparse_prefill_fwd_hs64(__grid_constant__ const SparsePrefillParams params
     p.o_row_stride = T::kHeadDimV;
     p.indices_batch_stride = params.stride_indices_s_q;
     hs64_attention<T, false>(p, static_cast<float *>(params.max_logits));
+    }
 }
 
 // Reuse the no-extra images for full tiles; all other inputs retain guards.
-template<int HeadDim, bool AllowExtra = true>
+template<int HeadDim, bool AllowExtra = true, int Arch = 89>
 static void run_flash_sparse_decode_wg_kernel_hs64_hdim(
     Flash_fwd_params &params,
     hggcStream_t stream)
 {
     static_assert(HeadDim == 512 || HeadDim == 576);
-    using T = Hs64Traits<HeadDim, /*GuardIndices=*/AllowExtra>;
+    using T = Hs64Traits<HeadDim, /*GuardIndices=*/AllowExtra, Arch>;
     static_assert(T::kBlockM == 64 && T::kBlockN == 64 && T::kHeadDim == HeadDim);
     static_assert(T::kUsePv2x4,
                   "HS64 instances use the shared PV 2x4 layout");
@@ -4596,10 +4846,10 @@ static void run_flash_sparse_decode_wg_kernel_hs64_hdim(
                params.page_block_size);
         printf("grid_n[%d, %d, %d]\n",
                int(grid.x), int(grid.y), int(grid.z));
-        printf("vreg:%d, stack:%d, sm:%d, occupancy:%0.3f, Arch:89\n",
+        printf("vreg:%d, stack:%d, sm:%d, occupancy:%0.3f, Arch:%d\n",
                int(attr.numRegs), int(attr.localSizeBytes), sm_count,
                float(grid.x * grid.y * grid.z) /
-                   float(sm_count * ctas_per_sm));
+                   float(sm_count * ctas_per_sm), Arch);
     }
 
     hggcLaunchAttribute kernel_attributes[1];
@@ -4620,7 +4870,8 @@ static void run_flash_sparse_decode_wg_kernel_hs64_hdim(
     ::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(params, stream);
 }
 
-void run_flash_sparse_decode_wg_kernel_hs64(
+template<int Arch>
+static void run_flash_sparse_decode_wg_kernel_hs64_arch(
     Flash_fwd_params &params,
     hggcStream_t stream)
 {
@@ -4635,24 +4886,34 @@ void run_flash_sparse_decode_wg_kernel_hs64(
         params.topk > 0 && params.topk % index_quantum == 0;
     if (params.d == 512) {
         if (use_full_tile_indices) {
-            run_flash_sparse_decode_wg_kernel_hs64_hdim<512, false>(
+            run_flash_sparse_decode_wg_kernel_hs64_hdim<512, false, Arch>(
                 params, stream);
         } else {
-            run_flash_sparse_decode_wg_kernel_hs64_hdim<512>(params, stream);
+            run_flash_sparse_decode_wg_kernel_hs64_hdim<512, true, Arch>(params, stream);
         }
     } else {
         FLASH_ASSERT(params.d == 576);
         if (use_full_tile_indices) {
-            run_flash_sparse_decode_wg_kernel_hs64_hdim<576, false>(params, stream);
+            run_flash_sparse_decode_wg_kernel_hs64_hdim<576, false, Arch>(params, stream);
         } else {
-            run_flash_sparse_decode_wg_kernel_hs64_hdim<576>(params, stream);
+            run_flash_sparse_decode_wg_kernel_hs64_hdim<576, true, Arch>(params, stream);
         }
     }
 }
 
-template<int HeadDim>
+void run_flash_sparse_decode_wg_kernel_hs64(
+    Flash_fwd_params &params, hggcStream_t stream) {
+    const auto [major, minor] = get_compute_capability(get_current_device());
+    if (major > 8 || (major == 8 && minor >= 9)) {
+        run_flash_sparse_decode_wg_kernel_hs64_arch<89>(params, stream);
+    } else {
+        run_flash_sparse_decode_wg_kernel_hs64_arch<80>(params, stream);
+    }
+}
+
+template<int HeadDim, int Arch>
 void run_flash_sparse_prefill_fwd_hs64(SparsePrefillParams &params) {
-    using T = Hs64PrefillTraits<HeadDim>;
+    using T = Hs64PrefillTraits<HeadDim, Arch>;
     auto kernel = &flash_sparse_prefill_fwd_hs64<T>;
     constexpr size_t smem_size =
         std::max(sizeof(typename T::SharedMemoryPlan),

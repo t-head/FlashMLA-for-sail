@@ -448,7 +448,7 @@ void run_flash_mla_combine_kernel(Flash_fwd_mla_params &params, hggcStream_t str
             constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
             auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, Traits<ElementT>::kHeadDimV, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
             CHECK_CUDA(hggcFuncSetAttribute(combine_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-            // Use hggcLaunchKernelExC to enable PDL (Programmatic Dependent Launch)
+            // Use hggcLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
             hggcLaunchAttribute attribute[1];
             attribute[0].id = hggcLaunchAttributeProgrammaticStreamSerialization;
             attribute[0].val.programmaticStreamSerializationAllowed = 1;
@@ -460,7 +460,7 @@ void run_flash_mla_combine_kernel(Flash_fwd_mla_params &params, hggcStream_t str
                 attribute,
                 1
             };
-            hggcLaunchKernelExC(&combine_kernel_config, (const void*)combine_kernel, (void**)&params);
+            hggcLaunchKernelEx(&combine_kernel_config, combine_kernel, params);
         }
     });
     CHECK_CUDA_KERNEL_LAUNCH();

@@ -48,6 +48,10 @@ get_mla_metadata(
     int block_size_n;
     if (is_sparse_attn) {
         block_size_n = 64;
+#ifdef FLASHMLA_C_ENABLE_DECODE_SPARSE
+        block_size_n = flashmla::dsa::sparse_decode_metadata_block_size_n(
+            num_tokens_per_head_k, is_fp8_kvcache);
+#endif
     } else {
         if (!is_sm89_or_newer()) {
             block_size_n = use_cross_cut(num_tokens_per_head_k, batch_size)

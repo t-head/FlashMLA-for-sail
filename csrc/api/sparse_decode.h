@@ -47,10 +47,10 @@ sparse_attn_decode_interface(
 
         int num_sm_parts = get_num_sm_parts(ngroups, num_heads_k, batch_size, /*is_sparse_attn=*/true);
 
-        // HS64 advances by 128 tokens.  FP8, PPU1.0 and the M128 WG kernel
+        // HS64 advances by 128 tokens. FP8 and the M128 WG kernel
         // preserve main's original 64-token scheduler quantum.
         int block_size_n = flashmla::dsa::sparse_decode_metadata_block_size_n(
-            ngroups, is_fp8, is_sm89_or_newer());
+            ngroups, is_fp8);
 
         static constexpr int fixed_overhead_num_blocks = 5;
         auto options = q.options().dtype(torch::kInt32);
