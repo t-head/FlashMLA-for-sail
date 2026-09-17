@@ -1116,7 +1116,14 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
         // HS64 handles an odd number of complete M64 head tiles per query.
         // Both paths require power-of-two page sizes; other cases fall back.
         const bool kCanWI = is_sm89_or_newer();
+        // Short split-KV partitions cannot amortize the M128 WI pipeline.
+        // The legacy M64 kernel uses the same 64-token metadata quantum.
+        const int64_t kv_tokens = int64_t(params.topk) + std::max(params.extra_topk, 0);
+        const int min_kv_per_part = params.seqlen_q > params.ngroups ? 512 : 256;
+        const bool m128_has_enough_work =
+            int64_t(params.b) * kv_tokens > int64_t(params.num_sm_parts) * min_kv_per_part;
         const bool wi_enable_m128 = kCanWI
+            && m128_has_enough_work
             && (params.ngroups > 0 && params.ngroups % 128 == 0)
             && (params.page_block_size > 0)
             && flashmla::dsa::sparse_decode_m128_index_tiles_supported(params);
