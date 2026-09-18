@@ -1,0 +1,206 @@
+name: "PPU Board Verification (t-head)"
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      test_scenario:
+        description: "测试场景"
+        required: true
+        type: choice
+        options:
+          - all
+          - 890p-only
+          - 810e-only
+          - single-card
+          - multi-card
+          - multi-node
+
+env:
+  IMAGE: "reg.docker.alibaba-inc.com/ai-tmp/llm:pytorch2.9.0-ubuntu24.04-cuda13.0-sglang0.5.10-py312-ppu202605281910"
+  NAMESPACE: "ppu-sched"
+
+jobs:
+  # ============================================================
+  # 890P 板卡 (ZW-M890P) — 单卡 / 多卡 / 多机
+  # ============================================================
+  single-card-890p:
+    if: >-
+      ${{
+        inputs.test_scenario == '' ||
+        inputs.test_scenario == 'all' ||
+        inputs.test_scenario == '890p-only' ||
+        inputs.test_scenario == 'single-card'
+      }}
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: "890P 单卡验证 (1 PPU)"
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=ZW-M890P"
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          timeout_minutes: 10
+          command: |
+            echo '=== 890P 单卡验证 ==='
+            echo "Hostname: $(hostname), Node: $NODE_NAME"
+            echo '--- ppu-smi ---'
+            ppu-smi
+            echo '--- source dir ---'
+            ls -la $SOURCE_DIR
+            echo '--- NAS mounts ---'
+            ls /nas_aisw
+            ls /mnt/wl_nas
+            echo '=== DONE ==='
+
+  multi-card-890p:
+    if: >-
+      ${{
+        inputs.test_scenario == '' ||
+        inputs.test_scenario == 'all' ||
+        inputs.test_scenario == '890p-only' ||
+        inputs.test_scenario == 'multi-card'
+      }}
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: "890P 多卡验证 (8 PPU)"
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          timeout_minutes: 10
+          command: |
+            echo '=== 890P 多卡验证 (8 PPU) ==='
+            echo "Hostname: $(hostname), Node: $NODE_NAME"
+            echo "RANK=$RANK WORLD_SIZE=$WORLD_SIZE NNODES=$NNODES NPROC_PER_NODE=$NPROC_PER_NODE MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+            echo '--- ppu-smi ---'
+            ppu-smi
+            echo '--- source dir ---'
+            ls -la $SOURCE_DIR
+            echo '--- NAS mounts ---'
+            ls /nas_aisw
+            ls /mnt/wl_nas
+            echo '=== DONE ==='
+
+  multi-node-890p:
+    if: >-
+      ${{
+        inputs.test_scenario == '' ||
+        inputs.test_scenario == 'all' ||
+        inputs.test_scenario == '890p-only' ||
+        inputs.test_scenario == 'multi-node'
+      }}
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: "890P 多机验证 (2 nodes × 8 PPU)"
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          nnodes: 2
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          timeout_minutes: 10
+          command: |
+            echo '=== 890P 多机验证 (2 nodes × 8 PPU) ==='
+            echo "Hostname: $(hostname), Node: $NODE_NAME"
+            echo "RANK=$RANK NODE_RANK=$NODE_RANK WORLD_SIZE=$WORLD_SIZE NNODES=$NNODES NPROC_PER_NODE=$NPROC_PER_NODE MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+            echo '--- ppu-smi ---'
+            ppu-smi
+            echo '--- source dir ---'
+            ls -la $SOURCE_DIR
+            echo '--- NAS mounts ---'
+            ls /nas_aisw
+            ls /mnt/wl_nas
+            echo '=== DONE ==='
+
+  # ============================================================
+  # 810E 板卡 (OAM-810E) — 单卡 / 多卡（仅 1 台，无多机）
+  # ============================================================
+  single-card-810e:
+    if: >-
+      ${{
+        inputs.test_scenario == '' ||
+        inputs.test_scenario == 'all' ||
+        inputs.test_scenario == '810e-only' ||
+        inputs.test_scenario == 'single-card'
+      }}
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: "810E 单卡验证 (1 PPU)"
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=OAM-810E"
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          timeout_minutes: 10
+          command: |
+            echo '=== 810E 单卡验证 ==='
+            echo "Hostname: $(hostname), Node: $NODE_NAME"
+            echo '--- ppu-smi ---'
+            ppu-smi
+            echo '--- source dir ---'
+            ls -la $SOURCE_DIR
+            echo '--- NAS mounts ---'
+            ls /nas_aisw
+            ls /mnt/wl_nas
+            echo '=== DONE ==='
+
+  multi-card-810e:
+    if: >-
+      ${{
+        inputs.test_scenario == '' ||
+        inputs.test_scenario == 'all' ||
+        inputs.test_scenario == '810e-only' ||
+        inputs.test_scenario == 'multi-card'
+      }}
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: "810E 多卡验证 (8 PPU)"
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=OAM-810E"
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          timeout_minutes: 10
+          command: |
+            echo '=== 810E 多卡验证 (8 PPU) ==='
+            echo "Hostname: $(hostname), Node: $NODE_NAME"
+            echo "RANK=$RANK WORLD_SIZE=$WORLD_SIZE NNODES=$NNODES NPROC_PER_NODE=$NPROC_PER_NODE MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+            echo '--- ppu-smi ---'
+            ppu-smi
+            echo '--- source dir ---'
+            ls -la $SOURCE_DIR
+            echo '--- NAS mounts ---'
+            ls /nas_aisw
+            ls /mnt/wl_nas
+            echo '=== DONE ==='
