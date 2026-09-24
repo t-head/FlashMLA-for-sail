@@ -682,7 +682,14 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
 // Prefill assigns one complete sparse query to each CTA, without split-KV.
 template<int HeadDimK, int Arch = 89>
 struct Hs64PrefillTraits : public Hs64Traits<HeadDimK, false, Arch> {
+    using Base = Hs64Traits<HeadDimK, false, Arch>;
     static constexpr bool kIsPrefill = true;
+#if ACOMPUTE_VERSION >= 10500
+    using SmemCopyOpK = std::conditional_t<Arch == 89,
+        SparsePairedTsmUnit16<typename Base::InputT, Base::kBlockN, true, false, 8>,
+        typename Base::SmemCopyOpK>;
+    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, typename Base::InputT>;
+#endif
 };
 
 }  // namespace flashmla::dsa::hs64
