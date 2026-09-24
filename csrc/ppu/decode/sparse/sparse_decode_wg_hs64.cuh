@@ -2449,7 +2449,8 @@ __forceinline__ __device__ void store_o(
 // M64 issues two physical copy waves of 32 tokens. XOR4 computes both waves'
 // pointers from one metadata pass.
 // Compile-time version: for mainloop (USE_EXTRA as template param)
-template<int S, bool USE_EXTRA, typename T, bool PREFETCH_K = false, typename TensorVI>
+template<int S, bool USE_EXTRA, typename T, bool PREFETCH_K = false,
+         bool PREFETCH_PREFILL_FIRST_TILE = false, typename TensorVI>
 __forceinline__ __device__ void compute_K_addr_bf16(
     const Flash_fwd_mla_params &params,
     int batch_idx,
@@ -2572,6 +2573,19 @@ __forceinline__ __device__ void compute_K_addr_bf16(
     token_ptr[1] = k_base_ptr
         + (is_valid[1] ? (static_cast<size_t>(atom1) + lane_atom)
                        : lane_atom) * T::kGmemElemsPerLoad;
+
+    if constexpr (PREFETCH_PREFILL_FIRST_TILE && T::kIsPrefill &&
+                  T::kArch == 89 && T::kHasExtraKTile) {
+        // Hint the next K0 copy addresses before WG0's reader barrier.
+        // The real async copy and its completion semantics are unchanged.
+        CUTLASS_PRAGMA_UNROLL
+        for (int pass = 0; pass < T::kGmemPasses; ++pass) {
+            if (is_valid[pass]) {
+                __ppu_prefetch_nonebulk_L2(
+                    reinterpret_cast<char*>(token_ptr[pass]));
+            }
+        }
+    }
 
     if constexpr (PREFETCH_K && !T::kIsPrefill) {
         // Keep the uniform 64-bit base plus vector 32-bit offset used by
@@ -3301,6 +3315,8 @@ __forceinline__ __device__ void wg0_subroutine(
     bool (&precomp_valid1)[T::kGmemPasses],
     float* smem_cross_n_reduction
 ) {
+    constexpr bool kEarlyNextK0Addr =
+        T::kIsPrefill && T::kArch == 89;
     int start_token_idx = block_idx * T::kBlockN;
     int nxt_block0 = block_idx+2;
     int nxt_block1 = block_idx+3;
@@ -3465,6 +3481,17 @@ __forceinline__ __device__ void wg0_subroutine(
             // remote PV just read. Drain all WG0 readers before any warp starts
             // the asynchronous overwrite. The same rendezvous publishes the
             // earlier K0-low copy to every WG0 QK reader, without a new barrier.
+            // For SM89 Prefill, the current K0 copy and softmax have
+            // finished using this address and validity slot. Preparing the
+            // next address here overlaps useful work with K completion.
+            if constexpr (kEarlyNextK0Addr && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+                int next_nxt_block0 = block_idx + 4;
+                compute_K_addr_bf16<0, NEXT_EXTRA, T, false, true>(
+                    params, batch_idx, next_nxt_block0, seqlen_k,
+                    idx_in_warpgroup, ori_block_max, smem_valid_indices,
+                    vi_softmax_wg0, pre_token_idx, extra_seqlen_k,
+                    precomp_ptr0, precomp_valid0);
+            }
             if constexpr (!IS_BLK1_LAST) {
                 __pipeline_wait_prior(0);
             }
@@ -3503,11 +3530,13 @@ __forceinline__ __device__ void wg0_subroutine(
     // After QK: precompute addr for NEXT iteration's K loads
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
 
-        int next_nxt_block0 = block_idx + 4;
-        compute_K_addr_bf16<0, NEXT_EXTRA, T>(
-            params, batch_idx, next_nxt_block0, seqlen_k,
-            idx_in_warpgroup, ori_block_max, smem_valid_indices, vi_softmax_wg0,
-            pre_token_idx, extra_seqlen_k, precomp_ptr0, precomp_valid0);
+        if constexpr (!kEarlyNextK0Addr) {
+            int next_nxt_block0 = block_idx + 4;
+            compute_K_addr_bf16<0, NEXT_EXTRA, T>(
+                params, batch_idx, next_nxt_block0, seqlen_k,
+                idx_in_warpgroup, ori_block_max, smem_valid_indices, vi_softmax_wg0,
+                pre_token_idx, extra_seqlen_k, precomp_ptr0, precomp_valid0);
+        }
         if constexpr (!T::kHasExtraKTile) {
             int next_nxt_block1 = block_idx + 5;
             int next_vi_preload_wg1 = vi_softmax_wg0 + 2;
