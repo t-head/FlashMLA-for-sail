@@ -633,7 +633,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     ThrMMA thr_mma = tiled_mma.get_slice(cute_idx);
 
     auto smem_tiled_copy_K = make_tiled_copy_B(
-        std::conditional_t<T::kArch == 80, typename T::SmemCopyAtomK,
+        std::conditional_t<T::kArch == 80 || T::kUsePairedCubes, typename T::SmemCopyAtomK,
             Copy_Atom<HS64_TSM_K_UNIT16, typename T::InputT>>{}, tiled_mma);
 
     // K/V slice keeps the full warp index (warp_base*32). M128's cute_warp_Q
@@ -669,8 +669,15 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
             (warp_idx_Q_prefetch % QkCopyIndex(T::kAtomLayoutM)) * QkCopyIndex(32);
         auto smem_thr_copy_Q_prefetch =
             smem_tiled_copy_Q.get_thread_slice(cute_warp_Q_prefetch);
-        Tensor sQ5_prefetch_src = smem_thr_copy_Q_prefetch.partition_S(
-            make_mix_tensor_like(sQ_tiled(_, _, Int<kPrefetchedQTile>{})));
+        Tensor sQ5_prefetch_src = [&]() {
+            if constexpr (T::kUsePairedCubes) {
+                return smem_thr_copy_Q_prefetch.partition_S(
+                    make_mix_tensor_like(sQ_tiled))(_, _, _, Int<kPrefetchedQTile>{});
+            } else {
+                return smem_thr_copy_Q_prefetch.partition_S(
+                    make_mix_tensor_like(sQ_tiled(_, _, Int<kPrefetchedQTile>{})));
+            }
+        }();
         Tensor rQ5_prefetch_copy =
             smem_thr_copy_Q_prefetch.retile_D(rQ5_prefetch);
         CUTE_STATIC_ASSERT_V(
@@ -902,7 +909,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_high4_tail(
     auto smem_thr_copy_Q =
         smem_tiled_copy_Q.get_thread_slice(cute_warp_Q);
     auto smem_tiled_copy_K =
-        make_tiled_copy_B(std::conditional_t<T::kArch == 80, typename T::SmemCopyAtomK,
+        make_tiled_copy_B(std::conditional_t<T::kArch == 80 || T::kUsePairedCubes, typename T::SmemCopyAtomK,
             Copy_Atom<HS64_TSM_K_UNIT16, typename T::InputT>>{}, tiled_mma);
     auto smem_thr_copy_K =
         smem_tiled_copy_K.get_thread_slice(cute_warp_kv);
@@ -930,8 +937,13 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_high4_tail(
             static_cast<QkCopyIndex>(idx_in_warpgroup) / QkCopyIndex(32));
         auto copy_q5 = smem_tiled_copy_Q.get_thread_slice(
             (warp_q5 % QkCopyIndex(T::kAtomLayoutM)) * QkCopyIndex(32));
-        Tensor src_q5 = copy_q5.partition_S(
-            make_mix_tensor_like(sQ_tiled(_, _, Int<5>{})));
+        Tensor src_q5 = [&]() {
+            if constexpr (T::kUsePairedCubes) {
+                return copy_q5.partition_S(make_mix_tensor_like(sQ_tiled))(_, _, _, Int<5>{});
+            } else {
+                return copy_q5.partition_S(make_mix_tensor_like(sQ_tiled(_, _, Int<5>{})));
+            }
+        }();
         Tensor dst_q5 = copy_q5.retile_D(rQ5_transient);
         cute::copy(smem_tiled_copy_Q, src_q5, dst_q5);
     }
@@ -1963,6 +1975,27 @@ __forceinline__ __device__ void retrieve_rP_from_sP(
 }
 
 
+// Preserve the cube coordinate while loading a cached Q fragment. A standalone
+// local_tile view loses its parity, which paired-cube descriptors need.
+template<typename T, int Tile, typename ER, typename LR, typename ES, typename LS>
+__forceinline__ __device__ void retrieve_q_tile(
+    Tensor<ER, LR> &rQ, Tensor<ES, LS> const &sQ, int idx_in_warpgroup) {
+    if constexpr (T::kUsePairedCubes) {
+        typename T::TiledMma mma;
+        const int warp = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
+        auto copy_op = make_tiled_copy_A(typename T::SmemCopyAtomQ{}, mma);
+        auto thread_copy = copy_op.get_thread_slice((warp % T::kAtomLayoutM) * 32);
+        auto tiles = flat_divide(sQ, Shape<Int<T::kBlockM>, _64>{})(_, _, _0{}, _);
+        auto src = thread_copy.partition_S(make_mix_tensor_like(tiles));
+        auto dst = thread_copy.retile_D(rQ);
+        cute::copy(copy_op, src(_, _, _, Int<Tile>{}), dst);
+    } else {
+        retrieve_rP_from_sP<T>(rQ,
+            local_tile(sQ, Shape<Int<T::kBlockM>, _64>{}, Coord<_0, Int<Tile>>{}),
+            idx_in_warpgroup);
+    }
+}
+
 struct Wg0ScaleFactors {
     float row0;
     float row1;
@@ -2359,7 +2392,22 @@ __forceinline__ __device__ void store_o(
         ThrCopy r2s_thr_copy = r2s_tiled_copy.get_slice(idx_in_warpgroup);
         Tensor r2s_thr_copy_rOb = r2s_thr_copy.retile_S(rOb);
         Tensor r2s_thr_copy_sMyOutputBuf = r2s_thr_copy.partition_D(sMyOutputBuf);
-        cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sMyOutputBuf);
+        if constexpr (T::kUsePairedCubes) {
+            // PV uses four N-warps: the N-repeat stride is 64 columns, so
+            // exchange the cube bit in j with the upper C-fragment bit in i.
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < size<2>(r2s_thr_copy_sMyOutputBuf); ++j) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < size<0>(r2s_thr_copy_sMyOutputBuf); ++i) {
+                    const int real_i = (i & 3) | ((j & 1) << 2);
+                    const int real_j = (j & ~1) | (i >> 2);
+                    cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb(real_i, _, real_j),
+                               r2s_thr_copy_sMyOutputBuf(i, _, j));
+                }
+            }
+        } else {
+            cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sMyOutputBuf);
+        }
 
         __syncthreads();
 
@@ -2576,7 +2624,44 @@ __forceinline__ __device__ void compute_K_addr_bf16_dynamic(
     }
 }
 
-template <int START, int END, int P,
+// All K-buffer bases are 8-KiB aligned. Separate the buffer/tile prefix from
+// lane bits so paired stores do not build a serial vector-address add chain.
+// D576's unpaired ninth tile keeps its original layout.
+template<int Tile, int P>
+__forceinline__ __device__ uint32_t hs64_pair_k_dst(uint32_t base, int tidx) {
+    const unsigned tid = static_cast<unsigned>(tidx) & 255u;
+    const uint32_t swizzled_col = ((tid ^ (tid >> 3)) & 7u) << 4;
+    if constexpr (Tile == 8) {
+        const uint32_t prefix = base + Tile * 0x2000u + P * 0x1000u;
+        return prefix | ((tid & 0xf8u) << 4) | swizzled_col;
+    } else {
+        const uint32_t prefix = base + (Tile & ~1) * 0x2000u + P * 0x2000u;
+        const uint32_t lane = ((tid & 0x80u) << 5) | ((tid & 0x78u) << 4) | swizzled_col;
+        return prefix | ((Tile & 1) * 0x800u) | lane;
+    }
+}
+
+template<int Tile, int P, typename T, typename Copy, typename EG, typename LG,
+         typename ES, typename LS>
+__forceinline__ __device__ void hs64_copy_k_tile(
+    Copy copy_op, Tensor<EG, LG> const &src, Tensor<ES, LS> &sKV,
+    uint32_t base, int tidx) {
+    if constexpr (T::kUsePairedCubes) {
+        auto words = recast<cute::uint128_t>(src);
+        CUTE_STATIC_ASSERT_V(size(words) == Int<1>{});
+        auto dst = __cvta_shared_to_generic(hs64_pair_k_dst<Tile, P>(base, tidx));
+        if constexpr (T::kHasExtraKTile) {
+            __ppu_pipeline_memcpy_async_zfill(dst, &words[0], 16, copy_op.pred ? 0 : 16, 1);
+        } else {
+            PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
+                words[0], *static_cast<cute::uint128_t*>(dst), copy_op.pred);
+        }
+    } else {
+        cute::copy(copy_op, src, sKV(_, Int<P>{}, Int<Tile>{}));
+    }
+}
+
+template <int START, int END, int P, typename T,
           typename TiledCopy,
           typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
@@ -2584,7 +2669,7 @@ __forceinline__ __device__ void hs64_copy_k_tiles_pass_lookahead_impl(
     TiledCopy tiled_copy,
     Tensor<Engine0, Layout0> const &gKV,
     Tensor<Engine1, Layout1> &sKV,
-    decltype(gKV(_, _0{}, Int<START>{})) g_cur)
+    decltype(gKV(_, _0{}, Int<START>{})) g_cur, uint32_t base, int tidx)
 {
     if constexpr (START + 1 < END) {
         auto g_next = gKV(_, _0{}, Int<START + 1>{});
@@ -2598,26 +2683,26 @@ __forceinline__ __device__ void hs64_copy_k_tiles_pass_lookahead_impl(
         // Split operands avoid an extra consecutive 64-bit register pair. Copy
         // order stays sequential within each pass, preserving 128 B requests.
         asm volatile("" :: "r"(g_next_lo), "r"(g_next_hi));
-        cute::copy(tiled_copy, g_cur, sKV(_, Int<P>{}, Int<START>{}));
-        hs64_copy_k_tiles_pass_lookahead_impl<START + 1, END, P>(
-            tiled_copy, gKV, sKV, g_next);
+        hs64_copy_k_tile<START, P, T>(tiled_copy, g_cur, sKV, base, tidx);
+        hs64_copy_k_tiles_pass_lookahead_impl<START + 1, END, P, T>(
+            tiled_copy, gKV, sKV, g_next, base, tidx);
     } else {
-        cute::copy(tiled_copy, g_cur, sKV(_, Int<P>{}, Int<START>{}));
+        hs64_copy_k_tile<START, P, T>(tiled_copy, g_cur, sKV, base, tidx);
     }
 }
 
-template <int START, int END, int P,
+template <int START, int END, int P, typename T,
           typename TiledCopy,
           typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
 __forceinline__ __device__ void hs64_copy_k_tiles_pass(
     TiledCopy tiled_copy,
     Tensor<Engine0, Layout0> const &gKV,
-    Tensor<Engine1, Layout1> &sKV)
+    Tensor<Engine1, Layout1> &sKV, uint32_t base, int tidx)
 {
     auto g_cur = gKV(_, _0{}, Int<START>{});
-    hs64_copy_k_tiles_pass_lookahead_impl<START, END, P>(
-        tiled_copy, gKV, sKV, g_cur);
+    hs64_copy_k_tiles_pass_lookahead_impl<START, END, P, T>(
+        tiled_copy, gKV, sKV, g_cur, base, tidx);
 }
 
 
@@ -2640,15 +2725,18 @@ __forceinline__ __device__ void hs64_copy_even_full_or_pass(
         unsigned int hi = static_cast<unsigned int>(addr >> 32);
         asm volatile("" :: "r"(lo), "r"(hi));
         if constexpr (TILE < 4) {
-            cute::copy(tiled_copy, g_cur, sLow(_, Int<P>{}, Int<TILE>{}));
+            hs64_copy_k_tile<TILE, P, T>(tiled_copy, g_cur, sLow,
+                                        offsetof(Plan, smem_sK), tidx);
         } else {
             auto src = recast<cute::uint128_t>(g_cur);
             CUTE_STATIC_ASSERT_V(size(src) == Int<1>{});
             const uint32_t tid = static_cast<uint32_t>(hs64_store_thread<T>(tidx)) & 255u;
             const uint32_t lane_offset = typename T::SmemLayoutKHigh4Store{}(
                 tid / 8 + (T::kArch == 80 ? P * 32 : 0), (tid % 8) * 8) * sizeof(typename T::InputT);
-            const uint32_t dst = lane_offset | 0x18000u | (T::kArch == 80 ? 0u : P * 0x1000u) |
-                                 ((TILE - 4) * 0x2000u) | high_bank_mask;
+            const uint32_t dst = T::kUsePairedCubes
+                ? hs64_pair_k_dst<TILE - 4, P>(0x18000u | high_bank_mask, tidx)
+                : lane_offset | 0x18000u | (T::kArch == 80 ? 0u : P * 0x1000u) |
+                    ((TILE - 4) * 0x2000u) | high_bank_mask;
             PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
                 src[0], *static_cast<cute::uint128_t*>(__cvta_shared_to_generic(dst)),
                 tiled_copy.pred);
@@ -2661,8 +2749,10 @@ __forceinline__ __device__ void hs64_copy_even_full_or_pass(
         const uint32_t tid = static_cast<uint32_t>(hs64_store_thread<T>(tidx)) & 255u;
         const uint32_t lane_offset = typename T::SmemLayoutKHigh4Store{}(
             tid / 8 + (T::kArch == 80 ? P * 32 : 0), (tid % 8) * 8) * sizeof(typename T::InputT);
-        const uint32_t dst = lane_offset | 0x18000u | (T::kArch == 80 ? 0u : P * 0x1000u) |
-                             ((TILE - 4) * 0x2000u) | high_bank_mask;
+        const uint32_t dst = T::kUsePairedCubes
+            ? hs64_pair_k_dst<TILE - 4, P>(0x18000u | high_bank_mask, tidx)
+            : lane_offset | 0x18000u | (T::kArch == 80 ? 0u : P * 0x1000u) |
+                ((TILE - 4) * 0x2000u) | high_bank_mask;
         PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
             src[0], *static_cast<cute::uint128_t*>(__cvta_shared_to_generic(dst)),
             tiled_copy.pred);
@@ -2673,7 +2763,13 @@ __forceinline__ __device__ void hs64_copy_even_full_or_pass(
 template<int TILE, int P, typename T, typename EL, typename LL>
 __forceinline__ __device__ uint32_t hs64_even_bundle_dst(
     Tensor<EL, LL> &sLow, uint32_t high_base, int tidx) {
-    if constexpr (TILE < 4 || TILE == 8) {
+    if constexpr (T::kUsePairedCubes) {
+        if constexpr (TILE < 4 || TILE == 8) {
+            return hs64_pair_k_dst<TILE, P>(offsetof(typename T::SharedMemoryPlan, smem_sK), tidx);
+        } else {
+            return hs64_pair_k_dst<TILE - 4, P>(high_base, tidx);
+        }
+    } else if constexpr (TILE < 4 || TILE == 8) {
         // Only the merged even loader uses this helper: low/tail always
         // target buf0. Encode its cube prefix independently of the lane.
         using Plan = typename T::SharedMemoryPlan;
@@ -2741,10 +2837,11 @@ __forceinline__ __device__ void hs64_copy_even_full_prefix_pass(
 }
 
 // Bundle the four local high-K copy operands (tiles 4..7).
-template<int P, typename TiledCopy, typename EG, typename LG,
+template<int P, typename T, typename TiledCopy, typename EG, typename LG,
          typename ES, typename LS>
 __forceinline__ __device__ void hs64_copy_high_bundle_pass(
-    TiledCopy tiled_copy, Tensor<EG, LG> const &gKV, Tensor<ES, LS> &sKV)
+    TiledCopy tiled_copy, Tensor<EG, LG> const &gKV, Tensor<ES, LS> &sKV,
+    uint32_t base, int tidx)
 {
     auto src0 = recast<cute::uint128_t>(gKV(_, _0{}, Int<4>{}));
     auto src1 = recast<cute::uint128_t>(gKV(_, _0{}, Int<5>{}));
@@ -2768,10 +2865,21 @@ __forceinline__ __device__ void hs64_copy_high_bundle_pass(
     asm volatile("" :: "r"(static_cast<unsigned>(next_addr)),
                        "r"(static_cast<unsigned>(next_addr >> 32)));
     const int zfill = tiled_copy.pred ? 0 : 16;
-    __ppu_pipeline_memcpy_async_zfill(&dst0[0], &src0[0], 16, zfill, 1);
-    __ppu_pipeline_memcpy_async_zfill(&dst1[0], &src1[0], 16, zfill, 1);
-    __ppu_pipeline_memcpy_async_zfill(&dst2[0], &src2[0], 16, zfill, 1);
-    __ppu_pipeline_memcpy_async_zfill(&dst3[0], &src3[0], 16, zfill, 1);
+    if constexpr (T::kUsePairedCubes) {
+        auto d0 = __cvta_shared_to_generic(hs64_pair_k_dst<4, P>(base, tidx));
+        auto d1 = __cvta_shared_to_generic(hs64_pair_k_dst<5, P>(base, tidx));
+        auto d2 = __cvta_shared_to_generic(hs64_pair_k_dst<6, P>(base, tidx));
+        auto d3 = __cvta_shared_to_generic(hs64_pair_k_dst<7, P>(base, tidx));
+        __ppu_pipeline_memcpy_async_zfill(d0, &src0[0], 16, zfill, 1);
+        __ppu_pipeline_memcpy_async_zfill(d1, &src1[0], 16, zfill, 1);
+        __ppu_pipeline_memcpy_async_zfill(d2, &src2[0], 16, zfill, 1);
+        __ppu_pipeline_memcpy_async_zfill(d3, &src3[0], 16, zfill, 1);
+    } else {
+        __ppu_pipeline_memcpy_async_zfill(&dst0[0], &src0[0], 16, zfill, 1);
+        __ppu_pipeline_memcpy_async_zfill(&dst1[0], &src1[0], 16, zfill, 1);
+        __ppu_pipeline_memcpy_async_zfill(&dst2[0], &src2[0], 16, zfill, 1);
+        __ppu_pipeline_memcpy_async_zfill(&dst3[0], &src3[0], 16, zfill, 1);
+    }
     cute::copy(tiled_copy, g_next, sKV(_, Int<P>{}, Int<8>{}));
 }
 
@@ -2835,6 +2943,7 @@ __forceinline__ __device__ void issue_K_load_bf16(
             return gmem_thr_copy_K.partition_D(sK_buf);
         }
     }();
+    const uint32_t store_base = cast_smem_ptr_to_uint(cute::raw_pointer_cast(sK_buf.data()));
     Tensor gK_tok = make_tensor(make_gmem_ptr(k_base_ptr),
         Shape<Int<T::kGmemTokPerPass>, Int<T::kHeadDim>>{},
         make_stride(params.k_row_stride, _1{}));
@@ -2860,12 +2969,12 @@ __forceinline__ __device__ void issue_K_load_bf16(
         }
     } else {
         if constexpr (T::kHasExtraKTile && LOCAL_COPY_GROUP && S == 4 && E == 9) {
-            hs64_copy_high_bundle_pass<0>(cp0, tKgK0, tKsK);
+            hs64_copy_high_bundle_pass<0, T>(cp0, tKgK0, tKsK, store_base, tidx);
         } else {
-            hs64_copy_k_tiles_pass<S, E, 0>(cp0, tKgK0, tKsK);
+            hs64_copy_k_tiles_pass<S, E, 0, T>(cp0, tKgK0, tKsK, store_base, tidx);
         }
         if constexpr (T::kHasExtraKTile && LOCAL_COPY_GROUP && S == 0 && !ODD_LOW_ONLY) {
-            hs64_copy_k_tiles_pass<8, 9, 0>(cp0, tKgK0, tKsK);
+            hs64_copy_k_tiles_pass<8, 9, 0, T>(cp0, tKgK0, tKsK, store_base, tidx);
         }
     }
     if constexpr (T::kGmemPasses > 1) {
@@ -2889,12 +2998,12 @@ __forceinline__ __device__ void issue_K_load_bf16(
             }
         } else {
             if constexpr (T::kHasExtraKTile && LOCAL_COPY_GROUP && S == 4 && E == 9) {
-                hs64_copy_high_bundle_pass<1>(cp1, tKgK1, tKsK);
+                hs64_copy_high_bundle_pass<1, T>(cp1, tKgK1, tKsK, store_base, tidx);
             } else {
-                hs64_copy_k_tiles_pass<S, E, 1>(cp1, tKgK1, tKsK);
+                hs64_copy_k_tiles_pass<S, E, 1, T>(cp1, tKgK1, tKsK, store_base, tidx);
             }
             if constexpr (T::kHasExtraKTile && LOCAL_COPY_GROUP && S == 0 && !ODD_LOW_ONLY) {
-                hs64_copy_k_tiles_pass<8, 9, 1>(cp1, tKgK1, tKsK);
+                hs64_copy_k_tiles_pass<8, 9, 1, T>(cp1, tKgK1, tKsK, store_base, tidx);
             }
         }
     }
@@ -3075,7 +3184,20 @@ __forceinline__ __device__ void launch_q_copy(
     }
     Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
 
-    if (warp_idx == 0) {
+    if constexpr (T::kUsePairedCubes) {
+        if (warp_idx < T::kBlockM / T::kQRowsPerLoad) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int tile = 0; tile < T::kNumKTiles; ++tile) {
+                auto dst = tQsQ(_, warp_idx, tile);
+                if (tile < 8) {
+                    dst.data() = tQsQ.data() + (tile & ~1) * T::kBlockM * 64
+                        + ((warp_idx << 1) + (tile & 1)) * T::kQRowsPerLoad * 64;
+                }
+                cute::copy(gmem_tiled_copy_Q, tQgQ(_, warp_idx, tile), dst);
+            }
+            cutlass::arch::cpasync_barrier_arrive_noinc(barrier_Q);
+        }
+    } else if (warp_idx == 0) {
         cute::copy(gmem_tiled_copy_Q, tQgQ, tQsQ);
         cutlass::arch::cpasync_barrier_arrive_noinc(barrier_Q);
     }
@@ -3818,7 +3940,7 @@ __forceinline__ __device__ void hs64_attention(
     static_assert(T::SharedMemoryPlan::kNumKBarriers == 2,
                   "HS64 expects exactly 2 K sub-stage barriers");
     if (threadIdx.x == 0) {
-        __mbarrier_init(barrier_Q, 32);
+        __mbarrier_init(barrier_Q, T::kQBarrierThreads);
         CUTLASS_PRAGMA_UNROLL
         // Initialize two sub-stage barriers per block:
         //   barriers_Kx[0] → tiles 0-3 (dims 0-255) readiness
@@ -4125,10 +4247,7 @@ __forceinline__ __device__ void hs64_attention(
         Tensor rQ8 = make_rQ8();
         // Load once per batch and reuse it across every QK in both warpgroups.
         if constexpr (T::kCacheLastQTile) {
-            retrieve_rP_from_sP<T>(rQ8,
-                local_tile(sQ, Shape<Int<T::kBlockM>, _64>{},
-                           Coord<_0, Int<T::kCachedQTile>>{}),
-                idx_in_warpgroup);
+            retrieve_q_tile<T, T::kCachedQTile>(rQ8, sQ, idx_in_warpgroup);
         } else {
             cute::clear(rQ8);
         }
@@ -4139,10 +4258,7 @@ __forceinline__ __device__ void hs64_attention(
             local_tile(sQ, Shape<Int<T::kBlockM>, _64>{},
                        Coord<_0, Int<T::kCachedPrevQTile>>{}));
         if constexpr (T::kCachePrevQTile) {
-            retrieve_rP_from_sP<T>(rQ6,
-                local_tile(sQ, Shape<Int<T::kBlockM>, _64>{},
-                           Coord<_0, Int<T::kCachedPrevQTile>>{}),
-                idx_in_warpgroup);
+            retrieve_q_tile<T, T::kCachedPrevQTile>(rQ6, sQ, idx_in_warpgroup);
         }
 
         // Tile4 is the first high-half Q tile consumed after its K wait.
@@ -4150,10 +4266,7 @@ __forceinline__ __device__ void hs64_attention(
             local_tile(sQ, Shape<Int<T::kBlockM>, _64>{},
                        Coord<_0, Int<T::kCachedFirstHighQTile>>{}));
         if constexpr (T::kCacheFirstHighQTile) {
-            retrieve_rP_from_sP<T>(rQ4,
-                local_tile(sQ, Shape<Int<T::kBlockM>, _64>{},
-                           Coord<_0, Int<T::kCachedFirstHighQTile>>{}),
-                idx_in_warpgroup);
+            retrieve_q_tile<T, T::kCachedFirstHighQTile>(rQ4, sQ, idx_in_warpgroup);
         }
 
         // D576 preserves all Q operands whose raw cubes become the alternate
@@ -4166,16 +4279,8 @@ __forceinline__ __device__ void hs64_attention(
             local_tile(sQ, Shape<Int<T::kBlockM>, _64>{},
                        Coord<_0, Int<6>>{}));
         if constexpr (T::kCacheD576MiddleQTiles) {
-            retrieve_rP_from_sP<T>(
-                rQ5,
-                local_tile(sQ, Shape<Int<T::kBlockM>, _64>{},
-                           Coord<_0, Int<5>>{}),
-                idx_in_warpgroup);
-            retrieve_rP_from_sP<T>(
-                rQmid6,
-                local_tile(sQ, Shape<Int<T::kBlockM>, _64>{},
-                           Coord<_0, Int<6>>{}),
-                idx_in_warpgroup);
+            retrieve_q_tile<T, 5>(rQ5, sQ, idx_in_warpgroup);
+            retrieve_q_tile<T, 6>(rQmid6, sQ, idx_in_warpgroup);
         }
 
         // SM80 reuses Q0 across KV blocks rather than issuing four TSM loads
@@ -4722,7 +4827,7 @@ __forceinline__ __device__ void hs64_attention(
             if (batch_idx + 1 <= end_idx) {
                 // Keep mbarrier reinit for split path (store_o<T,false> uses sO_addr)
                 if (threadIdx.x == 0) {
-                    __mbarrier_init(barrier_Q, 32);
+                    __mbarrier_init(barrier_Q, T::kQBarrierThreads);
                     CUTLASS_PRAGMA_UNROLL
                     for (int i = 0; i < 2; ++i) {
                         __mbarrier_init(&barriers_K0[i], 256);

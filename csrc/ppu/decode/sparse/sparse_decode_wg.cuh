@@ -54,6 +54,27 @@ using fp8_e8m0 = __hg_fp8_e8m0;
 // ---------------------------------------------------------------------------
 namespace flash {
 
+// Match dense MLA's paired 16x64 K cubes while retaining sparse gather/zfill.
+template<int START, int END, typename T, typename TiledCopy,
+         typename EG, typename LG, typename ES, typename LS>
+__forceinline__ __device__ void launch_kv_pair_copy(
+    TiledCopy tiled_copy, Tensor<EG, LG> const &gKV,
+    Tensor<ES, LS> &sK, int tidx) {
+    auto src = recast<cute::uint128_t>(gKV(_, _, Int<START>{}));
+    CUTE_STATIC_ASSERT_V(size(src) == Int<1>{});
+    const int row = tidx / 8;
+    const int col = ((tidx % 8) ^ (row % 8)) * 8;
+    const int offset = START == 8
+        ? START * T::kBlockN * 64 + row * 64 + col
+        : (START & ~1) * T::kBlockN * 64 + (row / 16) * 2048
+            + (START & 1) * 1024 + (row % 16) * 64 + col;
+    auto *dst = reinterpret_cast<cute::uint128_t*>(sK.data().get() + offset);
+    PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(src[0], *dst, tiled_copy.pred);
+    if constexpr (START + 1 < END) {
+        launch_kv_pair_copy<START + 1, END, T>(tiled_copy, gKV, sK, tidx);
+    }
+}
+
 template <
     int START_HEAD_DIM_TILE_IDX,
     int END_HEAD_DIM_TILE_IDX,
@@ -98,6 +119,35 @@ __forceinline__ __device__ void launch_kv_tiles_wg(
 // so we must guarantee that MAX_INIT_VAL*scale_softmax_log2 < MAX_INIT_VAL_SM
 static constexpr float MAX_INIT_VAL_SM = -1e30f;
 static constexpr float MAX_INIT_VAL = -1e33f;
+
+template<typename Layout>
+__forceinline__ __device__ auto pv_rowcol_layout(Layout acc_layout) {
+    auto atom_div = logical_divide(acc_layout, Shape<_4>{});
+    auto row_div = logical_divide(atom_div, Shape<Shape<_2>>{});
+    return make_layout(
+        make_layout(get<0, 0, 1>(row_div), get<1>(row_div)),
+        make_layout(get<0, 0, 0>(row_div),
+                    make_layout(get<0, 1>(row_div), get<2>(row_div))));
+}
+
+template<typename T>
+__forceinline__ __device__ int pv_row_idx(int mi, int tid) {
+    return ((tid / 32) % T::kPvAtomLayoutM) * 16 + (tid % 32) / 4
+           + (mi & 1) * 8 + (mi / 2) * (16 * T::kPvAtomLayoutM);
+}
+
+template<typename T, typename ER, typename LR, typename ES, typename LS>
+__forceinline__ __device__ void pv_scale_one(
+    Tensor<ER, LR> &rO, Tensor<ES, LS> const &scale, int tid) {
+    auto rc = make_tensor(rO.data(), pv_rowcol_layout(rO.layout()));
+    CUTE_STATIC_ASSERT_V(size<0>(rc) == _4{});
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < 4; ++mi) {
+        float factor = scale(pv_row_idx<T>(mi, tid));
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(rc); ++ni) rc(mi, ni) *= factor;
+    }
+}
 
 template <int AtomLayoutM = 8>
 __forceinline__ __device__ int get_AorC_row_idx(int local_row_idx, int idx_in_warpgroup)
@@ -245,6 +295,7 @@ __forceinline__ __device__ void kernel_sleep_ns()
 // Wait for one KV-tile to be ready, and then calculate P += Q K^T for one Q-tile (BLOCK_SIZE_Mx64) and one KV-tile (PAGE_BLOCK_SIZEx64)
 // The Q-tile should be in shared memory
 template <
+    bool InterleaveLoads,
     typename TiledMMA,
     typename TiledCopyA,
     typename TiledCopyB,
@@ -278,6 +329,26 @@ __forceinline__ __device__ void qkt_gemm_one_tile_sQ(
     Tensor rK_copy_view = smem_thr_copy_K.retile_D(rK);
     CUTE_STATIC_ASSERT_V(size<1>(thr_mma_sKV_tile) == size<1>(rK_copy_view)); // M
 
+#if ACOMPUTE_VERSION >= 10500
+    if constexpr (InterleaveLoads) {
+        // Keep independent slice slots while overlapping Q/K supply and MMA.
+        CUTE_STATIC_ASSERT_V(size<2>(rQ_copy_view) == _4{});
+        CUTE_STATIC_ASSERT_V(size<2>(rK_copy_view) == _4{});
+        auto load_slice = [&](auto k) {
+            cute::copy(smem_tiled_copy_Q, thr_mma_sQ_tile(_, _, k), rQ_copy_view(_, _, k));
+            cute::copy(smem_tiled_copy_K, thr_mma_sKV_tile(_, _, k), rK_copy_view(_, _, k));
+        };
+        load_slice(_0{});
+        load_slice(_1{});
+        cute::gemm(tiled_mma, rQ_copy_view(_, _, _0{}), rK_copy_view(_, _, _0{}), rP);
+        load_slice(_2{});
+        cute::gemm(tiled_mma, rQ_copy_view(_, _, _1{}), rK_copy_view(_, _, _1{}), rP);
+        load_slice(_3{});
+        cute::gemm(tiled_mma, rQ_copy_view(_, _, _2{}), rK_copy_view(_, _, _2{}), rP);
+        cute::gemm(tiled_mma, rQ_copy_view(_, _, _3{}), rK_copy_view(_, _, _3{}), rP);
+        return;
+    }
+#endif
     cute::copy(smem_tiled_copy_Q, thr_mma_sQ_tile, rQ_copy_view);
 
     cute::copy(smem_tiled_copy_K, thr_mma_sKV_tile, rK_copy_view);
@@ -286,6 +357,38 @@ __forceinline__ __device__ void qkt_gemm_one_tile_sQ(
     cute::gemm(tiled_mma, rQ_copy_view(_, _, _1{}), rK_copy_view(_, _, _1{}), rP);
     cute::gemm(tiled_mma, rQ_copy_view(_, _, _2{}), rK_copy_view(_, _, _2{}), rP);
     cute::gemm(tiled_mma, rQ_copy_view(_, _, _3{}), rK_copy_view(_, _, _3{}), rP);
+}
+
+// Stream a ready four-tile QK interval through four independent slice slots.
+template <int FirstTile, typename T, typename TiledMMA,
+          typename CopyQ, typename CopyK, typename ThrQ, typename ThrK,
+          typename SQ, typename SK, typename SourceQ, typename SourceK, typename RP>
+__forceinline__ __device__ void qkt_gemm_four_tiles_sQ(
+    TiledMMA &mma, CopyQ &copy_q, CopyK &copy_k, ThrQ &thr_q, ThrK &thr_k,
+    SQ const &sQ, SK const &sK, SourceQ const &src_q, SourceK const &src_k,
+    RP &rP, int cute_idx)
+{
+    auto thr_mma = mma.get_slice(cute_idx);
+    Tensor rQ = thr_mma.partition_fragment_A(sQ(_, _, Int<FirstTile>{}));
+    Tensor rK = thr_mma.partition_fragment_B(sK(_, _, Int<FirstTile>{}));
+    Tensor cq = thr_q.retile_D(rQ);
+    Tensor ck = thr_k.retile_D(rK);
+    CUTE_STATIC_ASSERT_V(size<2>(cq) == _4{});
+    CUTE_STATIC_ASSERT_V(size<2>(ck) == _4{});
+    auto load = [&](auto k) {
+        constexpr int slice = decltype(k)::value % 4;
+        constexpr int tile = FirstTile + decltype(k)::value / 4;
+        cute::copy(copy_q, src_q(_, _, Int<slice>{}, Int<tile>{}), cq(_, _, Int<slice>{}));
+        cute::copy(copy_k, src_k(_, _, Int<slice>{}, Int<tile>{}), ck(_, _, Int<slice>{}));
+    };
+    for_each(make_int_sequence<4>{}, load);
+    for_each(make_int_sequence<16>{}, [&](auto k) {
+        constexpr int slice = decltype(k)::value % 4;
+        cute::gemm(mma, cq(_, _, Int<slice>{}), ck(_, _, Int<slice>{}), rP);
+        if constexpr (decltype(k)::value + 4 < 16) {
+            load(Int<decltype(k)::value + 4>{});
+        }
+    });
 }
 
 template <
@@ -369,18 +472,37 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
                     rQ8, sKV1_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV1_tiled(_, _, _, Int<TILE_IDX>{}), \
                     rP, cute_idx); \
         } else if constexpr(TILE_IDX < 4) { \
-            qkt_gemm_one_tile_sQ(tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, \
+            qkt_gemm_one_tile_sQ<T::CvtGemmSwzlLd>(tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, \
                     smem_thr_copy_Q, smem_thr_copy_K, \
                     sQ_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sQ_tiled(_, _, _, Int<TILE_IDX>{}), \
                     sKV0_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV0_tiled(_, _, _, Int<TILE_IDX>{}), \
                     rP, cute_idx); \
         } else  { \
-            qkt_gemm_one_tile_sQ(tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, \
+            qkt_gemm_one_tile_sQ<T::CvtGemmSwzlLd>(tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, \
                     smem_thr_copy_Q, smem_thr_copy_K, \
                     sQ_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sQ_tiled(_, _, _, Int<TILE_IDX>{}), \
                     sKV1_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV1_tiled(_, _, _, Int<TILE_IDX>{}), \
                     rP, cute_idx); \
         }
+
+    auto gemm_four_tiles = [&](auto first) {
+        constexpr int start = decltype(first)::value;
+#if ACOMPUTE_VERSION >= 10500
+        if constexpr (T::CvtGemmSwzlLd && T::kHeadDim == 576) {
+            auto &sK = start == 0 ? sKV0_tiled : sKV1_tiled;
+            auto &src_k = start == 0 ? thr_mma_sKV0_tiled : thr_mma_sKV1_tiled;
+            qkt_gemm_four_tiles_sQ<start, T>(tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K, sQ_tiled, sK, thr_mma_sQ_tiled, src_k,
+                rP, cute_idx);
+        } else
+#endif
+        {
+            QKT_GEMM_ONE_TILE(start);
+            QKT_GEMM_ONE_TILE(start + 1);
+            QKT_GEMM_ONE_TILE(start + 2);
+            QKT_GEMM_ONE_TILE(start + 3);
+        }
+    };
 
     if constexpr (PHASE_IDX == 0) {
         // In PHASE-0, warpgroup 0 calculates Q K^T for the first 4 tiles
@@ -388,29 +510,20 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
             kernel_sleep_ns();
         };
 
-        QKT_GEMM_ONE_TILE(0);
-        QKT_GEMM_ONE_TILE(1);
-        QKT_GEMM_ONE_TILE(2);
-        QKT_GEMM_ONE_TILE(3);
+        gemm_four_tiles(_0{});
     } else if constexpr (PHASE_IDX == 1) {
         // In PHASE-1, warpgroup 1 calculates Q K^T for all the 9 tiles
         while (!cutlass::arch::test_wait(&barriers[1], cur_phase, 1)) {
             kernel_sleep_ns();
         };
 
-        QKT_GEMM_ONE_TILE(4);
-        QKT_GEMM_ONE_TILE(5);
-        QKT_GEMM_ONE_TILE(6);
-        QKT_GEMM_ONE_TILE(7);
+        gemm_four_tiles(_4{});
         if constexpr (T::kHasExtraRopeTile) { QKT_GEMM_ONE_TILE(8); }
 
         while (!cutlass::arch::test_wait(&barriers[0], cur_phase, 1)) {
             kernel_sleep_ns();
         };
-        QKT_GEMM_ONE_TILE(0);
-        QKT_GEMM_ONE_TILE(1);
-        QKT_GEMM_ONE_TILE(2);
-        QKT_GEMM_ONE_TILE(3);
+        gemm_four_tiles(_0{});
         cur_phase = (cur_phase + 1) & 1;
     } else {
         // In PHASE-2, warpgroup 0 calculates Q K^T for the last 5 tiles
@@ -420,10 +533,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
             kernel_sleep_ns();
         };
 
-        QKT_GEMM_ONE_TILE(4);
-        QKT_GEMM_ONE_TILE(5);
-        QKT_GEMM_ONE_TILE(6);
-        QKT_GEMM_ONE_TILE(7);
+        gemm_four_tiles(_4{});
         if constexpr (T::kHasExtraRopeTile) { QKT_GEMM_ONE_TILE(8); }
         cur_phase = (cur_phase + 1) & 1;
     }
@@ -500,15 +610,24 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
     int idx_in_warpgroup,
     int warp_idx)
 {
-    typename T::TiledMma tiled_mma;
+    typename T::TiledMmaPV tiled_mma;
     const int cute_idx = idx_in_warpgroup % T::kMmaThreads;
     const int cute_warp = (warp_idx % T::kAtomLayoutM) * 32;
-    auto smem_tiled_copy_P = make_tiled_copy_A(typename T::SmemCopyAtomP{}, tiled_mma);
-    auto smem_thr_copy_P = smem_tiled_copy_P.get_thread_slice(cute_idx);
+    auto smem_tiled_copy_P = make_tiled_copy_A(typename T::SmemCopyAtomPV{}, tiled_mma);
+    const int p_copy_idx = T::kUsePv4x2
+        ? (__builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32) % T::kPvAtomLayoutM) * 32
+        : cute_idx;
+    auto smem_thr_copy_P = smem_tiled_copy_P.get_thread_slice(p_copy_idx);
     auto smem_tiled_copy_Vt = make_tiled_copy_B(typename T::SmemCopyAtomVt{}, tiled_mma);
     auto smem_thr_copy_Vt = smem_tiled_copy_Vt.get_thread_slice(cute_warp);
 
-    auto tSsP = smem_thr_copy_P.partition_S(sP);
+    auto tSsP = [&]() {
+        if constexpr (T::kUsePv4x2) {
+            return smem_thr_copy_P.partition_S(make_mix_tensor_like(sP));
+        } else {
+            return smem_thr_copy_P.partition_S(sP);
+        }
+    }();
     auto tSsVt = smem_thr_copy_Vt.partition_S(make_mix_tensor_like(sKV_half));
 
     ThrMMA thr_mma = tiled_mma.get_slice(cute_idx);
@@ -1025,7 +1144,12 @@ __forceinline__ __device__ void retrieve_rP_from_sP(
     const int cute_warp = (warp_idx % T::kAtomLayoutM) * 32;
 
     auto thr_mma = tiled_mma.get_thread_slice(cute_idx);
-    auto smem_tiled_copy_Q = make_tiled_copy_A(typename T::SmemCopyAtomQ{}, tiled_mma);
+    // This helper receives Q tile 8 as a standalone view. It is unpaired,
+    // so retain the original descriptor instead of treating its local tile 0
+    // coordinate as the first half of a paired cube.
+    using Q8CopyAtom = Copy_Atom<PPU_TSM_LD_SWZL<typename T::InputT,
+        T::kBlockM, T::kBlockKSmem, false, false, 1>, typename T::InputT>;
+    auto smem_tiled_copy_Q = make_tiled_copy_A(Q8CopyAtom{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(cute_warp);
     Tensor tSsQ = smem_thr_copy_Q.partition_S(make_mix_tensor_like(sP));
     // Tensor tSrQ  = thr_mma.partition_fragment_A(sP);
@@ -1082,6 +1206,14 @@ __forceinline__ __device__ void wg0_rescale_rO0(
     float rL[2],
     int idx_in_warpgroup
 ) {
+    if constexpr (T::kUsePv4x2) {
+        pv_scale_one<T>(rO0, sScale1, idx_in_warpgroup);
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < 2; ++mi) {
+            rL[mi] *= sScale1(get_AorC_row_idx<T::kAtomLayoutM>(mi, idx_in_warpgroup));
+        }
+        return;
+    }
     CUTLASS_PRAGMA_UNROLL
     for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
         int row_idx = get_AorC_row_idx<T::kAtomLayoutM>(local_row_idx, idx_in_warpgroup);
@@ -1118,6 +1250,17 @@ __forceinline__ __device__ void wg1_scale0_rO1(
     Tensor<Engine2, Layout2> &sScale1,
     int idx_in_warpgroup
 ) {
+    if constexpr (T::kUsePv4x2) {
+        auto rc = make_tensor(rO1.data(), pv_rowcol_layout(rO1.layout()));
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < 4; ++mi) {
+            int row = pv_row_idx<T>(mi, idx_in_warpgroup);
+            float factor = sScale0(row) * sScale1(row);
+            CUTLASS_PRAGMA_UNROLL
+            for (int ni = 0; ni < size<1>(rc); ++ni) rc(mi, ni) *= factor;
+        }
+        return;
+    }
     CUTLASS_PRAGMA_UNROLL
     for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
         int row_idx = get_AorC_row_idx<T::kAtomLayoutM>(local_row_idx, idx_in_warpgroup);
@@ -1150,6 +1293,10 @@ __forceinline__ __device__ void wg0_scale0_rO0(
     Tensor<Engine1, Layout1> &sScale0,
     int idx_in_warpgroup
 ) {
+    if constexpr (T::kUsePv4x2) {
+        pv_scale_one<T>(rO0, sScale0, idx_in_warpgroup);
+        return;
+    }
     CUTLASS_PRAGMA_UNROLL
     for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
         int row_idx = get_AorC_row_idx<T::kAtomLayoutM>(local_row_idx, idx_in_warpgroup);
@@ -1168,6 +1315,28 @@ __forceinline__ __device__ void wg0_scale0_rO0(
             rO0(i+1) *= scale_factor;
         }
 #endif
+    }
+}
+
+// The dense paired-cube PV load exchanges the two 64-column fragments.
+// Restore their logical column positions without another memory round trip.
+template<typename T, typename Copy, typename ER, typename LR, typename ES, typename LS>
+__forceinline__ __device__ void store_pv_fragment(
+    Copy copy_op, Tensor<ER, LR> const &src, Tensor<ES, LS> &dst) {
+    if constexpr (T::CvtGemmSwzlLd) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < size<2>(dst); ++j) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size<0>(dst); ++i) {
+                const int real_i = T::kUsePv4x2
+                    ? (i & 3) | ((j & 2) << 1) : (i & 3) | (j & 4);
+                const int real_j = T::kUsePv4x2
+                    ? (j & ~2) | ((i & 4) >> 1) : i + j - real_i;
+                cute::copy(copy_op, src(real_i, _, real_j), dst(i, _, j));
+            }
+        }
+    } else {
+        cute::copy(copy_op, src, dst);
     }
 }
 
@@ -1204,6 +1373,17 @@ __forceinline__ __device__ void store_o(
     // (SMEM_M,SMEM_N) // Sw<3,3,3> o _0 o (_32,(_64,_8)):(_64,(_1,_2048))
     Tensor rOb = make_tensor_like<ElementO>(rO);
 
+    if constexpr (T::kUsePv4x2) {
+        auto src = make_tensor(rO.data(), pv_rowcol_layout(rO.layout()));
+        auto dst = make_tensor(rOb.data(), pv_rowcol_layout(rOb.layout()));
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < 4; ++mi) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int ni = 0; ni < size<1>(src); ++ni) {
+                dst(mi, ni) = (InputT)(src(mi, ni) / rL[mi]);
+            }
+        }
+    } else {
     CUTLASS_PRAGMA_UNROLL
     for (int idx = 0; idx < size(rO); ++idx) {
 #if ACOMPUTE_VERSION == 10000
@@ -1211,6 +1391,7 @@ __forceinline__ __device__ void store_o(
 #else
         rOb(idx) = (InputT)(rO(idx) / rL[idx%4 >= 2]);
 #endif
+    }
     }
 
     if constexpr (!IS_NO_SPLIT && T::kBlockM >= 128) {
@@ -1220,7 +1401,7 @@ __forceinline__ __device__ void store_o(
         Tensor sHalfBuf = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(sO_addr)),
             SmemLayoutO_Half{});  // (kBlockM, kHeadDimV/2) = 128x256 floats
 
-        typename T::TiledMma tiled_mma;
+        typename T::TiledMmaPV tiled_mma;
         const int cute_idx = idx_in_warpgroup % T::kMmaThreads;
         auto r2s_tiled_copy = make_tiled_copy_C(SmemTiledCopyO{}, tiled_mma);
         ThrCopy r2s_thr_copy = r2s_tiled_copy.get_slice(cute_idx);
@@ -1241,7 +1422,11 @@ __forceinline__ __device__ void store_o(
         for (int pass = 0; pass < 2; ++pass) {
             // r2s: only the WG whose data matches this pass writes
             if (warpgroup_idx == pass) {
-                cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sHalfBuf);
+                if constexpr (T::CvtGemmSwzlLd) {
+                    store_pv_fragment<T>(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sHalfBuf);
+                } else {
+                    cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sHalfBuf);
+                }
             }
             __syncthreads();
 
@@ -1273,7 +1458,7 @@ __forceinline__ __device__ void store_o(
 
         Tensor sMyOutputBuf = local_tile(sOutputBuf, Shape<Int<T::kBlockM>, _256>{}, make_coord(_0{}, warpgroup_idx));
 
-        typename T::TiledMma tiled_mma;
+        typename T::TiledMmaPV tiled_mma;
         const int cute_idx = idx_in_warpgroup % T::kMmaThreads;
         auto r2s_tiled_copy = make_tiled_copy_C(
             SmemTiledCopyO{}, tiled_mma);
@@ -1281,7 +1466,11 @@ __forceinline__ __device__ void store_o(
         ThrCopy r2s_thr_copy = r2s_tiled_copy.get_slice(cute_idx);
         Tensor r2s_thr_copy_rOb = r2s_thr_copy.retile_S(rOb);
         Tensor r2s_thr_copy_sMyOutputBuf = r2s_thr_copy.partition_D(sMyOutputBuf);
-        cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sMyOutputBuf);
+        if constexpr (T::CvtGemmSwzlLd) {
+            store_pv_fragment<T>(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sMyOutputBuf);
+        } else {
+            cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sMyOutputBuf);
+        }
 
         __syncthreads();
 
@@ -1455,7 +1644,12 @@ __forceinline__ __device__ void issue_K_load_bf16(
     tKgK_tok.data() = token_ptr;
 
     gmem_tiled_copy_K.pred = is_valid;
-    flash::launch_kv_tiles_wg<S, E>(gmem_tiled_copy_K, tKgK_tok, tKsK, barriers_K);
+    if constexpr (T::CvtGemmSwzlLd) {
+        flash::launch_kv_pair_copy<S, E, T>(gmem_tiled_copy_K, tKgK_tok, sK_buf, tidx);
+        cutlass::arch::cpasync_barrier_arrive_noinc(barriers_K);
+    } else {
+        flash::launch_kv_tiles_wg<S, E>(gmem_tiled_copy_K, tKgK_tok, tKsK, barriers_K);
+    }
 
     if constexpr (DO_PREFETCH) {
         if (next_block_idx < end_block_idx) {
@@ -1736,10 +1930,22 @@ __forceinline__ __device__ void launch_q_copy(
 #endif
     Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
 
-    if (warp_idx == 0) {
+    if constexpr (T::CvtGemmSwzlLd) {
+        if (warp_idx < T::kBlockM / T::kBlockMPerLoad) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int tile = 0; tile < T::kHeadDim / T::kBlockKSmem; ++tile) {
+                auto dst = tQsQ(_, warp_idx, tile);
+                if (tile < T::TileNoCvt) {
+                    const int offset = (tile & ~1) * T::kBlockM * T::kBlockKSmem
+                        + ((warp_idx << 1) + (tile & 1)) * T::kBlockMPerLoad * T::kBlockKSmem;
+                    dst.data() = tQsQ.data() + offset;
+                }
+                cute::copy(gmem_tiled_copy_Q, tQgQ(_, warp_idx, tile), dst);
+            }
+            cutlass::arch::cpasync_barrier_arrive_noinc(barrier_Q);
+        }
+    } else if (warp_idx == 0) {
         cute::copy(gmem_tiled_copy_Q, tQgQ, tQsQ);
-
-        // __pipeline_arrive_on(barrier_Q);
         cutlass::arch::cpasync_barrier_arrive_noinc(barrier_Q);
     }
 }
@@ -1874,7 +2080,14 @@ __forceinline__ __device__ void wg0_subroutine(
     wg0_bunch_0< T, IS_BLK0_LAST || IS_BLK1_LAST > (rPb, rP0, rO0, sScale0, sM, rL, params.scale_softmax_log2, start_token_idx, idx_in_warpgroup, smem_valid_indices, vi_softmax_wg0);
 #endif
 
-    NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale0Ready);
+    if constexpr (T::kUsePv4x2) {
+        // WG1 reaches bar1 after its previous remote-P0 reads. This existing
+        // rendezvous makes the old P0 buffer available before local PV.
+        NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
+        save_rP0_to_sP<T>(rPb, sP0, idx_in_warpgroup);
+    } else {
+        NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale0Ready);
+    }
 
     // [BlockM=64 only] CTA-wide barrier for sScale0/sM cross-WG visibility.
     // On PPU M890, named barriers do NOT guarantee cross-wg SMEM visibility.
@@ -1903,7 +2116,10 @@ __forceinline__ __device__ void wg0_subroutine(
     // Issue rO0 += rPb @ sV0L
     wg0_scale0_rO0<T>(rO0, sScale0, idx_in_warpgroup);
 
-    if constexpr (T::kIsCrossCut) {
+    if constexpr (T::kUsePv4x2) {
+        __ppu_barrier_sync(6, 256, 15u);
+        warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0L, rO0, idx_in_warpgroup, wg_idx);
+    } else if constexpr (T::kIsCrossCut) {
         // (4,2) layout: each N-warp only has 16/32 P columns, localP broken.
         // Save rPb to sP0 temporarily, per-WG barrier, then remoteP from SMEM.
         save_rP0_to_sP<T>(rPb, sP0, idx_in_warpgroup);
@@ -1916,6 +2132,7 @@ __forceinline__ __device__ void wg0_subroutine(
     }
 
     // sScale1Ready also signals sP1 is ready (WG1 saves sP1 before arriving)
+    // With PV4x2 this also drains WG0's local P0 readers before P0 is rescaled.
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
     // [BlockM=64 only] CTA-wide barrier for sScale1/sM cross-WG visibility.
@@ -2144,9 +2361,14 @@ __forceinline__ __device__ void wg1_subroutine(
     }
 
     // Issue rO1 += rP1b @ sV1R
+    if constexpr (T::kUsePv4x2) {
+        __ppu_barrier_sync(7, 256, 15u);
+    }
     wg1_scale0_rO1<T>(rO1, sScale0, sScale1, idx_in_warpgroup);
     if constexpr (!IS_BLK0_LAST) {
-        if constexpr (T::kIsCrossCut) {
+        if constexpr (T::kUsePv4x2) {
+            warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1R, rO1, idx_in_warpgroup, wg_idx);
+        } else if constexpr (T::kIsCrossCut) {
             // (4,2) layout: each N-warp only has 16/32 P columns, localP broken.
             // sP1 already saved above, use per-WG barrier then remoteP from SMEM.
             const int barrier_id = 6 + static_cast<int>(threadIdx.x >> 8);
@@ -2300,7 +2522,7 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
     // // Initialize TMA barriers
     static_assert(T::SharedMemoryPlan::kNumKBarriers == 2, "FP8 WI kernel expects exactly 2 K sub-stage barriers");
     if (threadIdx.x == 0) {
-        __mbarrier_init(barrier_Q, 32);
+        __mbarrier_init(barrier_Q, 32 * (T::kBlockM / T::kBlockMPerLoad));
         CUTLASS_PRAGMA_UNROLL
         // Initialize two sub-stage barriers per block:
         //   barriers_Kx[0] → tiles 0-3 (dims 0-255) readiness
@@ -2518,7 +2740,7 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
         // tight timing (fewer QKT tiles) + all rows active exposes the race.
         __syncthreads();
 
-        Tensor rO = partition_fragment_C((typename T::TiledMma){}, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV / 2>>{});	// ((2, 2, 32), 1, 1)
+        Tensor rO = partition_fragment_C((typename T::TiledMmaPV){}, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV / 2>>{});
         float rL[2];
         rL[0] = rL[1] = 0.0f;
 
@@ -2746,6 +2968,17 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
             __syncthreads();
         }
 
+        // Softmax keeps its original two-row QK ownership; PV has four rows.
+        float pv_norm[4];
+        if constexpr (T::kUsePv4x2) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int mi = 0; mi < 4; ++mi) {
+                float sum = sL_reduction_wksp[pv_row_idx<T>(mi, idx_in_warpgroup)];
+                pv_norm[mi] = (sum == 0.0f || sum != sum) ? 1.0f : sum;
+            }
+        }
+        float *output_norm = T::kUsePv4x2 ? pv_norm : rL;
+
         // Epilogue
         int num_valid_seq_q = min(params.seqlen_q - m_block_idx * T::BLOCK_SIZE_M, T::BLOCK_SIZE_M);
         if (is_no_split) {
@@ -2761,6 +2994,19 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
 
             // attn_sink: SM90-style combined scale (don't modify rL, preserve rO/rL error cancellation)
             if (params.attn_sink_ptr != nullptr) {
+                if constexpr (T::kUsePv4x2) {
+                    auto rc = make_tensor(rO.data(), pv_rowcol_layout(rO.layout()));
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int mi = 0; mi < 4; ++mi) {
+                        int row = pv_row_idx<T>(mi, idx_in_warpgroup);
+                        int head = (m_block_idx * T::BLOCK_SIZE_M + row) % params.ngroups;
+                        float sink_exp = expf(__ldg(params.attn_sink_ptr + head) - sM(row) * (float)M_LN2);
+                        float scale = __fdividef(1.0f, pv_norm[mi] + sink_exp);
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int ni = 0; ni < size<1>(rc); ++ni) rc(mi, ni) *= scale;
+                        pv_norm[mi] = 1.0f;
+                    }
+                } else {
                 const int row0 = my_row;
                 const int row1 = my_row + 8;
                 // Use pre-issued __ldg values (latency hidden by __syncthreads above)
@@ -2803,6 +3049,7 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
                 // Set rL to 1.0 so store_o's division becomes a no-op
                 rL[0] = 1.0f;
                 rL[1] = 1.0f;
+                }
             }
 
             if constexpr (T::kBlockM == 64) {
@@ -2812,7 +3059,7 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
                 }
             }
 
-            store_o<T, true>(rO, gO, rL, sO_addr, params, batch_idx, k_head_idx, m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
+            store_o<T, true>(rO, gO, output_norm, sO_addr, params, batch_idx, k_head_idx, m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
 
             int i = threadIdx.x;
             if (i < num_valid_seq_q) {
@@ -2866,12 +3113,12 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
                 }
             }
 
-            store_o<T, false>(rO, gOAccum, rL, sO_addr, params, batch_idx, k_head_idx, m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
+            store_o<T, false>(rO, gOAccum, output_norm, sO_addr, params, batch_idx, k_head_idx, m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
 
             if (batch_idx + 1 <= end_idx) {
                 // Keep mbarrier reinit for split path (store_o<T,false> uses sO_addr)
                 if (threadIdx.x == 0) {
-                    __mbarrier_init(barrier_Q, 32);
+                    __mbarrier_init(barrier_Q, 32 * (T::kBlockM / T::kBlockMPerLoad));
                     CUTLASS_PRAGMA_UNROLL
                     for (int i = 0; i < 2; ++i) {
                         __mbarrier_init(&barriers_K0[i], 256);

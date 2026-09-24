@@ -52,6 +52,10 @@ struct DSA_Traits {
     static constexpr bool Is_Q_in_regs = true || Share_Q_K_smem;
 
     static constexpr int NUM_K_BUFS = 3;
+    static constexpr bool kUsePairedCubes = Arch == 89 &&
+        std::is_same_v<InputT, cutlass::bfloat16_t>;
+    static constexpr int kQRowsPerLoad = kUsePairedCubes ? 8 : kBlockM;
+    static constexpr bool kCacheLastQ = !kUsePairedCubes || HEAD_DIM == 576;
 
     static_assert(std::is_same_v<InputT, cutlass::bfloat16_t> || std::is_same_v<InputT, cutlass::half_t>);
 
@@ -69,13 +73,28 @@ struct DSA_Traits {
     static constexpr int kBlockKSmem = 64;
     static constexpr int kSwizzle = 3;
 
+#if ACOMPUTE_VERSION >= 10500
+    using SmemCopyOpQ = std::conditional_t<kUsePairedCubes,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockM, 128, false, false, 1, true, 8>,
+        PPU_TSM_LD_SWZL<InputT, kBlockM, kBlockKSmem, false, false, 1>>;
+#else
     using SmemCopyOpQ = PPU_TSM_LD_SWZL<InputT, kBlockM, kBlockKSmem, false, false, 1>;
+#endif
     using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, InputT>;
 
 #if DSA_SIM_AIU
+#if ACOMPUTE_VERSION >= 10500
+    using SmemCopyOpK = std::conditional_t<kUsePairedCubes,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockN, 128, true, false, 1, true, 8>,
+        PPU_TSM_LD_SWZL<InputT, kBlockN, kBlockKSmem, true, false, 1>>;
+    using SmemCopyOpVt = std::conditional_t<kUsePairedCubes,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockN, 128, true, true, 1, true, -1>,
+        PPU_TSM_LD_SWZL<InputT, kBlockN, kBlockKSmem, true, true, 1>>;
+#else
     using SmemCopyOpK = PPU_TSM_LD_SWZL<InputT, kBlockN, kBlockKSmem, true, false, 1>;
-    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, InputT>;
     using SmemCopyOpVt = PPU_TSM_LD_SWZL<InputT, kBlockN, kBlockKSmem, true, true, 1>;
+#endif
+    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, InputT>;
     using SmemCopyAtomVt = Copy_Atom<SmemCopyOpVt, InputT>;
 #else
     using SmemCopyAtomK = Copy_Atom<PPU_U32x4_LDSM_N, InputT>;
@@ -171,7 +190,7 @@ using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSm
 
     using SmemCopyAtomP = Copy_Atom<PPU_U32x4_LDSM_N, InputT>;
 
-    struct SharedMemoryPlan {
+    struct SharedMemoryPlanBase {
         cute::array_aligned<InputT, cosize_v<SmemLayoutQ>> smem_sQ;
         cute::array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK;
         cute::array_aligned<float, kBlockM> smem_sM;
@@ -192,6 +211,13 @@ using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSm
         cute::array_aligned<int, 4*kBlockN> smem_valid_indices;
     };
 
+    struct SharedMemoryPlanPaired : SharedMemoryPlanBase {
+        // Paired D512 keeps all Q tiles in shared memory; P must not overwrite Q7.
+        cute::array_aligned<InputT, 2 * kBlockM * kBlockN> smem_sP;
+    };
+    using SharedMemoryPlan = std::conditional_t<kUsePairedCubes && HEAD_DIM == 512,
+        SharedMemoryPlanPaired, SharedMemoryPlanBase>;
+
     struct SharedMemoryOutPut {
         cute::array_aligned<ElementAccum, cosize_v<SmemLayoutO>> smem_out;
     };
@@ -202,8 +228,8 @@ using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSm
     static_assert(sizeof(SharedMemoryOutPut) <= kSmemBudgetBytes,
                   "SharedMemoryOutPut exceeds the 256 KiB PPU SMEM budget");
 
-    static constexpr int bits_per_aiu_Q = kBlockM * kBlockKSmem * sizeof(InputT) * 8;
-    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, InputT, false, kBlockM, kBlockKSmem>;
+    static constexpr int bits_per_aiu_Q = kQRowsPerLoad * kBlockKSmem * sizeof(InputT) * 8;
+    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, InputT, false, kQRowsPerLoad, kBlockKSmem>;
 
     static constexpr int bits_per_aiu_KV = kBlockN * kBlockKSmem * sizeof(InputT) * 8;
     using Gmem_copy_struct_KV = PPU_AIU_LOAD<cute::C<bits_per_aiu_KV>, InputT, false, kBlockN, kBlockKSmem>;
@@ -220,7 +246,7 @@ using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSm
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, InputT>{},
                     Layout<Shape <_1,_1>,
                            Stride<_1,_1>>{},
-                    Layout<Shape <Int<kBlockM>, Int<kBlockKSmem>>>{}));
+                    Layout<Shape <Int<kQRowsPerLoad>, Int<kBlockKSmem>>>{}));
 
     using GmemTiledCopyKV = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_KV, InputT>{},

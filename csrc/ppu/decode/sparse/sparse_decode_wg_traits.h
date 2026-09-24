@@ -41,6 +41,66 @@
 
 using namespace cute;
 
+#if ACOMPUTE_VERSION >= 10500
+namespace cute {
+// Keep the SDK paired-cube descriptor, but calculate offsets in its native
+// 16-byte address units. All shared-memory bases are 16-byte aligned.
+template<class Element, int BlockH, bool Swap, bool Trans, int OddTile>
+struct SparsePairedTsmUnit16 {
+    CUTE_HOST_DEVICE static void copy(
+        void* dst, void* base, unsigned coord0, unsigned coord1,
+        unsigned cube = 0, unsigned stage = 0) {
+#if defined(__HGGC_ARCH__)
+        static_assert(sizeof(Element) == 2);
+        const unsigned h = Trans ? coord0 : coord1;
+        const unsigned w = Trans ? coord1 : coord0;
+        const unsigned stg = cube + stage;
+        unsigned units = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(base) >> 4)
+            + BlockH * 8u * (stg & ~1u);
+        int lbo, sbo;
+        if constexpr (Trans) {
+            units += (stg & 1u) + h * 16u + (w >> 3);
+            lbo = 128;
+            sbo = 64;
+        } else if (stg == OddTile) {
+            units += (stg & 1u) * 128u + h * 8u + (w >> 3);
+            lbo = Swap ? 64 : 1;
+            sbo = Swap ? 1 : 64;
+        } else {
+            units += (stg & 1u) + h * 16u + (w >> 3);
+            lbo = 64;
+            sbo = 128;
+            if constexpr (Swap) sbo += (stg & 1u) ? -1 : 1;
+            else lbo += (stg & 1u) ? -1 : 1;
+        }
+        PPU0015_TSM_LD_SWZL_IMPL<Element, Trans, false>()(
+            reinterpret_cast<int*>(dst), static_cast<int>(units), lbo, sbo, 0);
+#else
+        CUTE_RUNTIME_ASSERT("Paired TSM unit address requires PPU1.5");
+#endif
+    }
+};
+
+template<class Element, int BlockH, bool Swap, bool Trans, int OddTile>
+struct Copy_Traits<SparsePairedTsmUnit16<Element, BlockH, Swap, Trans, OddTile>>
+    : Copy_Traits<PPU0015_TSM_LD_SWZL_CVT<Element, 16, 64, BlockH, 128,
+                                        Swap, Trans, 1, true, OddTile>> {
+    template<class Coord, int... Is>
+    CUTE_HOST_DEVICE void unpack(void* dst, void* base, Coord const& coord, seq<Is...>) const {
+        SparsePairedTsmUnit16<Element, BlockH, Swap, Trans, OddTile>::copy(
+            dst, base, static_cast<unsigned>(get<Is>(coord))...);
+    }
+    template<class TS, class LS, class TD, class LD>
+    CUTE_HOST_DEVICE friend void copy_unpack(
+        Copy_Traits const& traits, Tensor<TS, LS> const& src, Tensor<TD, LD>& dst) {
+        static_assert(is_mix_iterator<typename TS::iterator>::value);
+        traits.unpack(raw_pointer_cast(dst.data()), src.data().ptr_.get(),
+                      src.data().coord_, tuple_seq<decltype(src.data().coord_)>{});
+    }
+};
+} // namespace cute
+#endif
+
 // =============================================================================
 // Traits_v2<InputT>: inherits from splitkv Traits<InputT> and shadows
 // SharedMemoryPlan to add FP8-specific K-barrier count. FP8 nope/scales and
@@ -49,8 +109,8 @@ using namespace cute;
 // All other typedefs are inherited 1:1 from splitkv.
 // =============================================================================
 template<typename InputT_, int HeadDimK = 576, bool IsFP8_ = true, int BlockM_ = 128>
-struct Traits_v2 : public Traits<InputT_> {
-    using Base = Traits<InputT_>;
+struct Traits_v2 : public Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE_VERSION >= 10500)> {
+    using Base = Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE_VERSION >= 10500)>;
     using InputT = typename Base::InputT;
 
     // Whether the KV cache stores FP8 (with dequant) or BF16 (direct read).
@@ -75,8 +135,37 @@ struct Traits_v2 : public Traits<InputT_> {
         Layout<Shape<Int<kAtomLayoutM>, _1, _1>>,
         Tile<Int<16 * kAtomLayoutM>, _16, _16>>;
 
+#if ACOMPUTE_VERSION >= 10500
+    static constexpr bool kUsePv4x2 = !IsFP8 && BlockM_ == 128;
+#else
+    static constexpr bool kUsePv4x2 = false;
+#endif
+    static constexpr int kPvAtomLayoutM = kUsePv4x2 ? 4 : kAtomLayoutM;
+    using TiledMmaPV = std::conditional_t<kUsePv4x2,
+        TiledMMA<typename Base::MMA_Atom_Arch, Layout<Shape<_4, _2, _1>>,
+                 Tile<_64, _32, _16>>, TiledMma>;
+    using SmemCopyAtomPV = std::conditional_t<kUsePv4x2,
+        Copy_Atom<PPU_TSM_LD_SWZL<InputT, kBlockM, Base::kBlockN, false, false, 1>, InputT>,
+        typename Base::SmemCopyAtomP>;
+
     // Shadow SmemCopyOpQ/AtomQ for BlockM_ dimension
-    using SmemCopyOpQ = PPU_TSM_LD_SWZL<typename Base::InputT, kBlockM, Base::kBlockKSmem, false, false, 1>;
+#if ACOMPUTE_VERSION >= 10500
+    static constexpr bool kUseTsmUnit16 = kUsePv4x2 && HeadDimK == 512;
+    using SmemCopyOpQ = std::conditional_t<kUseTsmUnit16,
+        SparsePairedTsmUnit16<InputT, kBlockM, false, false, 8>,
+        std::conditional_t<BlockM_ == 128, typename Base::SmemCopyOpQ,
+            PPU_TSM_LD_SWZL<InputT, kBlockM, Base::kBlockKSmem, false, false, 1>>>;
+    using SmemCopyAtomK = std::conditional_t<kUseTsmUnit16,
+        Copy_Atom<SparsePairedTsmUnit16<InputT, Base::kBlockN, true, false, 8>, InputT>,
+        typename Base::SmemCopyAtomK>;
+    using SmemCopyAtomVt = std::conditional_t<kUseTsmUnit16,
+        Copy_Atom<SparsePairedTsmUnit16<InputT, Base::kBlockN, true, true, -1>, InputT>,
+        typename Base::SmemCopyAtomVt>;
+#else
+    using SmemCopyOpQ = std::conditional_t<BlockM_ == 128,
+        typename Base::SmemCopyOpQ,
+        PPU_TSM_LD_SWZL<typename Base::InputT, kBlockM, Base::kBlockKSmem, false, false, 1>>;
+#endif
     using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, typename Base::InputT>;
 
     // Shadow SmemLayoutP0 for BlockM_ dimension
@@ -119,13 +208,14 @@ struct Traits_v2 : public Traits<InputT_> {
     };
 
     // Shadow GmemTiledCopyQ for BlockM_ dimension
-    static constexpr int bits_per_aiu_Q = kBlockM * Base::kBlockKSmem * sizeof(typename Base::InputT) * 8;
-    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, typename Base::InputT, false, kBlockM, Base::kBlockKSmem>;
+    static constexpr int kBlockMPerLoad = Base::CvtGemmSwzlLd ? 8 : kBlockM;
+    static constexpr int bits_per_aiu_Q = kBlockMPerLoad * Base::kBlockKSmem * sizeof(typename Base::InputT) * 8;
+    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, typename Base::InputT, false, kBlockMPerLoad, Base::kBlockKSmem>;
     using GmemTiledCopyQ = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, typename Base::InputT>{},
                     Layout<Shape <_1,_1>,
                            Stride<_1,_1>>{},
-                    Layout<Shape <Int<kBlockM>, Int<Base::kBlockKSmem>>>{}));
+                    Layout<Shape <Int<kBlockMPerLoad>, Int<Base::kBlockKSmem>>>{}));
 
     // -----------------------------------------------------------------------
     // FP8 KV cache layout constants.
@@ -336,6 +426,9 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
     static constexpr int kBlockM = 64;
     static constexpr int BLOCK_SIZE_M = kBlockM;
 
+    // Match dense PPU1.5's paired-cube storage; SM80 keeps its native layout.
+    static constexpr bool kUsePairedCubes = Arch == 89;
+
     // The (4,2) cross-cut splits kBlockN columns across two N-warps, so their
     // per-row softmax max/sum must be merged (see wg*_bunch_0).
     static constexpr int kAtomLayoutM = 4;
@@ -388,8 +481,14 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
         Layout<Shape<Int<kPvAtomLayoutM>, Int<kPvAtomLayoutN>, _1>>,
         Tile<Int<16 * kPvAtomLayoutM>, Int<16 * kPvAtomLayoutN>, _16>>;
 
-    // M64 Q copy atom.
+    // Paired 16x64 cubes use the same SDK descriptors as dense MLA.
+#if ACOMPUTE_VERSION >= 10500
+    using SmemCopyOpQ = std::conditional_t<kUsePairedCubes,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockM, 128, false, false, 1, true, 8>,
+        PPU_TSM_LD_SWZL<InputT, kBlockM, Base::kBlockKSmem, false, false, 1>>;
+#else
     using SmemCopyOpQ = PPU_TSM_LD_SWZL<typename Base::InputT, kBlockM, Base::kBlockKSmem, false, false, 1>;
+#endif
     using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, typename Base::InputT>;
 
     // Shadow SmemCopyOpK/Vt on kBlockN. The TSM_LD_SWZL descriptor's row count
@@ -397,9 +496,18 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
     // it must match sK's actual row count. Base's 32 makes tile t land at
     // t*(32*64) instead of t*(kBlockN*64) -- with kBlockN=64 the rope tile 8
     // reads tile 4's nope data instead (probe: QK score 576 vs 8928).
+#if ACOMPUTE_VERSION >= 10500
+    using SmemCopyOpK = std::conditional_t<kUsePairedCubes,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockN, 128, true, false, 1, true, 8>,
+        PPU_TSM_LD_SWZL<InputT, kBlockN, Base::kBlockKSmem, true, false, 1>>;
+    using SmemCopyOpVt = std::conditional_t<kUsePairedCubes,
+        PPU0015_TSM_LD_SWZL_CVT<InputT, 16, 64, kBlockN, 128, true, true, 1, true, -1>,
+        PPU_TSM_LD_SWZL<InputT, kBlockN, Base::kBlockKSmem, true, true, 1>>;
+#else
     using SmemCopyOpK = PPU_TSM_LD_SWZL<typename Base::InputT, kBlockN, Base::kBlockKSmem, true, false, 1>;
-    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, typename Base::InputT>;
     using SmemCopyOpVt = PPU_TSM_LD_SWZL<typename Base::InputT, kBlockN, Base::kBlockKSmem, true, true, 1>;
+#endif
+    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, typename Base::InputT>;
     using SmemCopyAtomVt = Copy_Atom<SmemCopyOpVt, typename Base::InputT>;
 
     // The shared-P layout is specific to M64N64. A 64-element BF16 row needs
@@ -456,13 +564,15 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
     };
 
     // M64 Q global-memory copy.
-    static constexpr int bits_per_aiu_Q = kBlockM * Base::kBlockKSmem * sizeof(typename Base::InputT) * 8;
-    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, typename Base::InputT, false, kBlockM, Base::kBlockKSmem>;
+    static constexpr int kQRowsPerLoad = kUsePairedCubes ? 8 : kBlockM;
+    static constexpr int kQBarrierThreads = 32 * (kBlockM / kQRowsPerLoad);
+    static constexpr int bits_per_aiu_Q = kQRowsPerLoad * Base::kBlockKSmem * sizeof(typename Base::InputT) * 8;
+    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, typename Base::InputT, false, kQRowsPerLoad, Base::kBlockKSmem>;
     using GmemTiledCopyQ = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, typename Base::InputT>{},
                     Layout<Shape <_1,_1>,
                            Stride<_1,_1>>{},
-                    Layout<Shape <Int<kBlockM>, Int<Base::kBlockKSmem>>>{}));
+                    Layout<Shape <Int<kQRowsPerLoad>, Int<Base::kBlockKSmem>>>{}));
 
     // D576 has a ninth QK tile covering dims [512,576); D512 has eight tiles.
     static constexpr bool kHasExtraKTile = HeadDimK == 576;
