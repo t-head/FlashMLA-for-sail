@@ -422,6 +422,7 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
     // Unchecked prefetch is reserved for the host-selected full-tile path.
     static constexpr bool kGuardIndices = GuardIndices;
     static constexpr bool kIsPrefill = false;
+    static constexpr bool kParkQ5Fragment = false;
     static constexpr int kHeadDim = HeadDimK;
     static constexpr int kBlockM = 64;
     static constexpr int BLOCK_SIZE_M = kBlockM;
@@ -684,6 +685,41 @@ template<int HeadDimK, int Arch = 89>
 struct Hs64PrefillTraits : public Hs64Traits<HeadDimK, false, Arch> {
     using Base = Hs64Traits<HeadDimK, false, Arch>;
     static constexpr bool kIsPrefill = true;
+    static constexpr bool kParkQ5Fragment = HeadDimK == 512 && Arch == 89;
+
+    // Keep the exact paired-Q5 register image after raw Q4..Q7 becomes an
+    // alternating K0-low bank. Move metadata into the existing pre-P padding;
+    // the total shared-memory allocation remains 256 KiB.
+    struct ParkedQ5SharedMemoryPlan {
+        using InputT = typename Base::InputT;
+        cute::array_aligned<InputT, cosize_v<typename Base::SmemLayoutQ>> smem_sQ;
+        cute::array_aligned<InputT, cosize_v<typename Base::SmemLayoutK>> smem_sK;
+        cute::array_aligned<float, Base::kBlockM> smem_sM;
+        cute::array_aligned<float, Base::kBlockM + 128> sL_reduction_wksp;
+        cute::array_aligned<float, Base::kBlockM> smem_sScale0;
+        cute::array_aligned<float, Base::kBlockM> smem_sScale1;
+        cute::array_aligned<float, 4 * Base::kBlockM> smem_cross_n_reduction;
+        cute::array_aligned<unsigned int, 4 * Base::kValidWords> smem_valid_indices;
+        static constexpr int kNumKBarriers = 2;
+        __mbarrier_t barrier_Q;
+        __mbarrier_t barriers_K0[kNumKBarriers];
+        __mbarrier_t barriers_K1[kNumKBarriers];
+        static constexpr size_t kSPElems = size_t{2} * Base::kBlockM * Base::kBlockN;
+        static constexpr size_t kSPAlign = size_t{Base::kBlockM} * Base::kBlockN * sizeof(InputT);
+        cute::array_aligned<InputT, kSPElems, kSPAlign> smem_sP;
+        cute::array_aligned<InputT, Base::kBlockM * 64, kSPAlign> smem_parked_q5;
+        cute::array_aligned<InputT, cosize_v<typename Base::SmemLayoutKHigh4>, kSPAlign> smem_even_high;
+    };
+    using SharedMemoryPlan = std::conditional_t<
+        kParkQ5Fragment, ParkedQ5SharedMemoryPlan, typename Base::SharedMemoryPlan>;
+    static_assert(!kParkQ5Fragment || (
+        offsetof(ParkedQ5SharedMemoryPlan, smem_sQ) == 0 &&
+        offsetof(ParkedQ5SharedMemoryPlan, smem_sK) == 65536 &&
+        offsetof(ParkedQ5SharedMemoryPlan, smem_valid_indices) == 199168 &&
+        offsetof(ParkedQ5SharedMemoryPlan, smem_sP) == 204800 &&
+        offsetof(ParkedQ5SharedMemoryPlan, smem_parked_q5) == 221184 &&
+        offsetof(ParkedQ5SharedMemoryPlan, smem_even_high) == 229376 &&
+        sizeof(ParkedQ5SharedMemoryPlan) == 262144));
 #if ACOMPUTE_VERSION >= 10500
     using SmemCopyOpK = std::conditional_t<Arch == 89,
         SparsePairedTsmUnit16<typename Base::InputT, Base::kBlockN, true, false, 8>,

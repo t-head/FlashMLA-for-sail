@@ -148,6 +148,22 @@ __forceinline__ __device__ auto hs64_convert_layout_acc_rowcol(Layout acc_layout
 // Build tag printed once per kernel launch, for log attribution.
 inline constexpr char kHs64BuildTag[] = "HS64_BF16_LOCAL_K_PIPELINE";
 
+// Three independent D512 Prefill queries share one CTA. Their output staging
+// uses the retired first K bank so the next Q copy can overlap the epilogue.
+template <typename T>
+inline constexpr bool kHs64PrefillGroupedQueries =
+    T::kIsPrefill && T::kArch == 89 && T::kHeadDim == 512 &&
+    T::kIsCrossCut && T::kUseQkWeave && T::kUseEvenHighBank;
+inline constexpr int kHs64PrefillQueriesPerCta = 3;
+
+// WG1 owns both odd-K copy groups on SM89 D512 Prefill and on the existing
+// D576 path. WG0 publishes completion of its old odd-low PV readers first.
+template <typename T>
+inline constexpr bool kHs64LocalOddLow =
+    T::kHasExtraKTile || (T::kIsPrefill && T::kArch == 89 &&
+                         T::kHeadDim == 512 && T::kIsCrossCut &&
+                         T::kUseQkWeave && T::kUseEvenHighBank);
+
 // Shared max/scale/P publication needs TSM ordering and the full rendezvous.
 // D576 scopes these exchanges independently of pending VMEM operations;
 // K completion, buffer-reader drains, and global-output barriers remain explicit.
@@ -338,6 +354,35 @@ __forceinline__ __device__ void kernel_k_wait_sleep_ns()
         return;
     }
     __nanosleep(1);
+}
+
+// Save the exact paired-Q5 A-fragment image before raw Q4..Q7 is reused.
+// WG0's first 128 threads own the stores; both WGs restore after bar3.
+template <typename T, bool STORE, typename ER, typename LR, typename ES, typename LS>
+__forceinline__ __device__ void hs64_park_q5_fragment(
+    Tensor<ER, LR> &rQ, Tensor<ES, LS> const &sQ, int idx_in_warpgroup)
+{
+    static_assert(T::kParkQ5Fragment && T::kAtomLayoutM == 4);
+    using Plan = typename T::SharedMemoryPlan;
+    static_assert(offsetof(Plan, smem_sQ) == 0);
+    static_assert(offsetof(Plan, smem_parked_q5) == 221184);
+    CUTE_STATIC_ASSERT_V(size(rQ) == Int<32>{});
+    auto words = recast<cute::uint128_t>(rQ);
+    CUTE_STATIC_ASSERT_V(size(words) == Int<4>{});
+    auto* image = reinterpret_cast<cute::uint128_t*>(
+        cute::raw_pointer_cast(sQ.data()) +
+        offsetof(Plan, smem_parked_q5) / sizeof(typename T::InputT));
+    const int unique_thread = idx_in_warpgroup % 128;
+    CUTLASS_PRAGMA_UNROLL
+    for (int slice = 0; slice < 4; ++slice) {
+        if constexpr (STORE) {
+            cute::UniversalCopy<cute::uint128_t>::copy(
+                words(slice), image[slice * 128 + unique_thread]);
+        } else {
+            cute::UniversalCopy<cute::uint128_t>::copy(
+                image[slice * 128 + unique_thread], words(slice));
+        }
+    }
 }
 
 // Wait for one KV-tile to be ready, and then calculate P += Q K^T for one Q-tile (BLOCK_SIZE_Mx64) and one KV-tile (PAGE_BLOCK_SIZEx64)
@@ -627,9 +672,11 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     using QkCopyIndex = std::conditional_t<T::kArch == 80, unsigned, int>;
     const QkCopyIndex warp_base = __ppu_read_firstlane(
         static_cast<QkCopyIndex>(idx_in_warpgroup) / QkCopyIndex(32));
-    // Q is M-partitioned: fold the N-warp with % kAtomLayoutM.
+    // Q is M-partitioned: fold the N-warp into kAtomLayoutM.
     const QkCopyIndex cute_warp_Q =
-        (warp_base % QkCopyIndex(T::kAtomLayoutM)) * QkCopyIndex(32);
+        (T::kIsPrefill && T::kArch == 89 && T::kHasExtraKTile
+             ? (warp_base & QkCopyIndex(T::kAtomLayoutM - 1))
+             : (warp_base % QkCopyIndex(T::kAtomLayoutM))) * QkCopyIndex(32);
     ThrMMA thr_mma = tiled_mma.get_slice(cute_idx);
 
     auto smem_tiled_copy_K = make_tiled_copy_B(
@@ -666,7 +713,9 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         const QkCopyIndex warp_idx_Q_prefetch = __builtin_ppu_to_uniform_b32(
             static_cast<QkCopyIndex>(idx_in_warpgroup) / QkCopyIndex(32));
         const QkCopyIndex cute_warp_Q_prefetch =
-            (warp_idx_Q_prefetch % QkCopyIndex(T::kAtomLayoutM)) * QkCopyIndex(32);
+            (T::kIsPrefill && T::kArch == 89 && T::kHasExtraKTile
+                 ? (warp_idx_Q_prefetch & QkCopyIndex(T::kAtomLayoutM - 1))
+                 : (warp_idx_Q_prefetch % QkCopyIndex(T::kAtomLayoutM))) * QkCopyIndex(32);
         auto smem_thr_copy_Q_prefetch =
             smem_tiled_copy_Q.get_thread_slice(cute_warp_Q_prefetch);
         Tensor sQ5_prefetch_src = [&]() {
@@ -682,8 +731,13 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
             smem_thr_copy_Q_prefetch.retile_D(rQ5_prefetch);
         CUTE_STATIC_ASSERT_V(
             size<1>(sQ5_prefetch_src) == size<1>(rQ5_prefetch_copy));
-        cute::copy(
-            smem_tiled_copy_Q, sQ5_prefetch_src, rQ5_prefetch_copy);
+        if constexpr (T::kParkQ5Fragment) {
+            hs64_park_q5_fragment<T, false>(
+                rQ5_prefetch, sQ, idx_in_warpgroup);
+        } else {
+            cute::copy(
+                smem_tiled_copy_Q, sQ5_prefetch_src, rQ5_prefetch_copy);
+        }
     }
     before_qk();
 
@@ -901,7 +955,9 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_high4_tail(
     const QkCopyIndex warp_base = __ppu_read_firstlane(
         static_cast<QkCopyIndex>(idx_in_warpgroup) / QkCopyIndex(32));
     const QkCopyIndex cute_warp_Q =
-        (warp_base % QkCopyIndex(T::kAtomLayoutM)) * QkCopyIndex(32);
+        (T::kIsPrefill && T::kArch == 89 && T::kHasExtraKTile
+             ? (warp_base & QkCopyIndex(T::kAtomLayoutM - 1))
+             : (warp_base % QkCopyIndex(T::kAtomLayoutM))) * QkCopyIndex(32);
     const QkCopyIndex cute_warp_kv = warp_base * QkCopyIndex(32);
 
     auto smem_tiled_copy_Q =
@@ -945,7 +1001,12 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_high4_tail(
             }
         }();
         Tensor dst_q5 = copy_q5.retile_D(rQ5_transient);
-        cute::copy(smem_tiled_copy_Q, src_q5, dst_q5);
+        if constexpr (T::kParkQ5Fragment) {
+            hs64_park_q5_fragment<T, false>(
+                rQ5_transient, sQ, idx_in_warpgroup);
+        } else {
+            cute::copy(smem_tiled_copy_Q, src_q5, dst_q5);
+        }
     }
 
     before_qk();
@@ -1409,6 +1470,54 @@ __forceinline__ __device__ Wg0SoftmaxSums wg0_bunch_0_uniform_geometry(
                                   r_valid[k*2], r_valid[k*2+1]);
         }
     }
+    // For SM89 Prefill D576, both rows publish their independent partial
+    // maxima before one cross-N rendezvous. The row-wise exp/P math below is
+    // unchanged; D512 and all Decode instances retain their original path.
+    constexpr bool kFusedCrossNMax =
+        T::kIsPrefill && T::kArch == 89 && T::kHasExtraKTile &&
+        T::kIsCrossCut;
+    float fused_cur_max[2];
+    if constexpr (kFusedCrossNMax) {
+        const int warp_n_idx = softmax_warp / T::kAtomLayoutM;
+        CUTLASS_PRAGMA_UNROLL
+        for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+            const int row_idx = row_of(local_row_idx);
+            float cur_max = MAX_INIT_VAL;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
+                const int rv_base = (i / 4) * 2;
+                hs64_acc<T>(rP0, i) = r_valid[rv_base]
+                    ? hs64_acc<T>(rP0, i) : MAX_INIT_VAL;
+                hs64_acc<T>(rP0, i + 1) = r_valid[rv_base + 1]
+                    ? hs64_acc<T>(rP0, i + 1) : MAX_INIT_VAL;
+                cur_max = max(cur_max, max(hs64_acc<T>(rP0, i),
+                                            hs64_acc<T>(rP0, i + 1)));
+            }
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+            fused_cur_max[local_row_idx] = cur_max;
+            if (idx_in_warpgroup % 4 == 0) {
+                smem_cross_n_reduction[
+                    (softmax_wg * 2 + warp_n_idx) * T::kBlockM + row_idx] =
+                    cur_max;
+            }
+        }
+        const int warp_m = softmax_warp % T::kAtomLayoutM;
+        hs64_shared_exchange_sync<T>(7 + softmax_wg * 4 + warp_m, 64);
+        CUTLASS_PRAGMA_UNROLL
+        for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+            float cur_max = fused_cur_max[local_row_idx];
+            if (idx_in_warpgroup % 4 == 0) {
+                const int row_idx = row_of(local_row_idx);
+                const float partner_max = smem_cross_n_reduction[
+                    (softmax_wg * 2 + (1 - warp_n_idx)) * T::kBlockM + row_idx];
+                cur_max = max(cur_max, partner_max);
+            }
+            const int lane = threadIdx.x & 31;
+            fused_cur_max[local_row_idx] = __shfl_sync(
+                0xffffffff, cur_max, (lane / 4) * 4);
+        }
+    }
      // This piece of code is tightly coupled [Accumulate's layout](https://docs.nvidia.com/cuda/parallel-thread-execution/_images/wgmma-64N16-D.png)
     CUTLASS_PRAGMA_UNROLL
     for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
@@ -1416,7 +1525,9 @@ __forceinline__ __device__ Wg0SoftmaxSums wg0_bunch_0_uniform_geometry(
 
         // Mask, and get row-wise max
         float cur_max = MAX_INIT_VAL;
-        if constexpr (T::kIsCrossCut) {
+        if constexpr (kFusedCrossNMax) {
+            cur_max = fused_cur_max[local_row_idx];
+        } else if constexpr (T::kIsCrossCut) {
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
                 int g = i / 4;
@@ -1434,11 +1545,13 @@ __forceinline__ __device__ Wg0SoftmaxSums wg0_bunch_0_uniform_geometry(
                 cur_max = max(cur_max, max(hs64_acc<T>(rP0, i), hs64_acc<T>(rP0, i+1)));
             }
         }
-        cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
-        cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+        if constexpr (!kFusedCrossNMax) {
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
+            cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+        }
 
         // Cross-N-warp max reduction (4,2): merge the two N-warps' partials.
-        if constexpr (T::kIsCrossCut) {
+        if constexpr (T::kIsCrossCut && !kFusedCrossNMax) {
             int warp_n_idx = softmax_warp / T::kAtomLayoutM;
             if (idx_in_warpgroup % 4 == 0) {
                 smem_cross_n_reduction[(softmax_wg * 2 + warp_n_idx) * T::kBlockM + row_idx] = cur_max;
@@ -1744,7 +1857,8 @@ __forceinline__ __device__ void wg1_bunch_0_pre_crosscut(
     int idx_in_warpgroup,
     Tensor<EngineVI, LayoutVI> &smem_valid_indices,
     int valid_indices_buf,
-    float* smem_cross_n_reduction)
+    float* smem_cross_n_reduction,
+    const unsigned (&preloaded_valid_words)[2])
 {
     static_assert(T::kIsCrossCut);
     constexpr int NCG = T::kBlockN / 16;
@@ -1753,8 +1867,19 @@ __forceinline__ __device__ void wg1_bunch_0_pre_crosscut(
     int warp_n_idx = (idx_in_warpgroup / 32) / T::kAtomLayoutM;
 
     if constexpr (T::kHasExtraKTile) {
-        hs64_load_valid_quad<T>(smem_valid_indices, valid_indices_buf,
-            lane4, warp_n_idx, r_valid);
+        if constexpr (T::kIsPrefill && T::kArch == 89) {
+            const unsigned shift = (static_cast<unsigned>(lane4) & 1u) * 16u;
+            CUTLASS_PRAGMA_UNROLL
+            for (int cg = 0; cg < 4; ++cg) {
+                const unsigned bits = preloaded_valid_words[cg & 1];
+                r_valid[2 * cg] = (bits >> (shift + (cg / 2) * 4)) & 1u;
+                r_valid[2 * cg + 1] =
+                    (bits >> (shift + (cg / 2) * 4 + 8)) & 1u;
+            }
+        } else {
+            hs64_load_valid_quad<T>(smem_valid_indices, valid_indices_buf,
+                lane4, warp_n_idx, r_valid);
+        }
     } else {
         #pragma unroll
         for (int cg = 0; cg < NCG; ++cg) {
@@ -2074,7 +2199,9 @@ __forceinline__ __device__ void scale_rO_pv_product_with_cache(
     Tensor<Engine2, Layout2> const &sScale1,
     Wg1ScaleCache const &cache,
     float rL[2],
-    int idx_in_warpgroup
+    int idx_in_warpgroup,
+    float peer_scale0_row0 = 0.0f,
+    float peer_scale0_row1 = 0.0f
 ) {
     Tensor rO_rowcol = make_tensor(
         rO.data(), hs64_convert_layout_acc_rowcol<T>(rO.layout()));
@@ -2098,7 +2225,13 @@ __forceinline__ __device__ void scale_rO_pv_product_with_cache(
     rL[1] = rL[1] * own1 + cache.sum1;
 
     const int peer_row0 = qk_row0 + (owns_low_repeat ? 32 : -32);
-    const float peer0 = sScale0(peer_row0) * sScale1(peer_row0);
+    const float peer0 = [&]() {
+        if constexpr (T::kParkQ5Fragment) {
+            return peer_scale0_row0 * sScale1(peer_row0);
+        } else {
+            return sScale0(peer_row0) * sScale1(peer_row0);
+        }
+    }();
     const float scale0 = owns_low_repeat ? own0 : peer0;
     CUTLASS_PRAGMA_UNROLL
     for (int ni = 0; ni < 16; ++ni) {
@@ -2111,7 +2244,13 @@ __forceinline__ __device__ void scale_rO_pv_product_with_cache(
     }
 
     const int peer_row1 = peer_row0 + 8;
-    const float peer1 = sScale0(peer_row1) * sScale1(peer_row1);
+    const float peer1 = [&]() {
+        if constexpr (T::kParkQ5Fragment) {
+            return peer_scale0_row1 * sScale1(peer_row1);
+        } else {
+            return sScale0(peer_row1) * sScale1(peer_row1);
+        }
+    }();
     const float scale1 = owns_low_repeat ? own1 : peer1;
     CUTLASS_PRAGMA_UNROLL
     for (int ni = 0; ni < 16; ++ni) {
@@ -2409,7 +2548,12 @@ __forceinline__ __device__ void store_o(
             cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sMyOutputBuf);
         }
 
-        __syncthreads();
+        if constexpr (IS_NO_SPLIT && kHs64PrefillGroupedQueries<T>) {
+            // Publish sO while the next query's independent Q copy is in flight.
+            __ppu_barrier_sync(0, T::NUM_THREADS, 15u);
+        } else {
+            __syncthreads();
+        }
 
         const int64_t row_offset_o = batch_idx * params.o_batch_stride
             + m_block_idx * T::kBlockM * params.o_row_stride
@@ -2450,7 +2594,7 @@ __forceinline__ __device__ void store_o(
 // pointers from one metadata pass.
 // Compile-time version: for mainloop (USE_EXTRA as template param)
 template<int S, bool USE_EXTRA, typename T, bool PREFETCH_K = false,
-         bool PREFETCH_PREFILL_FIRST_TILE = false, typename TensorVI>
+         typename TensorVI>
 __forceinline__ __device__ void compute_K_addr_bf16(
     const Flash_fwd_mla_params &params,
     int batch_idx,
@@ -2573,19 +2717,6 @@ __forceinline__ __device__ void compute_K_addr_bf16(
     token_ptr[1] = k_base_ptr
         + (is_valid[1] ? (static_cast<size_t>(atom1) + lane_atom)
                        : lane_atom) * T::kGmemElemsPerLoad;
-
-    if constexpr (PREFETCH_PREFILL_FIRST_TILE && T::kIsPrefill &&
-                  T::kArch == 89 && T::kHasExtraKTile) {
-        // Hint the next K0 copy addresses before WG0's reader barrier.
-        // The real async copy and its completion semantics are unchanged.
-        CUTLASS_PRAGMA_UNROLL
-        for (int pass = 0; pass < T::kGmemPasses; ++pass) {
-            if (is_valid[pass]) {
-                __ppu_prefetch_nonebulk_L2(
-                    reinterpret_cast<char*>(token_ptr[pass]));
-            }
-        }
-    }
 
     if constexpr (PREFETCH_K && !T::kIsPrefill) {
         // Keep the uniform 64-bit base plus vector 32-bit offset used by
@@ -2719,6 +2850,36 @@ __forceinline__ __device__ void hs64_copy_k_tiles_pass(
         tiled_copy, gKV, sKV, g_cur, base, tidx);
 }
 
+// Form D512's four next-K0 low operands before issuing their copies. This
+// preserves the SDK copy atom, byte destinations and local commit boundary.
+template<int P, typename T, typename Copy, typename EG, typename LG,
+         typename ES, typename LS>
+__forceinline__ __device__ void hs64_copy_d512_low_bundle_pass(
+    Copy copy_op, Tensor<EG, LG> const &gKV, Tensor<ES, LS> &sKV,
+    uint32_t base, int tidx) {
+    static_assert(T::kIsPrefill && T::kArch == 89 &&
+                  !T::kHasExtraKTile && T::kUsePairedCubes);
+    auto src0 = recast<cute::uint128_t>(gKV(_, _0{}, Int<0>{}));
+    auto src1 = recast<cute::uint128_t>(gKV(_, _0{}, Int<1>{}));
+    auto src2 = recast<cute::uint128_t>(gKV(_, _0{}, Int<2>{}));
+    auto src3 = recast<cute::uint128_t>(gKV(_, _0{}, Int<3>{}));
+    CUTE_STATIC_ASSERT_V(size(src0) == Int<1>{});
+    CUTE_STATIC_ASSERT_V(size(src1) == Int<1>{});
+    CUTE_STATIC_ASSERT_V(size(src2) == Int<1>{});
+    CUTE_STATIC_ASSERT_V(size(src3) == Int<1>{});
+    auto dst0 = __cvta_shared_to_generic(hs64_pair_k_dst<0, P>(base, tidx));
+    auto dst1 = __cvta_shared_to_generic(hs64_pair_k_dst<1, P>(base, tidx));
+    auto dst2 = __cvta_shared_to_generic(hs64_pair_k_dst<2, P>(base, tidx));
+    auto dst3 = __cvta_shared_to_generic(hs64_pair_k_dst<3, P>(base, tidx));
+    PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
+        src0[0], *static_cast<cute::uint128_t*>(dst0), copy_op.pred);
+    PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
+        src1[0], *static_cast<cute::uint128_t*>(dst1), copy_op.pred);
+    PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
+        src2[0], *static_cast<cute::uint128_t*>(dst2), copy_op.pred);
+    PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
+        src3[0], *static_cast<cute::uint128_t*>(dst3), copy_op.pred);
+}
 
 // D512's lane/pass/tile/bank fields occupy disjoint address bits.
 template<int TILE, int P, typename T, typename TiledCopy, typename EG, typename LG,
@@ -2912,7 +3073,8 @@ __forceinline__ __device__ const int* hs64_query_indices(
 // PREFETCH_USE_EXTRA selects the next block's index base.
 template<int S, int E, bool PREFETCH_USE_EXTRA, typename T, bool DO_PREFETCH = true,
          bool LOCAL_COPY_GROUP = false, bool MERGE_EVEN_HIGH = false,
-         bool ODD_LOW_ONLY = false,
+         bool ODD_LOW_ONLY = false, bool EVEN_HIGH_ONLY = false,
+         bool EVEN_LOW_ONLY = false,
          typename TensorSK, typename TensorHigh = TensorSK>
 __forceinline__ __device__ void issue_K_load_bf16(
     const Flash_fwd_mla_params &params,
@@ -2931,6 +3093,8 @@ __forceinline__ __device__ void issue_K_load_bf16(
     int extra_seqlen_k,
     TensorHigh *even_high = nullptr
 ) {
+    static_assert(!(EVEN_HIGH_ONLY && EVEN_LOW_ONLY));
+    static_assert((!EVEN_HIGH_ONLY && !EVEN_LOW_ONLY) || MERGE_EVEN_HIGH);
     using InputT = typename T::InputT;
     constexpr int kBlockN = T::kBlockN;
 
@@ -2969,17 +3133,37 @@ __forceinline__ __device__ void issue_K_load_bf16(
     tKgK0.data() = token_ptr[0];
     if constexpr (MERGE_EVEN_HIGH) {
         static_assert(T::kUseEvenHighBank && LOCAL_COPY_GROUP && S == 0 && E == 4);
-        auto g_cur = tKgK0(_, _0{}, Int<0>{});
-        if constexpr (T::kHasExtraKTile) {
+        if constexpr (EVEN_LOW_ONLY) {
+            if constexpr (T::kIsPrefill && T::kArch == 89 &&
+                          !T::kHasExtraKTile) {
+                hs64_copy_d512_low_bundle_pass<0, T>(
+                    cp0, tKgK0, tKsK, store_base, tidx);
+            } else {
+                hs64_copy_k_tiles_pass<0, 4, 0, T>(
+                    cp0, tKgK0, tKsK, store_base, tidx);
+            }
+        } else if constexpr (T::kHasExtraKTile) {
             const uint32_t high_base = cast_smem_ptr_to_uint(
                 cute::raw_pointer_cast(even_high->data()));
-            hs64_copy_even_full_prefix_pass<0, 0, T>(
-                cp0, tKgK0, tKsK, g_cur, high_base, tidx);
+            if constexpr (EVEN_HIGH_ONLY) {
+                hs64_copy_even_full_prefix_pass<4, 0, T>(
+                    cp0, tKgK0, tKsK, tKgK0(_, _0{}, Int<4>{}), high_base, tidx);
+            } else {
+                hs64_copy_even_full_prefix_pass<0, 0, T>(
+                    cp0, tKgK0, tKsK, tKgK0(_, _0{}, Int<0>{}), high_base, tidx);
+            }
         } else {
+            auto g_cur = tKgK0(_, _0{}, Int<0>{});
             const uint32_t high_bank_mask = cast_smem_ptr_to_uint(
                 cute::raw_pointer_cast(even_high->data())) & 0x20000u;
-            hs64_copy_even_full_or_pass<0, 0, T>(
-                cp0, tKgK0, tKsK, g_cur, high_bank_mask, tidx);
+            if constexpr (EVEN_HIGH_ONLY) {
+                hs64_copy_even_full_or_pass<4, 0, T>(
+                    cp0, tKgK0, tKsK, tKgK0(_, _0{}, Int<4>{}),
+                    high_bank_mask, tidx);
+            } else {
+                hs64_copy_even_full_or_pass<0, 0, T>(
+                    cp0, tKgK0, tKsK, g_cur, high_bank_mask, tidx);
+            }
         }
     } else {
         if constexpr (T::kHasExtraKTile && LOCAL_COPY_GROUP && S == 4 && E == 9) {
@@ -2998,17 +3182,37 @@ __forceinline__ __device__ void issue_K_load_bf16(
         Tensor tKgK1 = gmem_thr_copy_K.partition_S(gK_tok);
         tKgK1.data() = token_ptr[1];
         if constexpr (MERGE_EVEN_HIGH) {
-            auto g_cur = tKgK1(_, _0{}, Int<0>{});
-            if constexpr (T::kHasExtraKTile) {
+            if constexpr (EVEN_LOW_ONLY) {
+                if constexpr (T::kIsPrefill && T::kArch == 89 &&
+                              !T::kHasExtraKTile) {
+                    hs64_copy_d512_low_bundle_pass<1, T>(
+                        cp1, tKgK1, tKsK, store_base, tidx);
+                } else {
+                    hs64_copy_k_tiles_pass<0, 4, 1, T>(
+                        cp1, tKgK1, tKsK, store_base, tidx);
+                }
+            } else if constexpr (T::kHasExtraKTile) {
                 const uint32_t high_base = cast_smem_ptr_to_uint(
                     cute::raw_pointer_cast(even_high->data()));
-                hs64_copy_even_full_prefix_pass<0, 1, T>(
-                    cp1, tKgK1, tKsK, g_cur, high_base, tidx);
+                if constexpr (EVEN_HIGH_ONLY) {
+                    hs64_copy_even_full_prefix_pass<4, 1, T>(
+                        cp1, tKgK1, tKsK, tKgK1(_, _0{}, Int<4>{}), high_base, tidx);
+                } else {
+                    hs64_copy_even_full_prefix_pass<0, 1, T>(
+                        cp1, tKgK1, tKsK, tKgK1(_, _0{}, Int<0>{}), high_base, tidx);
+                }
             } else {
+                auto g_cur = tKgK1(_, _0{}, Int<0>{});
                 const uint32_t high_bank_mask = cast_smem_ptr_to_uint(
                     cute::raw_pointer_cast(even_high->data())) & 0x20000u;
-                hs64_copy_even_full_or_pass<0, 1, T>(
-                    cp1, tKgK1, tKsK, g_cur, high_bank_mask, tidx);
+                if constexpr (EVEN_HIGH_ONLY) {
+                    hs64_copy_even_full_or_pass<4, 1, T>(
+                        cp1, tKgK1, tKsK, tKgK1(_, _0{}, Int<4>{}),
+                        high_bank_mask, tidx);
+                } else {
+                    hs64_copy_even_full_or_pass<0, 1, T>(
+                        cp1, tKgK1, tKsK, g_cur, high_bank_mask, tidx);
+                }
             }
         } else {
             if constexpr (T::kHasExtraKTile && LOCAL_COPY_GROUP && S == 4 && E == 9) {
@@ -3317,6 +3521,13 @@ __forceinline__ __device__ void wg0_subroutine(
 ) {
     constexpr bool kEarlyNextK0Addr =
         T::kIsPrefill && T::kArch == 89;
+    constexpr bool kSplitEvenHighCopy =
+        T::kIsPrefill && T::kArch == 89 && T::kIsCrossCut &&
+        T::kHasExtraKTile;
+    constexpr bool kD512K0LowFirst =
+        T::kIsPrefill && T::kArch == 89 && T::kIsCrossCut &&
+        !T::kHasExtraKTile;
+    constexpr bool kAltLow = kD512K0LowFirst && T::kParkQ5Fragment;
     int start_token_idx = block_idx * T::kBlockN;
     int nxt_block0 = block_idx+2;
     int nxt_block1 = block_idx+3;
@@ -3325,10 +3536,36 @@ __forceinline__ __device__ void wg0_subroutine(
     // cur_sK1 holds odd block (remote). V = first 512 dims of each K buffer.
     // Cross-WG smem_valid_indices: 4 bufs, WG0 uses 0/1, WG1 uses 2/3 (alternating)
     int vi_softmax_wg0 = (block_idx / 2) % 2;       // 0 or 1
-    auto sV_local = make_tensor(cur_sK0.data(), (typename T::SmemLayoutVDirect){});
+    auto raw_q4 = local_tile(
+        sQ, Shape<Int<T::kBlockM>, _64>{}, Coord<_0, Int<4>>{});
+    auto current_low_base = kAltLow && even_high_in_scratch
+        ? raw_q4.data() : cur_sK0.data();
+    auto next_low_base = kAltLow && !even_high_in_scratch
+        ? raw_q4.data() : cur_sK0.data();
+    Tensor next_sK0_low = make_tensor(
+        next_low_base, (typename T::SmemLayoutVDirect){});
+    auto sV_local = make_tensor(current_low_base, (typename T::SmemLayoutVDirect){});
     Tensor sV0L = get_half_V<T, 0>(sV_local);
     auto sV_remote = make_tensor(cur_sK1.data(), (typename T::SmemLayoutVDirect){});
     Tensor sV1L = get_half_V<T, 0>(sV_remote);
+
+    if constexpr (kSplitEvenHighCopy && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // The alternating next even-high bank is idle while the current
+        // high-V bank is still being read. Issue its copy before softmax.
+        auto scratch_base = hs64_even_high_scratch<T>(sQ);
+        auto buf0_tile4 = local_tile(
+            cur_sK0, Shape<Int<T::kBlockN>, _64>{}, Coord<_0, Int<4>>{});
+        auto next_high_base = even_high_in_scratch
+            ? buf0_tile4.data() : scratch_base;
+        Tensor next_sK0_high4 = make_tensor(
+            next_high_base, (typename T::SmemLayoutKHigh4){});
+        issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
+                         false, true, true, false, true>(
+            params, cur_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0],
+            idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+            pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k,
+            &next_sK0_high4);
+    }
 
     // Calc P0 = softmax(P0) and signal sScale0Ready before K load
     // (WG1 is waiting for sScale0Ready — arriving earlier lets WG1 start sooner)
@@ -3363,6 +3600,18 @@ __forceinline__ __device__ void wg0_subroutine(
 
     // For M64, the CTA-wide bar.sync publishes sScale0/sM to WG1.
 
+    if constexpr (kAltLow && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // Bar1 releases both WGs' previous-even remote-V readers before
+        // this inactive low bank is overwritten. The first raw-Q5 readers
+        // were already retired by the prologue's CTA bar3.
+        issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
+                         false, true, true, false, false, true>(
+            params, next_sK0_low, batch_idx, nxt_block0, seqlen_k,
+            &barriers_K0[0], idx_in_warpgroup, ori_block_max,
+            precomp_ptr0, precomp_valid0, pre_token_idx,
+            nxt_block0 + 2, end_block_idx, extra_seqlen_k);
+    }
+
     // Issue rO0 += rPb @ sV0L
     wg0_scale0_rO0<T>(
         rO0, sScale0, idx_in_warpgroup, &wg0_softmax_sums, rL);
@@ -3395,7 +3644,16 @@ __forceinline__ __device__ void wg0_subroutine(
 
     // [2-buffer] Reload tiles 0-3 only after localP consumes
     // sV0L=cur_sK0 and sScale1Ready releases the buffer.
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
+    if constexpr (kSplitEvenHighCopy && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // Low V reuses cur_sK0, so keep its existing reader-release point.
+        // This second async group still completes at the existing wait.
+        issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
+                         true, true, true, false, false, true>(
+            params, cur_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0],
+            idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+            pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k);
+    }
+    if constexpr (!kSplitEvenHighCopy && !IS_BLK0_LAST && !IS_BLK1_LAST) {
 
         if constexpr (T::kUseEvenHighBank) {
             // The inactive even-high bank is free before bar2. Load it in
@@ -3407,11 +3665,32 @@ __forceinline__ __device__ void wg0_subroutine(
                 ? buf0_tile4.data() : scratch_base;
             Tensor next_sK0_high4 = make_tensor(
                 next_high_base, (typename T::SmemLayoutKHigh4){});
-            issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T, true, true, true>(
-                params, cur_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0],
-                idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
-                pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k,
-                &next_sK0_high4);
+            if constexpr (kD512K0LowFirst) {
+                // Publish the low and high copy groups separately. Both are
+                // drained by the existing wait(0) before the WG0 bar6/QK.
+                if constexpr (!kAltLow) {
+                    issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
+                                     false, true, true, false, false, true>(
+                        params, cur_sK0, batch_idx, nxt_block0, seqlen_k,
+                        &barriers_K0[0], idx_in_warpgroup, ori_block_max,
+                        precomp_ptr0, precomp_valid0, pre_token_idx,
+                        nxt_block0 + 2, end_block_idx, extra_seqlen_k,
+                        &next_sK0_high4);
+                }
+                issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
+                                 true, true, true, false, true>(
+                    params, cur_sK0, batch_idx, nxt_block0, seqlen_k,
+                    &barriers_K0[0], idx_in_warpgroup, ori_block_max,
+                    precomp_ptr0, precomp_valid0, pre_token_idx,
+                    nxt_block0 + 2, end_block_idx, extra_seqlen_k,
+                    &next_sK0_high4);
+            } else {
+                issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T, true, true, true>(
+                    params, cur_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0],
+                    idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+                    pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k,
+                    &next_sK0_high4);
+            }
         } else {
             issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T, true, true>(
                 params, cur_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0],
@@ -3431,9 +3710,16 @@ __forceinline__ __device__ void wg0_subroutine(
         save_rP0_to_sP<T>(rPb, sP0, idx_in_warpgroup);
     }
 
-    // Sync with WG1: ensures sP0 not overwritten before WG1 reads it.
+    // WG1 reads P0 after bar3; the next CTA bar1 retires that reader before
+    // WG0 can overwrite P0 in the following iteration. On parked-Q5 Prefill,
+    // WG1 also snapshots its peer scale0 before bar2, so WG0 need only publish.
     if constexpr (T::kIsCrossCut) {
-        hs64_shared_exchange_sync<T>(3, T::NUM_THREADS);  // sP0Ready
+        if constexpr (T::kParkQ5Fragment) {
+            cutlass::arch::NamedBarrier::arrive(
+                T::NUM_THREADS, static_cast<cutlass::arch::ReservedNamedBarriers>(3));
+        } else {
+            hs64_shared_exchange_sync<T>(3, T::NUM_THREADS);  // sP0Ready
+        }
     } else {
         cutlass::arch::NamedBarrier::arrive(
             T::NUM_THREADS, static_cast<cutlass::arch::ReservedNamedBarriers>(3));  // M128 non-blocking producer
@@ -3471,7 +3757,7 @@ __forceinline__ __device__ void wg0_subroutine(
     // sP1 ready via sScale1Ready. remote PV can proceed after sP0Ready sync.
     if constexpr (!IS_BLK0_LAST) {
         warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup, wg_idx);
-        if constexpr (T::kHasExtraKTile && !IS_BLK1_LAST) {
+        if constexpr (kHs64LocalOddLow<T> && !IS_BLK1_LAST) {
             // Publish old buf1-low reader completion, not K0 copy completion.
             // WG1 waits for all 256 readers before overwriting this low half.
             __ppu_barrier_arrive(4, T::NUM_THREADS, 15u);
@@ -3486,7 +3772,7 @@ __forceinline__ __device__ void wg0_subroutine(
             // next address here overlaps useful work with K completion.
             if constexpr (kEarlyNextK0Addr && !IS_BLK0_LAST && !IS_BLK1_LAST) {
                 int next_nxt_block0 = block_idx + 4;
-                compute_K_addr_bf16<0, NEXT_EXTRA, T, false, true>(
+                compute_K_addr_bf16<0, NEXT_EXTRA, T, false>(
                     params, batch_idx, next_nxt_block0, seqlen_k,
                     idx_in_warpgroup, ori_block_max, smem_valid_indices,
                     vi_softmax_wg0, pre_token_idx, extra_seqlen_k,
@@ -3515,13 +3801,18 @@ __forceinline__ __device__ void wg0_subroutine(
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
         cute::clear(rP0);
         if constexpr (T::kIsCrossCut && T::kUseQkWeave) {
-            if constexpr (!T::kHasExtraKTile) {
+            if constexpr (!kHs64LocalOddLow<T>) {
                 issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T>(params, nxt_sK1, batch_idx, nxt_block1, seqlen_k, &barriers_K1[0],
                     idx_in_warpgroup, ori_block_max, precomp_ptr1, precomp_valid1,
                     pre_token_idx_b, nxt_block1 + 2, end_block_idx, extra_seqlen_k);
+            } else if constexpr (!T::kHasExtraKTile) {
+                // Keep WG0's next odd-mask producer while WG1 owns the data copy.
+                hs64_prefetch_next_indices<NEXT_EXTRA, T>(
+                    params, batch_idx, idx_in_warpgroup, ori_block_max,
+                    pre_token_idx_b, nxt_block1 + 2, end_block_idx);
             }
             // K0-low readiness was published by the preceding WG0 bar6.
-            warpgroup_cooperative_qkt_gemm<T, 5>(sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, rQlow0, barriers_K0, cur_phase_K0, idx_in_warpgroup);
+            warpgroup_cooperative_qkt_gemm<T, 5>(sQ, next_sK0_low, next_sK0_low, rP0, rQ8, rQ6, rQ4, rQlow0, barriers_K0, cur_phase_K0, idx_in_warpgroup);
         } else {
             warpgroup_cooperative_qkt_gemm<T, 0>(sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, rQlow0, barriers_K0, cur_phase_K0, idx_in_warpgroup);
         }
@@ -3651,7 +3942,8 @@ __forceinline__ __device__ void wg1_subroutine(
     typename T::InputT* (&precomp_ptr1)[T::kGmemPasses],
     bool (&precomp_valid0)[T::kGmemPasses],
     bool (&precomp_valid1)[T::kGmemPasses],
-    float* smem_cross_n_reduction
+    float* smem_cross_n_reduction,
+    unsigned (&preloaded_valid_words)[2]
 ) {
     int start_token_idx = block_idx * T::kBlockN;
     int nxt_block0 = block_idx+2;
@@ -3665,7 +3957,12 @@ __forceinline__ __device__ void wg1_subroutine(
     int vi_softmax_wg1 = 2 + (block_idx / 2) % 2;    // 2 or 3
     auto sV_local = make_tensor(cur_sK0.data(), (typename T::SmemLayoutVDirect){});
     Tensor sV0R = get_half_V<T, 1>(sV_local);
-    auto sV_remote = make_tensor(cur_sK1.data(), (typename T::SmemLayoutVDirect){});
+    auto raw_q4_even = local_tile(
+        sQ, Shape<Int<T::kBlockM>, _64>{}, Coord<_0, Int<4>>{});
+    auto current_even_low_base = T::kParkQ5Fragment && even_high_in_scratch
+        ? raw_q4_even.data() : cur_sK1.data();
+    auto sV_remote = make_tensor(
+        current_even_low_base, (typename T::SmemLayoutVDirect){});
     Tensor sV1R = get_half_V<T, 1>(sV_remote);
 
 
@@ -3678,7 +3975,8 @@ __forceinline__ __device__ void wg1_subroutine(
     if constexpr (T::kIsCrossCut) {
         wg1_bunch_0_pre_crosscut<T, IS_BLK0_LAST>(
             r_cur_max, rP1, params.scale_softmax_log2, idx_in_warpgroup,
-            smem_valid_indices, vi_softmax_wg1, smem_cross_n_reduction);
+            smem_valid_indices, vi_softmax_wg1, smem_cross_n_reduction,
+            preloaded_valid_words);
     } else {
         wg1_bunch_0_pre<T, IS_BLK0_LAST>(r_cur_max, rP1, params.scale_softmax_log2, idx_in_warpgroup, smem_valid_indices, vi_softmax_wg1);
     }
@@ -3702,8 +4000,33 @@ __forceinline__ __device__ void wg1_subroutine(
     if constexpr (!IS_BLK0_LAST) {
         save_rP1_to_sP<T>(rP1b, sP1, idx_in_warpgroup);
     }
+    if constexpr (T::kParkQ5Fragment) {
+        // Scores are dead after producing rP1b. Reuse their registers for
+        // the two peer scale0 values that WG1 would otherwise read after
+        // bar2. The following WG-local barrier drains these reads before
+        // WG1 signals CTA bar2 to WG0.
+        static_assert(T::kAtomLayoutM == 4 && T::kPvAtomLayoutM == 2);
+        const int qk_m = (idx_in_warpgroup / 32) % 4;
+        const int qk_row0 = get_AorC_row_idx<4>(0, idx_in_warpgroup);
+        const int peer_row0 = qk_row0 + (qk_m < 2 ? 32 : -32);
+        hs64_acc<T>(rP1, 0) = sScale0(peer_row0);
+        hs64_acc<T>(rP1, 1) = sScale0(peer_row0 + 8);
+    }
     if constexpr (T::kIsCrossCut) {
-        hs64_shared_exchange_sync<T>(2, T::NUM_THREADS);  // sScale1Ready
+        if constexpr (T::kParkQ5Fragment) {
+            // PV's two M-groups independently consume the P1 rows written
+            // by QK M-groups 0/2 and 1/3. Drain each four-warp producer
+            // group separately; CTA bar2 still publishes every P1 store and
+            // peer-scale read to WG0 before it can proceed. Reuse IDs 13/14
+            // only after the preceding softmax exchanges have completed.
+            const int pv_m = (idx_in_warpgroup / 32) & 1;
+            hs64_shared_exchange_sync<T>(13 + pv_m, 128);
+            cutlass::arch::NamedBarrier::arrive(
+                T::NUM_THREADS,
+                static_cast<cutlass::arch::ReservedNamedBarriers>(2));
+        } else {
+            hs64_shared_exchange_sync<T>(2, T::NUM_THREADS);  // sScale1Ready
+        }
     } else {
         cutlass::arch::NamedBarrier::arrive(
             T::NUM_THREADS, static_cast<cutlass::arch::ReservedNamedBarriers>(2));  // M128 non-blocking producer
@@ -3711,8 +4034,14 @@ __forceinline__ __device__ void wg1_subroutine(
 
     // Issue rO1 += rP1b @ sV1R
     if constexpr (T::kUsePv2x4) {
-        scale_rO_pv_product_with_cache<T>(
-            rO1, sScale0, sScale1, wg1_scale_cache, rL, idx_in_warpgroup);
+        if constexpr (T::kParkQ5Fragment) {
+            scale_rO_pv_product_with_cache<T>(
+                rO1, sScale0, sScale1, wg1_scale_cache, rL, idx_in_warpgroup,
+                hs64_acc<T>(rP1, 0), hs64_acc<T>(rP1, 1));
+        } else {
+            scale_rO_pv_product_with_cache<T>(
+                rO1, sScale0, sScale1, wg1_scale_cache, rL, idx_in_warpgroup);
+        }
     }
     if constexpr (!IS_BLK0_LAST) {
         if constexpr (T::kIsCrossCut) {
@@ -3775,17 +4104,31 @@ __forceinline__ __device__ void wg1_subroutine(
             sP0, sV1R, rO1, idx_in_warpgroup, wg_idx);
     }
 
-    if constexpr (T::kHasExtraKTile && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+    if constexpr (kHs64LocalOddLow<T> && !IS_BLK0_LAST && !IS_BLK1_LAST) {
         // Both WGs have issued their remote PV independently. Receive only
         // the old odd-low reader release, then cover low-copy latency with
         // high QK, whose separate local group was issued before remote PV.
-        hs64_shared_exchange_sync<T>(4, T::NUM_THREADS);
+        __ppu_barrier_sync(4, T::NUM_THREADS, 15u);
         issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
-                         false, true, false, true>(
+                         false, true, false, T::kHasExtraKTile>(
             params, cur_sK0, batch_idx, nxt_block1, seqlen_k,
             &barriers_K1[0], idx_in_warpgroup, ori_block_max,
             precomp_ptr0, precomp_valid0, pre_token_idx,
             nxt_block1 + 2, end_block_idx, extra_seqlen_k);
+    }
+
+    if constexpr (T::kIsPrefill && T::kArch == 89 &&
+                  T::kHasExtraKTile && !IS_BLK1_LAST) {
+        // The opposite validity slot is already complete. Read its two packed
+        // words before QK so the TSM latency overlaps tensor work, then use
+        // them at the next iteration's softmax entry.
+        const int next_vi = 2 + ((block_idx / 2 + 1) & 1);
+        const unsigned lane4 = static_cast<unsigned>(idx_in_warpgroup & 3);
+        const unsigned warp_n = static_cast<unsigned>(idx_in_warpgroup / 32) /
+                                static_cast<unsigned>(T::kAtomLayoutM);
+        const unsigned first_word = warp_n * 4u + (lane4 >> 1);
+        preloaded_valid_words[0] = smem_valid_indices(next_vi, first_word);
+        preloaded_valid_words[1] = smem_valid_indices(next_vi, first_word + 2u);
     }
 
     if constexpr (T::kIsCrossCut && T::kUseQkWeave &&
@@ -3797,7 +4140,7 @@ __forceinline__ __device__ void wg1_subroutine(
             Tensor cur_sK1_high4 = make_tensor(
                 cur_k1_tile4.data(), (typename T::SmemLayoutKHigh4){});
             auto phase6_wait_and_issue_k0 = [&]() {
-                if constexpr (T::kHasExtraKTile) {
+                if constexpr (kHs64LocalOddLow<T>) {
                     __pipeline_wait_prior(1);
                     // Do not flush the still-pending low VMEM group here.
                     __ppu_barrier_sync(15, 256, 15u);
@@ -3862,7 +4205,7 @@ __forceinline__ __device__ void wg1_subroutine(
 
     if constexpr (T::kIsCrossCut && T::kUseQkWeave &&
                   !IS_BLK0_LAST && !IS_BLK1_LAST) {
-        warpgroup_cooperative_qkt_gemm<T, 4, false, T::kHasExtraKTile>(
+        warpgroup_cooperative_qkt_gemm<T, 4, false, kHs64LocalOddLow<T>>(
             sQ, cur_sK0, cur_sK0, rP1, rQ8, rQ6, rQ4, rQlow0,
             barriers_K1, cur_phase_K1, idx_in_warpgroup);
     }
@@ -3960,7 +4303,14 @@ __forceinline__ __device__ void hs64_attention(
     // Cross-WG: WG0 uses bufs 0/1, WG1 uses bufs 2/3 (alternating preload/softmax)
     Tensor smem_valid_indices = make_tensor(make_smem_ptr(plan.smem_valid_indices.data()),
         Shape<_4, Int<T::kValidWords>>{}, Stride<Int<T::kValidWords>, _1>{});
-    char *sO_addr = (char *)plan.smem_sQ.data(); // Overlap with sK0 and sK1
+    constexpr bool kStageOutputInRetiredK =
+        kHs64PrefillGroupedQueries<T> && !ALLOW_EXTRA;
+    static_assert(!kStageOutputInRetiredK ||
+        (offsetof(SharedMemoryPlan, smem_sK) == 65536 &&
+         cosize_v<typename T::SmemLayoutO> * sizeof(InputT) <= 65536));
+    char *sO_addr = kStageOutputInRetiredK
+        ? (char *)cute::raw_pointer_cast(sK(_, _, 1).data())
+        : (char *)plan.smem_sQ.data();
 
     __mbarrier_t *barrier_Q = &(plan.barrier_Q);
     __mbarrier_t *barriers_K0 = plan.barriers_K0;
@@ -3987,7 +4337,13 @@ __forceinline__ __device__ void hs64_attention(
     int *tile_scheduler_metadata_ptr = nullptr;
     int begin_idx, begin_seqlen, end_idx, end_seqlen;
     if constexpr (T::kIsPrefill) {
-        begin_idx = end_idx = blockIdx.x;
+        if constexpr (kHs64PrefillGroupedQueries<T>) {
+            begin_idx = static_cast<int>(blockIdx.x) * kHs64PrefillQueriesPerCta;
+            end_idx = min(begin_idx + kHs64PrefillQueriesPerCta - 1,
+                          params.b - 1);
+        } else {
+            begin_idx = end_idx = blockIdx.x;
+        }
         begin_seqlen = end_seqlen = 0;
     } else {
         tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr + partition_idx * TileSchedulerMetaDataSize;
@@ -4007,6 +4363,9 @@ __forceinline__ __device__ void hs64_attention(
 
     // Copy the first Q
     launch_q_copy<T>(params, begin_idx, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
+    const bool next_wg0_high_active = kHs64PrefillGroupedQueries<T> &&
+        params.topk == 2048 && params.topk_len_ptr == nullptr &&
+        params.extra_topk < 0;
 
 #pragma unroll 1
 #pragma clang loop licm(disable)
@@ -4067,7 +4426,8 @@ __forceinline__ __device__ void hs64_attention(
         // cp.async can hide its latency.
 
         // Prefetch this thread's first-round token metadata.
-        auto prefetch_tok = [&](int _blk, int (&_out)[T::kGmemPasses]) {
+        auto prefetch_tok = [&](int _blk, int (&_out)[T::kGmemPasses],
+                                int prefetch_batch_idx) {
             if (_blk < 0 || _blk >= end_block_idx) {
                 CUTLASS_PRAGMA_UNROLL
                 for (int p = 0; p < T::kGmemPasses; ++p) _out[p] = -1;
@@ -4080,7 +4440,7 @@ __forceinline__ __device__ void hs64_attention(
                 _eff = _blk;
                 _index_count = params.topk;
                 _base = hs64_query_indices<false>(params)
-                    + static_cast<int64_t>(batch_idx) *
+                    + static_cast<int64_t>(prefetch_batch_idx) *
                         params.indices_batch_stride
                     + _eff * T::kBlockN;
             } else {
@@ -4090,11 +4450,11 @@ __forceinline__ __device__ void hs64_attention(
                 _index_count = _use_extra ? params.extra_topk : params.topk;
                 _base = _use_extra
                     ? (hs64_query_indices<true>(params)
-                       + static_cast<int64_t>(batch_idx) *
+                       + static_cast<int64_t>(prefetch_batch_idx) *
                            params.extra_indices_batch_stride
                        + _eff * T::kBlockN)
                     : (hs64_query_indices<false>(params)
-                       + static_cast<int64_t>(batch_idx) *
+                       + static_cast<int64_t>(prefetch_batch_idx) *
                            params.indices_batch_stride
                        + _eff * T::kBlockN);
             }
@@ -4117,14 +4477,14 @@ __forceinline__ __device__ void hs64_attention(
             // WG0: prolog loads block0 (uses idx0), main loop first loads nxt_block0=block2, nxt_block1=block3
             // idx0: prefetch block0 (prolog), will be updated to block2 by prolog load
             // idx1: prefetch block3 (first main loop nxt_block1)
-            prefetch_tok(start_block_idx, pre_token_idx0);
-            prefetch_tok(start_block_idx + 3, pre_token_idx1);
+            prefetch_tok(start_block_idx, pre_token_idx0, batch_idx);
+            prefetch_tok(start_block_idx + 3, pre_token_idx1, batch_idx);
         } else {
             // WG1: prolog loads block1 (uses idx1), main loop first loads nxt_block1=block3, nxt_block0=block2
             // idx1: prefetch block1 (prolog), will be updated to block3 by prolog load
             // idx0: prefetch block2 (first main loop nxt_block0)
-            prefetch_tok(start_block_idx + 1, pre_token_idx1);
-            prefetch_tok(start_block_idx + 2, pre_token_idx0);
+            prefetch_tok(start_block_idx + 1, pre_token_idx1, batch_idx);
+            prefetch_tok(start_block_idx + 2, pre_token_idx0, batch_idx);
         }
 
 
@@ -4152,13 +4512,15 @@ __forceinline__ __device__ void hs64_attention(
                     auto vi_wg0 = smem_valid_indices(prolog_vi_wg0, _);
 
                     if constexpr (!ALLOW_EXTRA) {
-                        load_K_tiles_bf16<
-                            T::kStage1KTiles, 8, false, T, false, T::kUseEvenHighBank>(
-                            params, cur_sK0, batch_idx, start_block_idx,
-                            seqlen_k, &barriers_K0[1], idx_in_warpgroup,
-                            ori_block_max, smem_valid_indices, prolog_vi_wg0,
-                            pre_token_idx0, start_block_idx + 2,
-                            end_block_idx, extra_seqlen_k);
+                        if (batch_idx == begin_idx || !next_wg0_high_active) {
+                            load_K_tiles_bf16<
+                                T::kStage1KTiles, 8, false, T, false, T::kUseEvenHighBank>(
+                                params, cur_sK0, batch_idx, start_block_idx,
+                                seqlen_k, &barriers_K0[1], idx_in_warpgroup,
+                                ori_block_max, smem_valid_indices, prolog_vi_wg0,
+                                pre_token_idx0, start_block_idx + 2,
+                                end_block_idx, extra_seqlen_k);
+                        }
                         load_K_tiles_bf16<
                             0, T::kStage1KTiles, false, T, true, true>(
                             params, cur_sK0, batch_idx, start_block_idx,
@@ -4224,6 +4586,14 @@ __forceinline__ __device__ void hs64_attention(
             }
         }
 
+        if constexpr (kHs64PrefillGroupedQueries<T>) {
+            // Overlap the Q completion poll with the prolog K drain.
+            while(!cutlass::arch::test_wait(barrier_Q, cur_phase_Q, 1)) {
+                kernel_sleep_ns();
+            }
+            cur_phase_Q ^= 1u;
+        }
+
         // Initialize the CTA-owned softmax max state before the existing prolog
         // barrier so both warpgroups observe it before entering the mainloop.
         if (threadIdx.x < size(sM)) {
@@ -4244,13 +4614,15 @@ __forceinline__ __device__ void hs64_attention(
 
         // Clear buffers
         cute::fill(rO, 0.);
-        while(!cutlass::arch::test_wait(barrier_Q, cur_phase_Q, 1)) {
-            kernel_sleep_ns();
-        }
-        if constexpr (T::kHasExtraKTile) {
-            cur_phase_Q = (cur_phase_Q + 1) & 1;
-        } else {
-            cur_phase_Q ^= 1u;
+        if constexpr (!kHs64PrefillGroupedQueries<T>) {
+            while(!cutlass::arch::test_wait(barrier_Q, cur_phase_Q, 1)) {
+                kernel_sleep_ns();
+            }
+            if constexpr (T::kHasExtraKTile) {
+                cur_phase_Q = (cur_phase_Q + 1) & 1;
+            } else {
+                cur_phase_Q ^= 1u;
+            }
         }
 
 
@@ -4320,6 +4692,19 @@ __forceinline__ __device__ void hs64_attention(
             retrieve_rP_from_sP<T>(rQlow0,
                 local_tile(sQ, Shape<Int<T::kBlockM>, _64>{}, Coord<_0, _0>{}),
                 idx_in_warpgroup);
+        }
+
+        if constexpr (T::kParkQ5Fragment) {
+            // Initial QK still uses raw Q5. The first CTA bar3 publishes
+            // this image and retires both WGs' remaining raw-Q readers.
+            if (warpgroup_idx == 0 && idx_in_warpgroup < 128) {
+                Tensor parked_q5 = thr_mma_rQ8.partition_fragment_A(
+                    local_tile(sQ, Shape<Int<T::kBlockM>, _64>{},
+                               Coord<_0, Int<5>>{}));
+                retrieve_q_tile<T, 5>(parked_q5, sQ, idx_in_warpgroup);
+                hs64_park_q5_fragment<T, true>(
+                    parked_q5, sQ, idx_in_warpgroup);
+            }
         }
 
         if (warpgroup_idx == 0) {
@@ -4471,6 +4856,19 @@ __forceinline__ __device__ void hs64_attention(
             // normal-iteration-only toggles keep both uniform states aligned.
             uint32_t even_high_in_scratch = 0;
 
+            unsigned preloaded_valid_words[2] = {};
+            if constexpr (T::kIsPrefill && T::kArch == 89 &&
+                          T::kHasExtraKTile) {
+                // Prolog bar0 publishes the first odd block's validity slot.
+                const int first_vi = 2 + ((start_block_idx / 2) & 1);
+                const unsigned lane4 = static_cast<unsigned>(idx_in_warpgroup & 3);
+                const unsigned warp_n = static_cast<unsigned>(idx_in_warpgroup / 32) /
+                                        static_cast<unsigned>(T::kAtomLayoutM);
+                const unsigned first_word = warp_n * 4u + (lane4 >> 1);
+                preloaded_valid_words[0] = smem_valid_indices(first_vi, first_word);
+                preloaded_valid_words[1] = smem_valid_indices(first_vi, first_word + 2u);
+            }
+
             #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA)  \
                 wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA>(          \
                 sQ, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, rQ6, rQ4, rQ5, rQmid6, rQlow0, \
@@ -4481,7 +4879,7 @@ __forceinline__ __device__ void hs64_attention(
                 pre_token_idx1,                                \
                 pre_token_idx0,                                \
                 extra_seqlen_k,                                                      \
-                precomp_ptr0_wg1, precomp_ptr1_wg1, precomp_valid0_wg1, precomp_valid1_wg1, smem_cross_n_reduction);  \
+                precomp_ptr0_wg1, precomp_ptr1_wg1, precomp_valid0_wg1, precomp_valid1_wg1, smem_cross_n_reduction, preloaded_valid_words);  \
 
             int block_idx = start_block_idx;
             if constexpr (!ALLOW_EXTRA) {
@@ -4601,6 +4999,33 @@ __forceinline__ __device__ void hs64_attention(
             sL_reduction_wksp[my_row + 8 + warpgroup_idx * 128] = rL[1];
         }
         __syncthreads();
+
+        // The final K readers have retired. Output no longer aliases sQ,
+        // allowing this original next-Q async group to overlap the epilogue.
+        if constexpr (kStageOutputInRetiredK) {
+            if (batch_idx < end_idx) {
+                launch_q_copy<T>(params, batch_idx + 1, m_block_idx,
+                                 k_head_idx, sQ, tidx, warp_idx, barrier_Q);
+            }
+        }
+        // WG0's retired bank is disjoint from the output staging bank. Keep
+        // this issue path separate from the Q-copy branch to preserve the
+        // independent scheduling window through the output epilogue.
+        if constexpr (kStageOutputInRetiredK) {
+            if (next_wg0_high_active && batch_idx < end_idx &&
+                warpgroup_idx == 0) {
+                int next_first_idx[T::kGmemPasses] = {};
+                const int next_batch_idx = batch_idx + 1;
+                constexpr int next_end_block_idx = 2048 / T::kBlockN;
+                prefetch_tok(0, next_first_idx, next_batch_idx);
+                load_K_tiles_bf16<
+                    T::kStage1KTiles, 8, false, T, false, T::kUseEvenHighBank>(
+                    params, cur_sK0, next_batch_idx, 0, 2048,
+                    &barriers_K0[1], idx_in_warpgroup, -1,
+                    smem_valid_indices, 0, next_first_idx, 2,
+                    next_end_block_idx, 0);
+            }
+        }
 
         // Reduce rL across warpgroups.
         if constexpr (T::kIsCrossCut && T::kUsePv2x4 && T::kBlockM == 64) {
@@ -4791,12 +5216,13 @@ __forceinline__ __device__ void hs64_attention(
             }
 
             if (batch_idx + 1 <= end_idx) {
-                // Skip mbarrier reinit: barrier phases are consistent across batches.
-                // store_o stages through sO_addr, which aliases sQ. Ensure every
-                // thread has finished its SMEM-to-register read before the next
-                // batch's Q copy overwrites that storage.
-                __syncthreads();
-                launch_q_copy<T>(params, batch_idx + 1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
+                if constexpr (!kStageOutputInRetiredK) {
+                    // The original path stages output in sQ. Its readers must
+                    // finish before the next query overwrites that storage.
+                    __syncthreads();
+                    launch_q_copy<T>(params, batch_idx + 1, m_block_idx,
+                                     k_head_idx, sQ, tidx, warp_idx, barrier_Q);
+                }
             } else {
                 // Allow the next kernel (the combine kernel) to launch
                 // The next kernel MUST be the combine kernel
@@ -5054,7 +5480,10 @@ void run_flash_sparse_prefill_fwd_hs64(SparsePrefillParams &params) {
                  sizeof(typename T::SharedMemoryOutPut));
     hggcFuncSetAttribute(
         kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    kernel<<<dim3(params.s_q), T::NUM_THREADS, smem_size, params.stream>>>(params);
+    const int grid_q = kHs64PrefillGroupedQueries<T>
+        ? cute::ceil_div(params.s_q, kHs64PrefillQueriesPerCta)
+        : params.s_q;
+    kernel<<<dim3(grid_q), T::NUM_THREADS, smem_size, params.stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
