@@ -94,3 +94,50 @@ def test_metadata_lazy_gen_and_runtime_refresh_inside_graph_capture():
         check_against_reference(
             t, out_ans, lse_ans, cache_seqlens, block_table, q, blocked_k
         )
+
+
+@torch.inference_mode()
+def test_graph_replay_after_warmup_with_padded_batch():
+    t = CASE
+    cache_seqlens, q, block_table, blocked_k = generate_test_data(t)
+    cache_seqlens = cache_seqlens.to(torch.int64)
+    cache_seqlens.fill_(1)
+    captured_block_table = block_table[:, :1]
+
+    sched_meta, num_splits = flash_mla.get_mla_metadata()
+
+    def decode():
+        return run_decode(
+            t,
+            q,
+            blocked_k,
+            captured_block_table,
+            cache_seqlens.to(torch.int32),
+            sched_meta,
+            num_splits,
+        )
+
+    def warmup():
+        sched_meta.have_initialized = False
+        return decode()
+
+    warmup_on_side_stream(warmup, rounds=2)
+
+    sched_meta.have_initialized = False
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_ans, lse_ans = decode()
+
+    cache_seqlens[0] = t.s_k
+    graph.replay()
+    torch.cuda.synchronize()
+
+    check_against_reference(
+        t,
+        out_ans[:1],
+        lse_ans[:1],
+        cache_seqlens[:1],
+        block_table[:1],
+        q[:1],
+        blocked_k,
+    )

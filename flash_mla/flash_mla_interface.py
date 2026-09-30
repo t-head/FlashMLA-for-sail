@@ -151,8 +151,9 @@ def flash_mla_with_kvcache(
         # Sanity check. We only perform sanity check during the first invocation to save CPU time.
         if indices_in_kvcache is not None:
             assert not causal, "causal must be False when indices_in_kvcache is not None (i.e. sparse attention is enabled)"
-
         # Initialize the tile scheduler metadata during the first invocation.
+        sched_meta.tile_scheduler_metadata = None
+        sched_meta.num_splits = None
         sched_meta.have_initialized = True
         sched_meta.config = FlashMLASchedMeta.Config(
             q.shape[0],
