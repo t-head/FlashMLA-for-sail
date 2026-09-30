@@ -1045,14 +1045,47 @@ void run_flash_sparse_decode_fwd(Flash_fwd_params &params, hggcStream_t stream) 
 #endif
     CHECK_CUDA_KERNEL_LAUNCH();
 
-    // Reuse the warp-per-q-seq combine kernel that the warp-group decode path uses:
-    // one CTA handles BLOCK_SIZE_M q-seqs instead of one CTA per q-seq, which shrinks
-    // the combine grid by BLOCK_SIZE_M (dominant cost at large batch / MTP s_q).
-    // The splitkv epilogue (kerutils softmax.cuh normalize_softmax_lse_per_warp)
-    // stores LSE in natural log, hence lse_in_log2=false.
-    // InputT (not Element) is required here: this is host code and
-    // Kernel_traits::Element resolves to half_t on the host pass.
-    run_flash_mla_combine_kernel<typename Kernel_traits::InputT>(params, stream, /*lse_in_log2=*/false);
+    // Non-WG combine dispatch is fitted independently for FP8-KV and BF16-KV.
+    // We exhaustively searched integer (batch, grid_size) AND rules on FP8 and
+    // BF16 non-WG cases on M890. 
+    // The split count is device-resident and unavailable here, so batch and grid_size
+    // can only proxy the per-row reduction chain. 
+    // TODO: The conservative rules still fall short of the per-case oracle, needs optimization
+    constexpr int kWarpCombineBlockSizeM = 8;
+    constexpr int kMinWarpGrid = IsFP8 ? 390 : 380;
+    constexpr int kMinBatch = IsFP8 ? 14 : 4;
+    const int grid_size = params.b * cute::ceil_div(
+        params.h * params.seqlen_q, kWarpCombineBlockSizeM);
+
+    if (grid_size >= kMinWarpGrid && params.b >= kMinBatch) {
+        // The splitkv epilogue stores LSE in natural log, hence lse_in_log2=false.
+        // InputT (not Element) is required here: Kernel_traits::Element resolves to
+        // half_t on the host pass.
+        run_flash_mla_combine_kernel<typename Kernel_traits::InputT>(
+            params, stream, /*lse_in_log2=*/false);
+    } else {
+        // Small grids use the legacy block-per-row kernel.
+        dim3 grid_combine(params.b * params.h * params.seqlen_q);
+        MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, kMaxSplits, [&] {
+            auto combine_kernel =
+                &flash::flash_fwd_splitkv_mla_combine_kernel<Kernel_traits, kMaxSplits>;
+#ifdef __HGGCCC__
+            const void *flash_func = reinterpret_cast<const void*>(combine_kernel);
+            HGfunction func = static_cast<HGfunction>(NULL);
+            hggcGetFuncBySymbol(reinterpret_cast<hggcFunction_t*>(&func), flash_func);
+
+            void* kernel_args[] = {&params};
+            HGlaunchAttributeAD LaunchAttr = {HGAD_LAUNCH_ATTRIBUTE_IGNORE};
+            HGlaunchConfigAD LaunchCfg = {
+                grid_combine.x, grid_combine.y, grid_combine.z,
+                128, 1, 1, 0, stream, &LaunchAttr, 0};
+            CUDA_DRIVER_CHECK(hgLaunchKernelExAD(&LaunchCfg, func, kernel_args, nullptr));
+#else
+            combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
+#endif
+        });
+        CHECK_CUDA_KERNEL_LAUNCH();
+    }
 }
 
 template<typename T, bool IsFP8, int Headdim, int Headdim_V>
