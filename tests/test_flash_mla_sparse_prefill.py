@@ -71,7 +71,7 @@ def main(loops=1):
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, d_qk=d_qk, have_topk_length=attn_sink)
         for d_qk in [512, 576]
         for h_q in [
-            128, 64
+            128, 64, 192
         ]
         for s_kv, topk in [
             # Regular
@@ -101,7 +101,7 @@ def main(loops=1):
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, have_attn_sink=have_attn_sink, have_topk_length=have_topk_length, d_qk=d_qk)
         for d_qk in [512, 576]
         for h_q in [
-            128, 64
+            128, 64, 192
         ]
         for s_kv, topk in [
             (592, 128),
@@ -123,7 +123,7 @@ def main(loops=1):
         TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
         for h_q in [
-            128, 64
+            128, 64, 192
         ]
         for s_q, s_kv, topk in [
             (1, 128, 128),
@@ -136,7 +136,7 @@ def main(loops=1):
         TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=True, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
         for h_q in [
-            128, 64
+            128, 64, 192
         ]
         for s_kv, topk in [
             (32, 2048),

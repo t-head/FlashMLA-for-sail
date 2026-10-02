@@ -34,7 +34,7 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
 
     // The double-warpgroup pipeline amortizes its setup on long topk;
     // retain the standard prefill kernel for short sparse rows.
-    const bool use_hs64 = params.h_q == 64 && params.h_kv == 1 &&
+    const bool use_hs64 = params.h_q % 128 == 64 && params.h_kv == 1 &&
         params.topk >= 512;
     const bool warp_interleave = ((params.s_q % 128 == 0) || (params.s_q > 256)) &&
         params.h_q == 128 && params.s_kv >= params.topk;

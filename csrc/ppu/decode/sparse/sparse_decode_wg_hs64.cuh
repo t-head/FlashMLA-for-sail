@@ -152,7 +152,7 @@ inline constexpr char kHs64BuildTag[] = "HS64_BF16_LOCAL_K_PIPELINE";
 // uses the retired first K bank so the next Q copy can overlap the epilogue.
 template <typename T>
 inline constexpr bool kHs64PrefillGroupedQueries =
-    T::kIsPrefill && T::kArch == 89 && T::kHeadDim == 512 &&
+    T::kIsPrefill && T::kGroupPrefillQueries && T::kArch == 89 && T::kHeadDim == 512 &&
     T::kIsCrossCut && T::kUseQkWeave && T::kUseEvenHighBank;
 inline constexpr int kHs64PrefillQueriesPerCta = 3;
 
@@ -4269,7 +4269,9 @@ __forceinline__ __device__ void hs64_attention(
     // o_ptr / softmax_lse_ptr; otherwise write to the *accum buffers at split
     // idx (n_split_idx + num_splits_ptr[batch_idx]).
 
-    const int m_block_idx = T::kIsPrefill ? 0 : blockIdx.x * gridDim.y + blockIdx.y;
+    const int m_block_idx = T::kIsPrefill
+        ? (T::kMultiPrefillHeadTiles ? static_cast<int>(blockIdx.y) : 0)
+        : blockIdx.x * gridDim.y + blockIdx.y;
     const int k_head_idx = 0;
     const int partition_idx = blockIdx.z;
     const int warpgroup_idx = __builtin_ppu_to_uniform_b32(threadIdx.x / 256);
@@ -5209,7 +5211,8 @@ __forceinline__ __device__ void hs64_attention(
                 if constexpr (T::kIsPrefill) {
                     // Like LSE, max_logits excludes attn_sink. sM is in log2
                     // units; the prefill API returns natural-log scores.
-                    max_logits_ptr[int64_t(batch_idx) * params.seqlen_q + i] =
+                    max_logits_ptr[int64_t(batch_idx) * params.seqlen_q +
+                                   m_block_idx * T::BLOCK_SIZE_M + i] =
                         (cur_L == 0.0f || cur_L != cur_L || sM_nan)
                         ? -INFINITY : sM_val * (float)M_LN2;
                 }
@@ -5328,7 +5331,8 @@ flash_sparse_prefill_fwd_hs64(__grid_constant__ const SparsePrefillParams params
     Flash_fwd_params p{};
     p.b = params.s_q;
     p.q_orig = 1;
-    p.seqlen_q = p.h_q = p.ngroups = T::kBlockM;
+    p.seqlen_q = p.h_q = p.ngroups =
+        T::kMultiPrefillHeadTiles ? params.h_q : T::kBlockM;
     p.h = p.h_h_k_ratio = 1;
     p.d = T::kHeadDim;
     p.d_v = T::kHeadDimV;
@@ -5349,7 +5353,7 @@ flash_sparse_prefill_fwd_hs64(__grid_constant__ const SparsePrefillParams params
     p.q_row_stride = params.stride_q_h_q;
     p.k_batch_stride = params.stride_kv_s_kv;
     p.k_row_stride = T::kHeadDim;
-    p.o_batch_stride = T::kBlockM * T::kHeadDimV;
+    p.o_batch_stride = p.seqlen_q * T::kHeadDimV;
     p.o_row_stride = T::kHeadDimV;
     p.indices_batch_stride = params.stride_indices_s_q;
     hs64_attention<T, false>(p, static_cast<float *>(params.max_logits));
@@ -5471,9 +5475,9 @@ void run_flash_sparse_decode_wg_kernel_hs64(
     }
 }
 
-template<int HeadDim, int Arch>
-void run_flash_sparse_prefill_fwd_hs64(SparsePrefillParams &params) {
-    using T = Hs64PrefillTraits<HeadDim, Arch>;
+template<int HeadDim, int Arch, bool GroupQueries, bool MultiHeadTiles>
+static void launch_sparse_prefill_hs64(SparsePrefillParams &params) {
+    using T = Hs64PrefillTraits<HeadDim, Arch, GroupQueries, MultiHeadTiles>;
     auto kernel = &flash_sparse_prefill_fwd_hs64<T>;
     constexpr size_t smem_size =
         std::max(sizeof(typename T::SharedMemoryPlan),
@@ -5483,8 +5487,27 @@ void run_flash_sparse_prefill_fwd_hs64(SparsePrefillParams &params) {
     const int grid_q = kHs64PrefillGroupedQueries<T>
         ? cute::ceil_div(params.s_q, kHs64PrefillQueriesPerCta)
         : params.s_q;
-    kernel<<<dim3(grid_q), T::NUM_THREADS, smem_size, params.stream>>>(params);
+    const int grid_h = MultiHeadTiles ? params.h_q / T::kBlockM : 1;
+    kernel<<<dim3(grid_q, grid_h), T::NUM_THREADS, smem_size, params.stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
+}
+
+template<int HeadDim, int Arch>
+void run_flash_sparse_prefill_fwd_hs64(SparsePrefillParams &params) {
+    // Small packed query batches lose parallelism when three queries share a
+    // CTA. Keep one query per CTA there and retain epilogue overlap on long Q.
+    const bool group_queries = Arch == 89 && HeadDim == 512 && params.s_q >= 1024;
+    if (params.h_q == 64) {
+        if (group_queries)
+            launch_sparse_prefill_hs64<HeadDim, Arch, true, false>(params);
+        else
+            launch_sparse_prefill_hs64<HeadDim, Arch, false, false>(params);
+    } else {
+        if (group_queries)
+            launch_sparse_prefill_hs64<HeadDim, Arch, true, true>(params);
+        else
+            launch_sparse_prefill_hs64<HeadDim, Arch, false, true>(params);
+    }
 }
 
 }  // namespace flashmla::dsa::hs64

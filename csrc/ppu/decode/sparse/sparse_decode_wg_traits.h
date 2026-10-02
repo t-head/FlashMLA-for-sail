@@ -422,6 +422,8 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
     // Unchecked prefetch is reserved for the host-selected full-tile path.
     static constexpr bool kGuardIndices = GuardIndices;
     static constexpr bool kIsPrefill = false;
+    static constexpr bool kGroupPrefillQueries = false;
+    static constexpr bool kMultiPrefillHeadTiles = false;
     static constexpr bool kParkQ5Fragment = false;
     static constexpr int kHeadDim = HeadDimK;
     static constexpr int kBlockM = 64;
@@ -680,11 +682,15 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
     };
 };
 
-// Prefill assigns one complete sparse query to each CTA, without split-KV.
-template<int HeadDimK, int Arch = 89>
+// Each CTA owns one M64 head tile, without split-KV. Query grouping is
+// selected by the launcher only when enough independent CTAs remain.
+template<int HeadDimK, int Arch = 89, bool GroupQueries = true,
+         bool MultiHeadTiles = false>
 struct Hs64PrefillTraits : public Hs64Traits<HeadDimK, false, Arch> {
     using Base = Hs64Traits<HeadDimK, false, Arch>;
     static constexpr bool kIsPrefill = true;
+    static constexpr bool kGroupPrefillQueries = GroupQueries;
+    static constexpr bool kMultiPrefillHeadTiles = MultiHeadTiles;
     static constexpr bool kParkQ5Fragment = HeadDimK == 512 && Arch == 89;
 
     // Keep the exact paired-Q5 register image after raw Q4..Q7 becomes an
