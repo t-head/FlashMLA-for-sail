@@ -3549,24 +3549,23 @@ __forceinline__ __device__ void wg0_subroutine(
     auto sV_remote = make_tensor(cur_sK1.data(), (typename T::SmemLayoutVDirect){});
     Tensor sV1L = get_half_V<T, 0>(sV_remote);
 
-    if constexpr (kSplitEvenHighCopy && !IS_BLK0_LAST && !IS_BLK1_LAST) {
-        // The alternating next even-high bank is idle while the current
-        // high-V bank is still being read. Issue its copy before softmax.
-        auto scratch_base = hs64_even_high_scratch<T>(sQ);
-        auto buf0_tile4 = local_tile(
-            cur_sK0, Shape<Int<T::kBlockN>, _64>{}, Coord<_0, Int<4>>{});
-        auto next_high_base = even_high_in_scratch
-            ? buf0_tile4.data() : scratch_base;
-        Tensor next_sK0_high4 = make_tensor(
-            next_high_base, (typename T::SmemLayoutKHigh4){});
-        issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
-                         false, true, true, false, true>(
-            params, cur_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0],
-            idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
-            pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k,
-            &next_sK0_high4);
-    }
-
+    auto issue_next_even_high = [&](int future_block) {
+        if constexpr (kSplitEvenHighCopy && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+            auto scratch_base = hs64_even_high_scratch<T>(sQ);
+            auto buf0_tile4 = local_tile(
+                cur_sK0, Shape<Int<T::kBlockN>, _64>{}, Coord<_0, Int<4>>{});
+            auto next_high_base = even_high_in_scratch
+                ? buf0_tile4.data() : scratch_base;
+            Tensor next_sK0_high4 = make_tensor(
+                next_high_base, (typename T::SmemLayoutKHigh4){});
+            issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
+                             false, true, true, false, true>(
+                params, cur_sK0, batch_idx, future_block, seqlen_k, &barriers_K0[0],
+                idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+                pre_token_idx, future_block + 2, end_block_idx, extra_seqlen_k,
+                &next_sK0_high4);
+        }
+    };
     // Calc P0 = softmax(P0) and signal sScale0Ready before K load
     // (WG1 is waiting for sScale0Ready — arriving earlier lets WG1 start sooner)
     // rPb must carry the TiledMma's own C-fragment layout: (8,1) gives 16
@@ -3599,6 +3598,12 @@ __forceinline__ __device__ void wg0_subroutine(
     }
 
     // For M64, the CTA-wide bar.sync publishes sScale0/sM to WG1.
+
+    if constexpr (kSplitEvenHighCopy && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // Initial QK still reads raw Q4..Q7 in WG1. Keep the original CTA
+        // retirement boundary for that first high-bank overwrite.
+        if (block_idx == 0) issue_next_even_high(nxt_block0);
+    }
 
     if constexpr (kAltLow && !IS_BLK0_LAST && !IS_BLK1_LAST) {
         // Bar1 releases both WGs' previous-even remote-V readers before
@@ -3863,6 +3868,14 @@ __forceinline__ __device__ void wg0_subroutine(
                     cur_phase_K0, idx_in_warpgroup, wait_k0_high);
             }
             even_high_in_scratch ^= 1u;
+            if constexpr (kSplitEvenHighCopy) {
+                if (block_idx + 4 < end_block_idx) {
+                    // Current tail QK is complete; WG1 releases the old high
+                    // bank independently. Preload the following pair here.
+                    __ppu_barrier_sync(5, T::NUM_THREADS, 15u);
+                    issue_next_even_high(block_idx + 4);
+                }
+            }
         } else {
             warpgroup_cooperative_qkt_gemm<T, 2>(
                 sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, rQlow0,
@@ -4102,6 +4115,16 @@ __forceinline__ __device__ void wg1_subroutine(
         // D512 keeps the original fixed buf0 high-half source.
         warpgroup_cooperative_pv_gemm_remoteP<T>(
             sP0, sV1R, rO1, idx_in_warpgroup, wg_idx);
+    }
+
+    if constexpr (T::kIsPrefill && T::kArch == 89 && T::kIsCrossCut &&
+                  T::kHasExtraKTile && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        if (block_idx + 4 < end_block_idx) {
+            // Publish high-bank reader retirement without waiting for WG0's
+            // next QK, which receives this phase before reusing the bank.
+            static_assert(!T::kKeepQkWeaveBar5);
+            __ppu_barrier_arrive(5, T::NUM_THREADS, 15u);
+        }
     }
 
     if constexpr (kHs64LocalOddLow<T> && !IS_BLK0_LAST && !IS_BLK1_LAST) {
