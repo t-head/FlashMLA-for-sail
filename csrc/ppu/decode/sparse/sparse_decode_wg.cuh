@@ -1503,12 +1503,24 @@ __forceinline__ __device__ void store_o(
     }
 }
 
+// Internal address representation for aligned, main-only cache spans below 64GiB.
+template<typename T>
+struct CompactKAddrTraits : T { using Bf16KAddr = uint32_t; };
+template<typename T, typename = void>
+struct WgKAddrType { using type = typename T::InputT*; };
+template<typename T>
+struct WgKAddrType<T, std::void_t<typename T::Bf16KAddr>> {
+    using type = typename T::Bf16KAddr;
+};
+template<typename T>
+using WgKAddr = typename WgKAddrType<T>::type;
+
 // Phase 1: Compute token_ptr from pre_token_idx + write smem_valid_indices.
 // Does NOT issue cp.async, does NOT write to sK buffer.
 // Can be placed anywhere (fills SIMT gaps during TC execution).
 // Compile-time version: for mainloop (USE_EXTRA as template param)
 template<int S, bool USE_EXTRA, typename T, typename TensorVI>
-__forceinline__ __device__ typename T::InputT* compute_K_addr_bf16(
+__forceinline__ __device__ WgKAddr<T> compute_K_addr_bf16(
     const Flash_fwd_mla_params &params,
     int batch_idx,
     int block_idx_kv,
@@ -1556,21 +1568,31 @@ __forceinline__ __device__ typename T::InputT* compute_K_addr_bf16(
 
     // k_stride_elems set above via if constexpr
 
-    InputT* token_ptr = k_base_ptr + (tidx % 8) * 8;
-    if (is_valid) {
-        int page_idx    = t_idx >> __builtin_ctz(page_block_size); // t_idx / page_block_size;
-        int off_in_page = t_idx & ((page_block_size & (-page_block_size)) - 1); // t_idx - page_idx * page_block_size;
-        token_ptr = k_base_ptr
-            + page_idx * k_stride_elems
-            + off_in_page * (kBytesPerToken / sizeof(InputT))
-            + (tidx % 8) * 8;
+    if constexpr (std::is_same_v<WgKAddr<T>, uint32_t>) {
+        // Host guard proves all defined cache addresses fit uint32 units of 16B.
+        // Compact kernels are main-only; default kernels keep full pointers.
+        static_assert(sizeof(InputT) == 2 && kBytesPerToken % 16 == 0);
+        const uint32_t lane = uint32_t(tidx % 8);
+        if (!is_valid) return lane;
+        const uint32_t page = uint32_t(t_idx >> __builtin_ctz(page_block_size));
+        const uint32_t row = uint32_t(t_idx & ((page_block_size & (-page_block_size)) - 1));
+        return page * uint32_t(k_stride_elems / 8) +
+               row * uint32_t(kBytesPerToken / 16) + lane;
+    } else {
+        InputT* token_ptr = k_base_ptr + (tidx % 8) * 8;
+        if (is_valid) {
+            int page_idx = t_idx >> __builtin_ctz(page_block_size);
+            int off_in_page = t_idx & ((page_block_size & (-page_block_size)) - 1);
+            token_ptr = k_base_ptr + page_idx * k_stride_elems +
+                off_in_page * (kBytesPerToken / sizeof(InputT)) + (tidx % 8) * 8;
+        }
+        return token_ptr;
     }
-    return token_ptr;
 }
 
 // Runtime version: for prolog (use_extra as runtime param)
 template<int S, typename T, typename TensorVI>
-__forceinline__ __device__ typename T::InputT* compute_K_addr_bf16_dynamic(
+__forceinline__ __device__ WgKAddr<T> compute_K_addr_bf16_dynamic(
     const Flash_fwd_mla_params &params,
     int batch_idx,
     int block_idx_kv,
@@ -1618,7 +1640,7 @@ __forceinline__ __device__ void issue_K_load_bf16(
     __mbarrier_t *barriers_K,
     int tidx,
     int ori_block_max,
-    typename T::InputT* token_ptr,
+    WgKAddr<T> token_addr,
     bool is_valid,
     int *pre_token_idx,
     int next_block_idx,
@@ -1643,7 +1665,11 @@ __forceinline__ __device__ void issue_K_load_bf16(
             Shape<Int<kBlockN>, Int<T::kHeadDim>>{},
             make_stride(params.k_row_stride, _1{}));
         Tensor tKgK_tok = gmem_thr_copy_K.partition_S(gK_tok);
-        tKgK_tok.data() = token_ptr;
+        if constexpr (std::is_same_v<WgKAddr<T>, uint32_t>) {
+            tKgK_tok.data() = k_base_ptr + uint64_t(token_addr) * 8;
+        } else {
+            tKgK_tok.data() = token_addr;
+        }
 
         gmem_tiled_copy_K.pred = is_valid;
         if constexpr (T::CvtGemmSwzlLd) {
@@ -1697,7 +1723,7 @@ __forceinline__ __device__ void load_K_tiles_bf16(
     bool use_extra = (ori_block_max >= 0) && (block_idx_kv >= ori_block_max);
     bool prefetch_use_extra = (ori_block_max >= 0) && (next_block_idx >= ori_block_max);
     bool is_valid;
-    typename T::InputT* token_ptr = compute_K_addr_bf16_dynamic<S, T>(
+    WgKAddr<T> token_ptr = compute_K_addr_bf16_dynamic<S, T>(
         params, batch_idx, block_idx_kv, seqlen_k, tidx, ori_block_max,
         smem_valid_indices, vi_buf, pre_token_idx, extra_seqlen_k, is_valid, use_extra);
     
@@ -2060,8 +2086,8 @@ __forceinline__ __device__ void wg0_subroutine(
     int *pre_token_idx,
     int *pre_token_idx_b,
     int extra_seqlen_k,
-    typename T::InputT* &precomp_ptr0,
-    typename T::InputT* &precomp_ptr1,
+    WgKAddr<T> &precomp_ptr0,
+    WgKAddr<T> &precomp_ptr1,
     bool &precomp_valid0,
     bool &precomp_valid1
 ) {
@@ -2297,8 +2323,8 @@ __forceinline__ __device__ void wg1_subroutine(
     int *pre_token_idx,
     int *pre_token_idx_b,
     int extra_seqlen_k,
-    typename T::InputT* &precomp_ptr0,
-    typename T::InputT* &precomp_ptr1,
+    WgKAddr<T> &precomp_ptr0,
+    WgKAddr<T> &precomp_ptr1,
     bool &precomp_valid0,
     bool &precomp_valid1
 ) {
@@ -2840,8 +2866,8 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
             int idx = 0;
 
             // Precomputed K addresses for SIMT/TC overlap
-            InputT* precomp_ptr0 = nullptr;
-            InputT* precomp_ptr1 = nullptr;
+            WgKAddr<T> precomp_ptr0{};
+            WgKAddr<T> precomp_ptr1{};
             bool precomp_valid0 = false;
             bool precomp_valid1 = false;
 
@@ -2906,8 +2932,8 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
             int idx = 0;
 
             // Precomputed K addresses for SIMT/TC overlap (WG1)
-            InputT* precomp_ptr0_wg1 = nullptr;
-            InputT* precomp_ptr1_wg1 = nullptr;
+            WgKAddr<T> precomp_ptr0_wg1{};
+            WgKAddr<T> precomp_ptr1_wg1{};
             bool precomp_valid0_wg1 = false;
             bool precomp_valid1_wg1 = false;
 
@@ -3237,6 +3263,23 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
             use_metadata_stripe2 = int64_t(sm_count) == physical_parts;
         }
     }
+    bool use_compact_k_addr = false;
+    if constexpr (Arch == 89 && !IsFP8 && BlockM == 128 &&
+                  std::is_same_v<InputT, cutlass::bfloat16_t>) {
+        const int64_t launched_parts = int64_t(params.num_sm_parts) *
+                                       (use_metadata_stripe2 ? 2 : 1);
+        // Amortize pointer reconstruction over at least 128 N32 tiles per CTA.
+        if (launched_parts > 0 && int64_t(params.b) * params.topk > launched_parts * 4096 &&
+            params.extra_topk <= 0 && params.extra_k_ptr == nullptr &&
+            params.num_blocks > 0 && params.page_block_size > 0 &&
+            params.k_batch_stride > 0 && (params.k_batch_stride & 7) == 0) {
+            const uint64_t stride_units = uint64_t(params.k_batch_stride) / 8;
+            const uint64_t tail_units = uint64_t(params.page_block_size) *
+                                        uint64_t(params.d / 8) - 1;
+            use_compact_k_addr = tail_units <= UINT32_MAX && stride_units <= UINT32_MAX &&
+                uint64_t(params.num_blocks - 1) <= (UINT32_MAX - tail_units) / stride_units;
+        }
+    }
     // [SPARSE-WI Stage B] BOOL_SWITCH on is_causal removed -- only one
     // instantiation; sparse path ignores params.is_causal.
     if (params.d == 576) {
@@ -3245,6 +3288,10 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
         using T = Traits_v2<InputT, 576, IsFP8, BlockM>;
 
         auto mla_kernel = &flash_sparse_decode_wg_kernel<T>;
+        if constexpr (Arch == 89 && !IsFP8 && BlockM == 128 &&
+                      std::is_same_v<InputT, cutlass::bfloat16_t>) {
+            if (use_compact_k_addr) mla_kernel = &flash_sparse_decode_wg_kernel<CompactKAddrTraits<T>>;
+        }
         int launch_parts = params.num_sm_parts;
         if constexpr (Arch == 89 && !IsFP8 && BlockM == 128 &&
                       std::is_same_v<InputT, cutlass::bfloat16_t>) {
@@ -3311,6 +3358,10 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
         using T = Traits_v2<InputT, 512, IsFP8, BlockM>;
 
         auto mla_kernel = &flash_sparse_decode_wg_kernel<T>;
+        if constexpr (Arch == 89 && !IsFP8 && BlockM == 128 &&
+                      std::is_same_v<InputT, cutlass::bfloat16_t>) {
+            if (use_compact_k_addr) mla_kernel = &flash_sparse_decode_wg_kernel<CompactKAddrTraits<T>>;
+        }
         int launch_parts = params.num_sm_parts;
         if constexpr (Arch == 89 && !IsFP8 && BlockM == 128 &&
                       std::is_same_v<InputT, cutlass::bfloat16_t>) {
