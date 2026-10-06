@@ -1,7 +1,7 @@
 """Native precision and metadata regression for the SM89 BF16 WG128 route.
 
-The large single-query case must schedule one partition per physical SM.
-Boundary and unchanged-route cases protect the legacy scheduler contract.
+The kernel may expand its launch grid while retaining the original metadata
+partition count. Check native output/LSE and reuse of that unchanged metadata.
 """
 import argparse
 import dataclasses
@@ -55,7 +55,7 @@ def test_flash_mla_sparse_scheduler(raw, expected_parts):
     assert passed, "Native output/LSE precision regression"
 
 
-def main(loops=1, seed_offset=0):
+def main(loops=1, seed_offset=0, shard=0, shards=1):
     torch.cuda.set_device(0)
     capability = torch.cuda.get_device_capability()
     if capability != (8, 9):
@@ -73,19 +73,20 @@ def main(loops=1, seed_offset=0):
         b=74, h_q=128, s_q=1, h_kv=1, s_kv=8192, is_varlen=True,
         topk=512, is_fp8=False, enable_attn_sink=True, block_size=64,
         d_qk=576, d_v=512, check_correctness=True, num_runs=0)
-    # B4 * TopK == SM_count * 256 must retain the old count because the
-    # dispatch uses strict >. One additional 64-token block crosses it.
-    boundary_k = sm_count * 64
-    boundary_source_k = max(8192, boundary_k + 64)
-    cases = [
-        ("single_query_all_SMs", base, sm_count),
-        ("work_boundary_equal", dataclasses.replace(
-            base, b=4, topk=boundary_k, s_kv=boundary_source_k),
-         legacy_h128_parts),
-        ("work_boundary_above", dataclasses.replace(
-            base, b=4, topk=boundary_k + 64, s_kv=boundary_source_k),
-         sm_count),
-        ("multi_query_unchanged", dataclasses.replace(base, s_q=3),
+    cases = []
+    for dim in (512, 576):
+        cur = dataclasses.replace(base, d_qk=dim)
+        for batch in (35, 36, 37, 74):
+            cases.append((f"d{dim}_b{batch}", dataclasses.replace(cur, b=batch),
+                          legacy_h128_parts))
+        cases.append((f"d{dim}_small_batch_long_K", dataclasses.replace(
+            cur, b=1, topk=16384, s_kv=32768), legacy_h128_parts))
+        cases.append((f"d{dim}_Sq2", dataclasses.replace(cur, s_q=2),
+                      legacy_h128_parts))
+    cases += [
+        ("variable_main_extra", dataclasses.replace(
+            base, d_qk=512, have_topk_length=True, extra_s_k=2048,
+            extra_topk=512, extra_block_size=64, have_extra_topk_length=True),
          legacy_h128_parts),
         ("page_fallback_unchanged", dataclasses.replace(base, block_size=61),
          legacy_h128_parts),
@@ -93,21 +94,28 @@ def main(loops=1, seed_offset=0):
         ("H192_unchanged", dataclasses.replace(base, h_q=192),
          legacy_h192_parts),
     ]
-    next_seed = seed_offset
+    completed = 0
     for loop in range(loops):
-        for name, raw, expected_parts in cases:
+        for index, (name, raw, expected_parts) in enumerate(cases):
+            if index % shards != shard:
+                continue
             print(f"ROUND {loop} CASE {name}", flush=True)
             test_flash_mla_sparse_scheduler(
-                dataclasses.replace(raw, seed=next_seed), expected_parts)
-            next_seed += 1
-    print(f"PASS {loops * len(cases)} SM89 native scheduler cases", flush=True)
+                dataclasses.replace(raw, seed=seed_offset + loop * len(cases) + index),
+                expected_parts)
+            completed += 1
+    print(f"PASS {completed} SM89 native scheduler cases", flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--loops", type=int, default=1)
     parser.add_argument("--seed-offset", type=int, default=0)
+    parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--shards", type=int, default=1)
     args = parser.parse_args()
     if args.loops < 1:
         parser.error("--loops must be positive")
-    main(args.loops, args.seed_offset)
+    if args.shards < 1 or not 0 <= args.shard < args.shards:
+        parser.error("Require --shards >= 1 and 0 <= --shard < --shards")
+    main(args.loops, args.seed_offset, args.shard, args.shards)

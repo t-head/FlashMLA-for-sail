@@ -2474,7 +2474,9 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
 
     const int m_block_idx = blockIdx.x;
     const int k_head_idx = blockIdx.y;
-    const int partition_idx = blockIdx.z;
+    // Keep the parent's metadata identity; child parity changes only batch ownership.
+    const int partition_idx = blockIdx.z / T::kMetadataStripeFactor;
+    const int metadata_stripe_idx = blockIdx.z % T::kMetadataStripeFactor;
     const int warpgroup_idx = __builtin_ppu_to_uniform_b32(threadIdx.x / 256);
     const int idx_in_warpgroup = threadIdx.x % 256;
     const int warp_idx = __builtin_ppu_to_uniform_b32(threadIdx.x / 32);
@@ -2554,12 +2556,20 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
         return;
     int begin_n_split_idx = *(tile_scheduler_metadata_ptr + 4);
 
-    // Copy the first Q
-    launch_q_copy<T>(params, begin_idx, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
+    // Descriptor begin/end stay unchanged: they still identify partial K ranges
+    // and the original begin_n_split_idx. Only the first owned batch is shifted.
+    const int first_batch_idx = begin_idx + metadata_stripe_idx;
+    if constexpr (T::kMetadataStripeFactor > 1) {
+        // CTA-uniform exit before any Q load for an empty child stripe.
+        if (first_batch_idx > end_idx || first_batch_idx >= params.b) return;
+    }
+    // Copy the first owned Q.
+    launch_q_copy<T>(params, first_batch_idx, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
 
 #pragma unroll 1
 #pragma clang loop licm(disable)
-    for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
+    for (int batch_idx = first_batch_idx; batch_idx <= end_idx;
+         batch_idx += T::kMetadataStripeFactor) {
         constexpr int kBlockN = T::kBlockN;
         const int n_split_idx = batch_idx == begin_idx ? begin_n_split_idx : 0;
         int seqlen_k;
@@ -3073,10 +3083,10 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
                 }
             }
 
-            if (batch_idx + 1 <= end_idx) {
+            if (batch_idx + T::kMetadataStripeFactor <= end_idx) {
                 // Skip mbarrier reinit: barrier phases are consistent across batches.
                 // store_o<T, true> writes directly to GMEM, no sO_addr SMEM race.
-                launch_q_copy<T>(params, batch_idx + 1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
+                launch_q_copy<T>(params, batch_idx + T::kMetadataStripeFactor, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
             } else {
                 // Allow the next kernel (the combine kernel) to launch
                 // The next kernel MUST be the combine kernel
@@ -3115,7 +3125,7 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
 
             store_o<T, false>(rO, gOAccum, output_norm, sO_addr, params, batch_idx, k_head_idx, m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
 
-            if (batch_idx + 1 <= end_idx) {
+            if (batch_idx + T::kMetadataStripeFactor <= end_idx) {
                 // Keep mbarrier reinit for split path (store_o<T,false> uses sO_addr)
                 if (threadIdx.x == 0) {
                     __mbarrier_init(barrier_Q, 32 * (T::kBlockM / T::kBlockMPerLoad));
@@ -3127,13 +3137,21 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
                 }
                 __syncthreads();
                 cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
-                launch_q_copy<T>(params, batch_idx + 1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
+                launch_q_copy<T>(params, batch_idx + T::kMetadataStripeFactor, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
             } else {
                 // Allow the next kernel (the combine kernel) to launch
             }
         }
-        if (batch_idx != end_idx)
-            __syncthreads();
+        if constexpr (T::kMetadataStripeFactor > 1) {
+            // A child's last batch may be end_idx-1. Do not prefetch or reset
+            // phases for the other child, or retain an unmatched async Q copy.
+            if (batch_idx + T::kMetadataStripeFactor <= end_idx)
+                __syncthreads();
+        } else {
+            // Keep the original generic image's exact terminal condition.
+            if (batch_idx != end_idx)
+                __syncthreads();
+        }
     }
 }
 
@@ -3143,6 +3161,24 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
     if constexpr (!IsFP8) {
         FLASH_ASSERT(params.ngroups > 0 && params.ngroups % BlockM == 0);
     }
+    // Correct the internal launch geometry without changing API metadata,
+    // num_splits, scratch capacity, or params.num_sm_parts. Host SDK version
+    // 10000 differs from device10500, so use explicit type/Arch scope here.
+    bool use_metadata_stripe2 = false;
+    if constexpr (Arch == 89 && !IsFP8 && BlockM == 128 &&
+                  std::is_same_v<InputT, cutlass::bfloat16_t>) {
+        const int64_t physical_parts = int64_t(params.num_sm_parts) * 2;
+        const int64_t kv_tokens = int64_t(params.topk) + std::max(params.extra_topk, 0);
+        if (params.ngroups == 128 && params.h == 1 && params.q_orig == 1 &&
+            params.seqlen_q == 128 && params.num_sm_parts > 0 &&
+            int64_t(params.b) >= physical_parts &&
+            int64_t(params.b) * kv_tokens > physical_parts * 256) {
+            int sm_count = get_num_sm(get_current_device());
+            // Match the existing launcher's legacy810E normalization.
+            if (sm_count == 64) sm_count = 20;
+            use_metadata_stripe2 = int64_t(sm_count) == physical_parts;
+        }
+    }
     // [SPARSE-WI Stage B] BOOL_SWITCH on is_causal removed -- only one
     // instantiation; sparse path ignores params.is_causal.
     if (params.d == 576) {
@@ -3151,6 +3187,19 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
         using T = Traits_v2<InputT, 576, IsFP8, BlockM>;
 
         auto mla_kernel = &flash_sparse_decode_wg_kernel<T>;
+        int launch_parts = params.num_sm_parts;
+        if constexpr (Arch == 89 && !IsFP8 && BlockM == 128 &&
+                      std::is_same_v<InputT, cutlass::bfloat16_t>) {
+            using StripeT = MetadataStripeTraits<T>;
+            static_assert(sizeof(typename StripeT::SharedMemoryPlan) ==
+                          sizeof(typename T::SharedMemoryPlan));
+            static_assert(sizeof(typename StripeT::SharedMemoryOutPut) ==
+                          sizeof(typename T::SharedMemoryOutPut));
+            if (use_metadata_stripe2) {
+                mla_kernel = &flash_sparse_decode_wg_kernel<StripeT>;
+                launch_parts = params.num_sm_parts * 2;
+            }
+        }
         constexpr size_t smem_size = std::max(sizeof(typename T::SharedMemoryPlan), sizeof(typename T::SharedMemoryOutPut));
 
         hggcFuncSetAttribute(mla_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
@@ -3176,9 +3225,9 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
             // [SPARSE-WI Stage B] Is_causal removed; sparse decode is mask-by-indices.
             printf("Is_causal:%d (sparse: ignored)\n", int(params.is_causal));
             printf("grid_n[%d, %d, %d]\n",
-                    num_m_block, params.h, params.num_sm_parts);
+                    num_m_block, params.h, launch_parts);
             printf("verg:%d, stack:%d, sm:%d, occpuancy:%0.3f, Arch:%d\n", int(attr.numRegs), int(attr.localSizeBytes), sm_count,
-                    float(num_m_block * params.h * params.num_sm_parts) / float(sm_count * ctas_per_sm), Arch);
+                    float(num_m_block * params.h * launch_parts) / float(sm_count * ctas_per_sm), Arch);
         }
 
         // Use hggcLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
@@ -3186,7 +3235,7 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
         mla_kernel_attributes[0].id = hggcLaunchAttributeProgrammaticStreamSerialization;
         mla_kernel_attributes[0].val.programmaticStreamSerializationAllowed = 1;
         hggcLaunchConfig_t mla_kernel_config = {
-            dim3(num_m_block, params.h, params.num_sm_parts),
+            dim3(num_m_block, params.h, launch_parts),
             dim3(T::NUM_THREADS, 1, 1),
             smem_size,
             stream,
@@ -3203,6 +3252,19 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
         using T = Traits_v2<InputT, 512, IsFP8, BlockM>;
 
         auto mla_kernel = &flash_sparse_decode_wg_kernel<T>;
+        int launch_parts = params.num_sm_parts;
+        if constexpr (Arch == 89 && !IsFP8 && BlockM == 128 &&
+                      std::is_same_v<InputT, cutlass::bfloat16_t>) {
+            using StripeT = MetadataStripeTraits<T>;
+            static_assert(sizeof(typename StripeT::SharedMemoryPlan) ==
+                          sizeof(typename T::SharedMemoryPlan));
+            static_assert(sizeof(typename StripeT::SharedMemoryOutPut) ==
+                          sizeof(typename T::SharedMemoryOutPut));
+            if (use_metadata_stripe2) {
+                mla_kernel = &flash_sparse_decode_wg_kernel<StripeT>;
+                launch_parts = params.num_sm_parts * 2;
+            }
+        }
         constexpr size_t smem_size = std::max(sizeof(typename T::SharedMemoryPlan), sizeof(typename T::SharedMemoryOutPut));
 
         hggcFuncSetAttribute(mla_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
@@ -3227,9 +3289,9 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
                     T::kBlockM, T::kBlockN, T::NUM_THREADS, params.page_block_size);
             printf("Is_causal:%d (sparse: ignored)\n", int(params.is_causal));
             printf("grid_n[%d, %d, %d]\n",
-                    num_m_block, params.h, params.num_sm_parts);
+                    num_m_block, params.h, launch_parts);
             printf("verg:%d, stack:%d, sm:%d, occpuancy:%0.3f, Arch:%d\n", int(attr.numRegs), int(attr.localSizeBytes), sm_count,
-                    float(num_m_block * params.h * params.num_sm_parts) / float(sm_count * ctas_per_sm), Arch);
+                    float(num_m_block * params.h * launch_parts) / float(sm_count * ctas_per_sm), Arch);
         }
 
         // Use hggcLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
@@ -3237,7 +3299,7 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
         mla_kernel_attributes[0].id = hggcLaunchAttributeProgrammaticStreamSerialization;
         mla_kernel_attributes[0].val.programmaticStreamSerializationAllowed = 1;
         hggcLaunchConfig_t mla_kernel_config = {
-            dim3(num_m_block, params.h, params.num_sm_parts),
+            dim3(num_m_block, params.h, launch_parts),
             dim3(T::NUM_THREADS, 1, 1),
             smem_size,
             stream,

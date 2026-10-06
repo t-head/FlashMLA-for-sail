@@ -82,11 +82,10 @@ get_num_sm_parts(
     const int num_heads_per_head_k,
     const int num_heads_k,
     const int batch,
-    bool is_sparse_attn,
-    int sparse_block_size_m = 64
+    bool is_sparse_attn
 ) {
-    // Sparse callers may override the legacy M64 model when their selected
-    // kernel uses a different M tile.
+    // This should match the logic in the MLA kernel.
+    //static constexpr int block_size_m = 64;
     int block_size_m;
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -98,7 +97,7 @@ get_num_sm_parts(
         sm_count = 20;
     }
     if (is_sparse_attn) {
-        block_size_m = sparse_block_size_m;
+        block_size_m = 64;
         occupancy = 1;
     } else if (!is_sm89_or_newer()) {
         block_size_m = num_heads_per_head_k > 64 ? 128 : (num_heads_per_head_k <= 32 ? (num_heads_per_head_k + 16 - 1) / 16 * 16: 64);

@@ -115,6 +115,8 @@ struct Traits_v2 : public Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE
 
     // Whether the KV cache stores FP8 (with dequant) or BF16 (direct read).
     static constexpr bool IsFP8 = IsFP8_;
+    // Original metadata images process each parent's batch interval contiguously.
+    static constexpr int kMetadataStripeFactor = 1;
 
     // Shadow Base::kHeadDim with template parameter
     static constexpr int kHeadDim = HeadDimK;
@@ -339,6 +341,17 @@ struct Traits_v2 : public Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE
         __mbarrier_t barriers_K0[kNumKBarriers];
         __mbarrier_t barriers_K1[kNumKBarriers];
     };
+};
+
+// Two private CTAs process alternate batch atoms of one unchanged metadata row.
+// Precision, layouts, K ranges and split-output slots are inherited from T.
+template<typename T>
+struct MetadataStripeTraits : public T {
+    static_assert(!T::IsFP8 && T::kBlockM == 128 &&
+                  (T::kHeadDim == 512 || T::kHeadDim == 576) &&
+                  std::is_same_v<typename T::InputT, cutlass::bfloat16_t>,
+                  "MetadataStripeTraits is BF16 D512/D576 M128 only");
+    static constexpr int kMetadataStripeFactor = 2;
 };
 
 namespace flashmla::dsa::hs64 {
