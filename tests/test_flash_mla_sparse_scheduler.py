@@ -1,7 +1,7 @@
-"""Native precision and metadata regression for the SM89 BF16 WG128 route.
+"""Native precision and reuse regression for host-selected sparse Decode tiles.
 
-The kernel may expand its launch grid while retaining the original metadata
-partition count. Check native output/LSE and reuse of that unchanged metadata.
+Check metadata partition counts at WG128 work thresholds and across queries,
+using the original native generators, reference and precision tolerances.
 """
 import argparse
 import dataclasses
@@ -67,8 +67,8 @@ def main(loops=1, seed_offset=0, shard=0, shards=1):
     torch.set_num_threads(1)
     props = torch.cuda.get_device_properties(0)
     sm_count = 20 if "810E" in props.name else props.multi_processor_count
-    legacy_h128_parts = sm_count // math.gcd(2, sm_count)
-    legacy_h192_parts = sm_count // math.gcd(3, sm_count)
+    h128_sq2_parts = sm_count // math.gcd(2, sm_count)
+    h192_parts = sm_count // math.gcd(3, sm_count)
     base = lib.RawTestParamForDecode(
         b=74, h_q=128, s_q=1, h_kv=1, s_kv=8192, is_varlen=True,
         topk=512, is_fp8=False, enable_attn_sink=True, block_size=64,
@@ -78,21 +78,43 @@ def main(loops=1, seed_offset=0, shard=0, shards=1):
         cur = dataclasses.replace(base, d_qk=dim)
         for batch in (35, 36, 37, 74):
             cases.append((f"d{dim}_b{batch}", dataclasses.replace(cur, b=batch),
-                          legacy_h128_parts))
+                          sm_count))
         cases.append((f"d{dim}_small_batch_long_K", dataclasses.replace(
-            cur, b=1, topk=16384, s_kv=32768), legacy_h128_parts))
+            cur, b=1, topk=16384, s_kv=32768), sm_count))
         cases.append((f"d{dim}_Sq2", dataclasses.replace(cur, s_q=2),
-                      legacy_h128_parts))
+                      h128_sq2_parts))
     cases += [
         ("variable_main_extra", dataclasses.replace(
             base, d_qk=512, have_topk_length=True, extra_s_k=2048,
             extra_topk=512, extra_block_size=64, have_extra_topk_length=True),
-         legacy_h128_parts),
+         sm_count),
         ("page_fallback_unchanged", dataclasses.replace(base, block_size=61),
-         legacy_h128_parts),
+         h128_sq2_parts),
         ("H64_unchanged", dataclasses.replace(base, h_q=64), sm_count),
         ("H192_unchanged", dataclasses.replace(base, h_q=192),
-         legacy_h192_parts),
+         h192_parts),
+    ]
+    # At equality the candidate WG128 is rejected. Its fallback's smaller
+    # partition count must not make dispatch select WG128 again.
+    for dim in (512, 576):
+        for sq in (1, 2, 3):
+            wg_parts = sm_count // math.gcd(sq, sm_count)
+            fallback_parts = sm_count // math.gcd(2 * sq, sm_count)
+            threshold_batch = wg_parts * (256 if sq == 1 else 512) // 512
+            cases.append((f"d{dim}_Sq{sq}_work_below_or_equal", dataclasses.replace(
+                base, d_qk=dim, s_q=sq, b=threshold_batch), fallback_parts))
+            cases.append((f"d{dim}_Sq{sq}_work_above", dataclasses.replace(
+                base, d_qk=dim, s_q=sq, b=threshold_batch + 1), wg_parts))
+    cases += [
+        ("H192_Sq2", dataclasses.replace(base, h_q=192, s_q=2),
+         sm_count // math.gcd(6, sm_count)),
+        ("H16_Sq2_fallback_M32", dataclasses.replace(base, h_q=16, s_q=2),
+         sm_count // math.gcd(2, sm_count)),
+        ("H256_Sq2", dataclasses.replace(base, h_q=256, s_q=2),
+         sm_count // math.gcd(4, sm_count)),
+        ("H256_Sq2_small_batch", dataclasses.replace(
+            base, h_q=256, s_q=2, b=3, topk=8192, s_kv=16384),
+         max(1, sm_count // 4)),
     ]
     completed = 0
     for loop in range(loops):

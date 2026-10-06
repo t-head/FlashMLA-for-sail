@@ -21,7 +21,7 @@
 #include "kerutils/device/ppu/dequant.cuh"
 #include "utils.h"
 #include "ppuxx/decode/combine/combine.cuh"
-#include "decode/sparse/sparse_decode_wg.h"
+#include "decode/sparse/sparse_decode_dispatch.h"
 #include "kerutils/host/host.h"
 
 #include <hggc_ad.h>
@@ -1115,25 +1115,12 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
         // M128 requires complete head tiles and supports multiple queries.
         // HS64 handles an odd number of complete M64 head tiles per query.
         // Both paths require power-of-two page sizes; other cases fall back.
-        const bool kCanWI = is_sm89_or_newer();
-        // Short split-KV partitions cannot amortize the M128 WI pipeline.
-        // The legacy M64 kernel uses the same 64-token metadata quantum.
-        const int64_t kv_tokens = int64_t(params.topk) + std::max(params.extra_topk, 0);
-        const int min_kv_per_part = params.seqlen_q > params.ngroups ? 512 : 256;
-        const bool m128_has_enough_work =
-            int64_t(params.b) * kv_tokens > int64_t(params.num_sm_parts) * min_kv_per_part;
-        const bool wi_enable_m128 = kCanWI
-            && m128_has_enough_work
-            && (params.ngroups > 0 && params.ngroups % 128 == 0)
-            && (params.page_block_size > 0)
-            && flashmla::dsa::sparse_decode_m128_index_tiles_supported(params);
-        const bool wi_enable_m64 = (params.ngroups % 128 == 64)
-            && (params.page_block_size > 0)
-            && flashmla::dsa::sparse_decode_hs64_addressing_supported(params);
+        const auto dispatch_plan = flashmla::dsa::sparse_decode_dispatch_plan(
+            params, false, is_sm89_or_newer(), get_num_sm(get_current_device()));
         IS_PAGE_POWER2(params.page_block_size, params.extra_page_block_size, [&] {
-            if (wi_enable_m128 && kPagePow2) {
+            if (dispatch_plan.route == flashmla::dsa::SparseDecodeRoute::WG128 && kPagePow2) {
                 run_flash_sparse_decode_wg_kernel<T, 89, false, 128>(params, stream);
-            } else if (wi_enable_m64 && kPagePow2) {
+            } else if (dispatch_plan.route == flashmla::dsa::SparseDecodeRoute::HS64 && kPagePow2) {
                 flashmla::dsa::hs64::run_flash_sparse_decode_wg_kernel_hs64(
                     params, stream);
             } else {

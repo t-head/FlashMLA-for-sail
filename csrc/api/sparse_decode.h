@@ -9,7 +9,7 @@
 #include "common.h"
 #include "params.h"
 #include "kerutils/common/static_switch.h"
-#include "decode/sparse/sparse_decode_wg.h"
+#include "decode/sparse/sparse_decode_dispatch.h"
 
 template<typename T, bool IsFP8, int Headdim, int Headdim_V>
 void run_sparse_decode_fwd_dispatch(Flash_fwd_params &params, hggcStream_t stream);
@@ -35,49 +35,7 @@ sparse_attn_decode_interface(
                    kv.dtype() == torch::kInt8 ||
                    kv.dtype() == torch::kUInt8);
 
-    // ========== Phase 1: Lazy metadata ==========
-    if (!tile_scheduler_metadata.has_value()) {
-        at::cuda::CUDAGuard metadata_device_guard{q.device()};
-        const auto sizes = q.sizes();
-        const int batch_size = sizes[0];
-        const int num_heads_ori = sizes[2];
-        const int num_heads_k = kv.size(2);
-        TORCH_CHECK(num_heads_ori % num_heads_k == 0);
-        const int ngroups = num_heads_ori / num_heads_k;
-
-        int num_sm_parts = get_num_sm_parts(ngroups, num_heads_k, batch_size, /*is_sparse_attn=*/true);
-
-        // HS64 advances by 128 tokens. FP8 and the M128 WG kernel
-        // preserve main's original 64-token scheduler quantum.
-        int block_size_n = flashmla::dsa::sparse_decode_metadata_block_size_n(
-            ngroups, is_fp8);
-
-        static constexpr int fixed_overhead_num_blocks = 5;
-        auto options = q.options().dtype(torch::kInt32);
-        auto tile_scheduler_metadata_t = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
-        auto num_splits_t = torch::empty({batch_size + 1}, options);
-
-        auto meta_stream = at::cuda::getCurrentCUDAStream().stream();
-        Mla_metadata_params meta_params = {};
-        meta_params.seqlens_k_ptr = nullptr;
-        meta_params.tile_scheduler_metadata_ptr = tile_scheduler_metadata_t.data_ptr<int>();
-        meta_params.num_splits_ptr = num_splits_t.data_ptr<int>();
-        meta_params.batch_size = batch_size;
-        meta_params.block_size_n = block_size_n;
-        meta_params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
-        meta_params.num_sm_parts = num_sm_parts;
-        meta_params.topk = indices.size(-1);
-        meta_params.extra_topk = extra_indices.has_value() ? (int)extra_indices->size(-1) : 0;
-        meta_params.topk_length = topk_length.has_value() ? topk_length->data_ptr<int>() : nullptr;
-        meta_params.extra_topk_length = extra_topk_length.has_value() ? extra_topk_length->data_ptr<int>() : nullptr;
-
-        get_mla_metadata_func(meta_params, meta_stream);
-
-        tile_scheduler_metadata = tile_scheduler_metadata_t;
-        num_splits = num_splits_t;
-    }
-
-    // ========== Phase 2: Kernel dispatch ==========
+    // Validate inputs and fill dispatch params before choosing metadata geometry.
     at::cuda::CUDAGuard device_guard{q.device()};
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor >= 0;
@@ -255,6 +213,38 @@ sparse_attn_decode_interface(
                 topk, is_fp8, bool(params.attn_sink_ptr), topk_len_str,
                 params.extra_topk, extra_topk_len_str
             );
+    }
+
+    // New metadata uses the same route and M tiles as the compute dispatch.
+    // Supplied/reused metadata keeps its own row count and split boundaries.
+    if (!tile_scheduler_metadata.has_value()) {
+        const bool can_wg128 = is_sm89_or_newer();
+        const auto plan = flashmla::dsa::sparse_decode_dispatch_plan(
+            params, is_fp8, can_wg128, get_num_sm(get_current_device()));
+        const int num_sm_parts = !is_fp8 && can_wg128
+            ? plan.num_sm_parts
+            : get_num_sm_parts(ngroups, num_heads_k, batch_size, /*is_sparse_attn=*/true);
+        const int block_size_n = flashmla::dsa::sparse_decode_metadata_block_size_n(
+            ngroups, is_fp8);
+        static constexpr int fixed_overhead_num_blocks = 5;
+        auto options = q.options().dtype(torch::kInt32);
+        auto tile_scheduler_metadata_t = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
+        auto num_splits_t = torch::empty({batch_size + 1}, options);
+        Mla_metadata_params meta_params = {};
+        meta_params.seqlens_k_ptr = nullptr;
+        meta_params.tile_scheduler_metadata_ptr = tile_scheduler_metadata_t.data_ptr<int>();
+        meta_params.num_splits_ptr = num_splits_t.data_ptr<int>();
+        meta_params.batch_size = batch_size;
+        meta_params.block_size_n = block_size_n;
+        meta_params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
+        meta_params.num_sm_parts = num_sm_parts;
+        meta_params.topk = topk;
+        meta_params.extra_topk = std::max(params.extra_topk, 0);
+        meta_params.topk_length = params.topk_len_ptr;
+        meta_params.extra_topk_length = params.extra_topk_len_ptr;
+        get_mla_metadata_func(meta_params, stream);
+        tile_scheduler_metadata = tile_scheduler_metadata_t;
+        num_splits = num_splits_t;
     }
 
     // tile_scheduler
