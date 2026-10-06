@@ -47,6 +47,33 @@ sparse_attn_decode_interface(
 
         int num_sm_parts = get_num_sm_parts(ngroups, num_heads_k, batch_size, /*is_sparse_attn=*/true);
 
+        // The single-query BF16 WG128 grid has ceil(ngroups / 128) M tiles.
+        // Modeling it as M64 can leave half the device idle. Change only a
+        // route that remains WG128 under both partition counts: the dispatch
+        // work threshold itself depends on num_sm_parts.
+        if (!is_fp8 && sizes[1] == 1 && is_sm89_or_newer() &&
+                ngroups > 0 && ngroups % 128 == 0 && kv.size(1) > 0) {
+            Flash_fwd_params route_params {};
+            route_params.topk = indices.size(-1);
+            route_params.extra_topk = extra_indices.has_value()
+                ? int(extra_indices->size(-1)) : -1;
+            const int m128_parts = get_num_sm_parts(
+                ngroups, num_heads_k, batch_size, /*is_sparse_attn=*/true,
+                /*sparse_block_size_m=*/128);
+            const int64_t kv_tokens = int64_t(route_params.topk) +
+                std::max(route_params.extra_topk, 0);
+            const bool enough_work_for_both = int64_t(batch_size) * kv_tokens >
+                int64_t(std::max(num_sm_parts, m128_parts)) * 256;
+            if (enough_work_for_both &&
+                    flashmla::dsa::sparse_decode_m128_index_tiles_supported(route_params)) {
+                const int extra_page_size = extra_kv.has_value()
+                    ? int(extra_kv->size(1)) : 0;
+                IS_PAGE_POWER2(int(kv.size(1)), extra_page_size, [&] {
+                    if (kPagePow2) num_sm_parts = m128_parts;
+                });
+            }
+        }
+
         // HS64 advances by 128 tokens. FP8 and the M128 WG kernel
         // preserve main's original 64-token scheduler quantum.
         int block_size_n = flashmla::dsa::sparse_decode_metadata_block_size_n(
