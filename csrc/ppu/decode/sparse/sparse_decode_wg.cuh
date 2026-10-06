@@ -1607,7 +1607,8 @@ __forceinline__ __device__ const int* wg_query_indices_bf16(
 
 // Phase 2: Issue cp.async using precomputed token_ptr + prefetch next token index.
 // LOAD_USE_EXTRA removed: k_base_ptr is dummy (overwritten by token_ptr), only PREFETCH_USE_EXTRA matters
-template<int S, int E, bool PREFETCH_USE_EXTRA, typename T, bool DO_PREFETCH = true, typename TensorSK>
+template<int S, int E, bool PREFETCH_USE_EXTRA, typename T, bool DO_PREFETCH = true,
+         bool DO_COPY = true, bool DO_COMMIT = true, typename TensorSK>
 __forceinline__ __device__ void issue_K_load_bf16(
     const Flash_fwd_mla_params &params,
     TensorSK &sK_buf,
@@ -1629,26 +1630,33 @@ __forceinline__ __device__ void issue_K_load_bf16(
     constexpr int kBlockN          = Base::kBlockN;
     constexpr int kThreadsPerWg    = Base::NUM_THREADS / 2;
 
-    using KVCacheGmem = flash::KVCacheGmemBf16<InputT, kBlockN, kThreadsPerWg, T::kHeadDim>;
-    using GmemTiledCopyKNoAiu = typename KVCacheGmem::GmemTiledCopy;
-    GmemTiledCopyKNoAiu gmem_tiled_copy_K;
+    if constexpr (DO_COPY) {
+        using KVCacheGmem = flash::KVCacheGmemBf16<InputT, kBlockN, kThreadsPerWg, T::kHeadDim>;
+        using GmemTiledCopyKNoAiu = typename KVCacheGmem::GmemTiledCopy;
+        GmemTiledCopyKNoAiu gmem_tiled_copy_K;
 
-    // Dummy k_base_ptr — actual address comes from token_ptr (set below)
-    InputT* k_base_ptr = reinterpret_cast<InputT*>(params.k_ptr);
-    auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(tidx);
-    Tensor tKsK = gmem_thr_copy_K.partition_D(sK_buf);
-    Tensor gK_tok = make_tensor(make_gmem_ptr(k_base_ptr),
-        Shape<Int<kBlockN>, Int<T::kHeadDim>>{},
-        make_stride(params.k_row_stride, _1{}));
-    Tensor tKgK_tok = gmem_thr_copy_K.partition_S(gK_tok);
-    tKgK_tok.data() = token_ptr;
+        // Dummy k_base_ptr — actual address comes from token_ptr (set below)
+        InputT* k_base_ptr = reinterpret_cast<InputT*>(params.k_ptr);
+        auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(tidx);
+        Tensor tKsK = gmem_thr_copy_K.partition_D(sK_buf);
+        Tensor gK_tok = make_tensor(make_gmem_ptr(k_base_ptr),
+            Shape<Int<kBlockN>, Int<T::kHeadDim>>{},
+            make_stride(params.k_row_stride, _1{}));
+        Tensor tKgK_tok = gmem_thr_copy_K.partition_S(gK_tok);
+        tKgK_tok.data() = token_ptr;
 
-    gmem_tiled_copy_K.pred = is_valid;
-    if constexpr (T::CvtGemmSwzlLd) {
-        flash::launch_kv_pair_copy<S, E, T>(gmem_tiled_copy_K, tKgK_tok, sK_buf, tidx);
+        gmem_tiled_copy_K.pred = is_valid;
+        if constexpr (T::CvtGemmSwzlLd) {
+            flash::launch_kv_pair_copy<S, E, T>(gmem_tiled_copy_K, tKgK_tok, sK_buf, tidx);
+            if constexpr (DO_COMMIT) {
+                cutlass::arch::cpasync_barrier_arrive_noinc(barriers_K);
+            }
+        } else {
+            static_assert(DO_COMMIT, "Raw-copy specialization requires CvtGemmSwzlLd");
+            flash::launch_kv_tiles_wg<S, E>(gmem_tiled_copy_K, tKgK_tok, tKsK, barriers_K);
+        }
+    } else if constexpr (DO_COMMIT) {
         cutlass::arch::cpasync_barrier_arrive_noinc(barriers_K);
-    } else {
-        flash::launch_kv_tiles_wg<S, E>(gmem_tiled_copy_K, tKgK_tok, tKsK, barriers_K);
     }
 
     if constexpr (DO_PREFETCH) {
@@ -2309,14 +2317,25 @@ __forceinline__ __device__ void wg1_subroutine(
     auto sV_remote = make_tensor(cur_sK1.data(), (typename T::SmemLayoutVDirect){});
     Tensor sV1R = get_half_V<T, 1>(sV_remote);
 
-    // Cross-WG: wg1 loads tiles 4-8 for nxt_block1 at the very beginning.
-    // Does NOT write smem_valid_indices — wg0 writes it for the same block.
+    // Non-target paths retain their original early odd-high copy.
+    // This copy does not write the validity slot owned by WG0.
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
         constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem;
         if constexpr (!T::IsFP8) {
-            issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T>(params, nxt_sK1, batch_idx, nxt_block1, seqlen_k, &barriers_K1[1],
-                idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
-                pre_token_idx, nxt_block1 + 2, end_block_idx, extra_seqlen_k);
+            if constexpr (T::kBlockM == 128 && T::kUsePv4x2 &&
+                          T::CvtGemmSwzlLd &&
+                          std::is_same_v<typename T::InputT, cutlass::bfloat16_t>) {
+                // The payload was copied before this pair's QK. Commit exactly
+                // once here, with the unchanged next-index cache selection.
+                issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T, true, false, true>(params, nxt_sK1, batch_idx, nxt_block1, seqlen_k, &barriers_K1[1],
+                    idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+                    pre_token_idx, nxt_block1 + 2, end_block_idx, extra_seqlen_k);
+            } else if constexpr (!(T::kBlockM == 128 &&
+                            std::is_same_v<typename T::InputT, cutlass::bfloat16_t>)) {
+                issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T>(params, nxt_sK1, batch_idx, nxt_block1, seqlen_k, &barriers_K1[1],
+                    idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+                    pre_token_idx, nxt_block1 + 2, end_block_idx, extra_seqlen_k);
+            }
         } else {
             load_and_dequant_sparse_K_staged<4, kNumTiles, T>(
                 params, sK, batch_idx, nxt_block1, seqlen_k,
@@ -2331,6 +2350,18 @@ __forceinline__ __device__ void wg1_subroutine(
 
     // Wait for sScale0 from WG0 (delayed: cur_max already computed)
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
+
+    if constexpr (!T::IsFP8 && T::kBlockM == 128 &&
+                  std::is_same_v<typename T::InputT, cutlass::bfloat16_t> &&
+                  !(T::kUsePv4x2 && T::CvtGemmSwzlLd) &&
+                  !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // The next high bank held the previous pair's remote V. Reuse it
+        // only after every WG1 reader reaches the existing CTA rendezvous.
+        constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem;
+        issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T>(params, nxt_sK1, batch_idx, nxt_block1, seqlen_k, &barriers_K1[1],
+            idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+            pre_token_idx, nxt_block1 + 2, end_block_idx, extra_seqlen_k);
+    }
 
     // [BlockM=64 only] CTA-wide barrier for sScale0/sM cross-WG visibility.
     // Pairs with wg0's __syncthreads after its arrive(sScale0Ready).
@@ -2423,6 +2454,21 @@ __forceinline__ __device__ void wg1_subroutine(
 
     // Remote PV GEMM: reads sP0 (ready via sP0Ready) and sV0R
     warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup, wg_idx);
+
+    if constexpr (!T::IsFP8 && T::kBlockM == 128 && T::kUsePv4x2 &&
+                  T::CvtGemmSwzlLd &&
+                  std::is_same_v<typename T::InputT, cutlass::bfloat16_t> &&
+                  !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        if (block_idx + 4 < end_block_idx) {
+            // Rendezvous after the old high-bank reader calls. The next payload
+            // does not alias either bank used by the following QK.
+            __ppu_barrier_sync(7, 256, 15u);
+            constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem;
+            issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T, false, true, false>(params, cur_sK0, batch_idx, block_idx + 5, seqlen_k, &barriers_K1[1],
+                idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+                pre_token_idx, block_idx + 7, end_block_idx, extra_seqlen_k);
+        }
+    }
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
         cute::clear(rP1);
@@ -2876,6 +2922,18 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
                     params, batch_idx, start_block_idx + 2, seqlen_k,
                     idx_in_warpgroup, ori_block_max, smem_valid_indices, 0,
                     &pre_token_idx0, extra_seqlen_k, precomp_valid1_wg1, init_load_extra);
+                if constexpr (T::kBlockM == 128 && T::kUsePv4x2 &&
+                              T::CvtGemmSwzlLd &&
+                              std::is_same_v<typename T::InputT, cutlass::bfloat16_t>) {
+                    if (start_block_idx < end_block_idx - 2) {
+                        // The third bank has no previous reader on bootstrap.
+                        // Leave its commit and index prefetch in the first pair.
+                        constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem;
+                        issue_K_load_bf16<4, kNumTiles, false, T, false, true, false>(params, nxt_sK0, batch_idx, start_block_idx + 3, seqlen_k, &barriers_K1[1],
+                            idx_in_warpgroup, ori_block_max, precomp_ptr0_wg1, precomp_valid0_wg1,
+                            &pre_token_idx1, start_block_idx + 5, end_block_idx, extra_seqlen_k);
+                    }
+                }
             }
 
             #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA)  \
@@ -3173,9 +3231,9 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
             params.seqlen_q == 128 && params.num_sm_parts > 0 &&
             int64_t(params.b) >= physical_parts &&
             int64_t(params.b) * kv_tokens > physical_parts * 256) {
-            int sm_count = get_num_sm(get_current_device());
-            // Match the existing launcher's legacy810E normalization.
-            if (sm_count == 64) sm_count = 20;
+            const auto *dprops = at::cuda::getCurrentDeviceProperties();
+            int sm_count = dprops->multiProcessorCount;
+            if (std::string(dprops->name).find("810E") != std::string::npos) sm_count = 20;
             use_metadata_stripe2 = int64_t(sm_count) == physical_parts;
         }
     }
@@ -3217,8 +3275,9 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
 
             hggcFuncAttributes attr;
             hggcFuncGetAttributes(&attr, mla_kernel);
-            int sm_count = get_num_sm(get_current_device());
-            if (sm_count == 64) sm_count = 20;
+            const auto *dprops = at::cuda::getCurrentDeviceProperties();
+            int sm_count = dprops->multiProcessorCount;
+            if (std::string(dprops->name).find("810E") != std::string::npos) sm_count = 20;
 
             printf("blockM:%d, blockN:%d, threads:%d, block_size:%d\n",
                     T::kBlockM, T::kBlockN, T::NUM_THREADS, params.page_block_size);
@@ -3282,8 +3341,9 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
 
             hggcFuncAttributes attr;
             hggcFuncGetAttributes(&attr, mla_kernel);
-            int sm_count = get_num_sm(get_current_device());
-            if (sm_count == 64) sm_count = 20;
+            const auto *dprops = at::cuda::getCurrentDeviceProperties();
+            int sm_count = dprops->multiProcessorCount;
+            if (std::string(dprops->name).find("810E") != std::string::npos) sm_count = 20;
 
             printf("blockM:%d, blockN:%d, threads:%d, block_size:%d\n",
                     T::kBlockM, T::kBlockN, T::NUM_THREADS, params.page_block_size);

@@ -47,12 +47,20 @@ sparse_attn_decode_interface(
 
         int num_sm_parts = get_num_sm_parts(ngroups, num_heads_k, batch_size, /*is_sparse_attn=*/true);
 
-        // H128/Sq1 WG128 has one M tile: CU / gcd(1, CU) partitions.
+        // HS64 advances by 128 tokens. FP8 and the M128 WG kernel
+        // preserve main's original 64-token scheduler quantum.
+        int block_size_n = flashmla::dsa::sparse_decode_metadata_block_size_n(
+            ngroups, is_fp8);
+
+        static constexpr int fixed_overhead_num_blocks = 5;
+
+        // H128/Sq1 WG128 has one M tile: candidate CU / gcd(1, CU) parts.
         // Use its own work guard so the unchanged launcher selects WG128.
         if (!is_fp8 && is_sm89_or_newer() && ngroups == 128 &&
             num_heads_k == 1 && sizes[1] == 1) {
-            int wg_parts = get_num_sm(get_current_device());
-            if (wg_parts == 64) wg_parts = 20; // Existing 810E normalization.
+            const auto *dprops = at::cuda::getCurrentDeviceProperties();
+            int wg_parts = dprops->multiProcessorCount;
+            if (std::string(dprops->name).find("810E") != std::string::npos) wg_parts = 20;
             Flash_fwd_params index_shape = {};
             index_shape.topk = indices.size(-1);
             index_shape.extra_topk = extra_indices.has_value()
@@ -60,20 +68,25 @@ sparse_attn_decode_interface(
             const auto is_pow2 = [](int n) { return n > 0 && (n & (n - 1)) == 0; };
             const int64_t kv_tokens = int64_t(index_shape.topk) +
                 std::max(index_shape.extra_topk, 0);
+            const int64_t batch_cost = cutlass::ceil_div(kv_tokens, int64_t(block_size_n)) +
+                fixed_overhead_num_blocks;
+            const int64_t payload = cutlass::ceil_div(int64_t(batch_size) * batch_cost,
+                int64_t(wg_parts)) + fixed_overhead_num_blocks;
+            // Prefer legacy stripes for small uniform workloads that split batches.
+            const bool keep_legacy_stripe = !topk_length.has_value() &&
+                !extra_topk_length.has_value() && int64_t(num_sm_parts) * 2 == wg_parts &&
+                int64_t(batch_size) >= wg_parts &&
+                int64_t(batch_size) * kv_tokens <= int64_t(wg_parts) * 3584 &&
+                payload % batch_cost > fixed_overhead_num_blocks;
             if (is_pow2(kv.size(1)) &&
                 (!extra_kv.has_value() || is_pow2(extra_kv->size(1))) &&
                 flashmla::dsa::sparse_decode_m128_index_tiles_supported(index_shape) &&
-                int64_t(batch_size) * kv_tokens > int64_t(wg_parts) * 256) {
+                int64_t(batch_size) * kv_tokens > int64_t(wg_parts) * 256 &&
+                !keep_legacy_stripe) {
                 num_sm_parts = wg_parts;
             }
         }
 
-        // HS64 advances by 128 tokens. FP8 and the M128 WG kernel
-        // preserve main's original 64-token scheduler quantum.
-        int block_size_n = flashmla::dsa::sparse_decode_metadata_block_size_n(
-            ngroups, is_fp8);
-
-        static constexpr int fixed_overhead_num_blocks = 5;
         auto options = q.options().dtype(torch::kInt32);
         auto tile_scheduler_metadata_t = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
         auto num_splits_t = torch::empty({batch_size + 1}, options);
