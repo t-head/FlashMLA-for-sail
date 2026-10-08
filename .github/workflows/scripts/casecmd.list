@@ -1,0 +1,9 @@
+# FlashMLA PR unit-test commands
+# Each non-empty, non-comment line is executed as a shell command.
+
+python ./tests/test_flash_mla_dense_decoding.py
+python ./tests/test_flash_mla_dense_decoding.py --dtype=fp16
+python ./tests/test_flash_mla_sparse_decoding.py
+python ./tests/test_flash_mla_sparse_prefill.py
+pytest ./tests/test_flash_mla_cuda_graph.py::test_metadata_lazy_gen_and_runtime_refresh_inside_graph_capture -v
+pytest ./tests/test_flash_mla_supplemental.py -v -o console_output_style=classic
