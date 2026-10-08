@@ -1400,6 +1400,10 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
         dsa_warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup, wg_idx);
     }
 
+    // Retire V1L readers before the next iteration reuses their shared slot.
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST)
+        NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup0);
+
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST)
     {
         cute::clear(rP0);
@@ -1518,6 +1522,11 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
 
     // Wait for rO1 += rP1b @ sV1R, launch TMA for the next V1R
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
+        if constexpr (T::kHeadDim == 512) {
+            // Retire the previous V0R readers before reusing their shared slot.
+            if (block_idx != 0)
+                NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup1);
+        }
 #if DSA_SIM_AIU
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(sim_cross_tid);
         Tensor tKsK1 = gmem_thr_copy_K.partition_D(nxt_sKSim1);
@@ -1591,6 +1600,11 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
     }
 
     dsa_warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup, wg_idx);
+
+    if constexpr (T::kHeadDim == 576 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // Retire V0R readers before the next iteration reuses their shared slot.
+        NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup1);
+    }
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
         cute::clear(rP1);
