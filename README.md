@@ -1,4 +1,10 @@
-# FlashMLA 2.1.0 for PPU
+# FlashMLA for PPU
+
+## News
+
+### V2.2.0
+
+Added an optimized BF16 Warp Interleave kernel for sparse decode and sparse prefill on 810E and M890. The optimized path applies to `head_num=64`, `Hkv=1`, `Dqk=512/576`, and `Dv=512`; decode requires power-of-two KV page sizes within supported addressing limits, while prefill requires `topk≥512` and `topk` divisible by 128. The kernel uses M64N64 tiling and a double-buffered pipeline to overlap asynchronous data transfers with QK/PV computation, while reusing loaded K data for V to reduce memory traffic. 
 
 ## Introduction
 
