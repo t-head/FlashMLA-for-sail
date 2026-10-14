@@ -282,6 +282,11 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
 
     flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, AtomLayoutP, kNWarps0/AtomLayoutQ, 1/*ForceUseTsm*/> softmax;
 
+    // Q is loop-invariant across n_block; keep the leading QK k-steps of the Q A-operand
+    // in registers so that subsequent QK GEMMs reuse them instead of reloading from smem.
+    constexpr int kKeepQQkSteps = 24;
+    static_assert(kKeepQQkSteps + 1 <= decltype(size<2>(tSrQ))::value, "kKeepQQkSteps must leave at least one QK k-step streamed from smem");
+
     // These are the iterations where we don't need masking on S
     for (int n_block = 0; n_block < n_block_max; ++n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_s, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -317,10 +322,30 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
         auto tOsVt_current = kv_load_num % 2 == 0 ? tOsVt : tOsVt_double;
 
         if (warp_idx < kNWarps0) {
-            flash::gemm<Kernel_traits::Is_Q_in_regs>(
-                acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
-                smem_thr_copy_Q, smem_thr_copy_K
-            );
+            if constexpr (!Kernel_traits::Share_Q_K_smem) {
+                // Q and K occupy disjoint smem here, so Q is still intact at n_block == 0;
+                // stage its leading QK k-steps into registers once and reuse them below.
+                if (n_block == 0) {
+                    Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+                    CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
+                    #pragma unroll
+                    for (int i = 0; i < kKeepQQkSteps; ++i) {
+                        cute::copy(smem_tiled_copy_Q, tSsQ(_, _, i), tSrQ_copy_view(_, _, i));
+                    }
+                }
+                flash::gemm_rss<kKeepQQkSteps>(
+                    acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
+                    smem_thr_copy_Q, smem_thr_copy_K
+                );
+            } else {
+                // Q/K alias the same smem (Share_Q_K_smem): sQ has already been overwritten by
+                // the first K cp_async before the loop, and Q was staged to registers in the
+                // prologue, so keep the original QK GEMM path instead of re-reading the stale sQ.
+                flash::gemm<Kernel_traits::Is_Q_in_regs>(
+                    acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
+                    smem_thr_copy_Q, smem_thr_copy_K
+                );
+            }
 
             constexpr int MMA_N_S = kBlockN / decltype(typename Kernel_traits::TiledMmaS{}.template tile_size_mnk<1>())::value;
             flash::apply_indices_mask(acc_s, smem_valid_indices, (warp_idx / AtomLayoutQ) * MMA_N_S, kv_load_num % 2);
