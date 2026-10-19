@@ -1571,6 +1571,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             __mbarrier_init(&barriers_K1[i], 32);
         }
     }
+    __syncthreads();
     bool cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
 
     int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr + partition_idx * TileSchedulerMetaDataSize;
@@ -1868,6 +1869,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
                         __mbarrier_init(&barriers_K1[i], 32);
                     }
                 }
+                __syncthreads();
                 cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
                 launch_q_copy<T>(params, batch_idx + 1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
             }
