@@ -1,4 +1,4 @@
-name: flashmla ut test     # ① Workflow 名称（显示在 Actions 页面）
+name: flashmla ut test     # Workflow name, shown on the Actions page
 
 on:
   workflow_call:
@@ -105,22 +105,27 @@ jobs:
             echo "START TO BUILD WHEEL"
             LOG_FILE="build.log"
             ERROR_LOG="error.log"
-            echo "开始构建 wheel..."
+            echo "Building wheel..."
             python ./setup.py bdist_wheel > "$LOG_FILE" 2> "$ERROR_LOG"
             EXIT_CODE=$?
 
-            # 3. 检查返回值
+            # 3. Check the exit code
             if [ $EXIT_CODE -ne 0 ]; then
                 echo "Build failed with exit code $EXIT_CODE"
-                cat "$ERROR_LOG" # 显示错误详情
+                cat "$ERROR_LOG" # show the error details
                 echo "----- last 1000 lines of $LOG_FILE -----"
                 tail -n 1000 "$LOG_FILE"
+                # Keep the build logs on NAS: the Pod is removed after the run,
+                # so this is the only persistent copy of the failure details.
+                NAS_RESULT_DIR="/mnt/wl_nas/devops/flashmla-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+                mkdir -p "$NAS_RESULT_DIR"
+                cp "$LOG_FILE" "$ERROR_LOG" "$NAS_RESULT_DIR/" 2>/dev/null || true
                 exit 1
             else
-                echo "✅ 构建成功！"
+                echo "✅ Build succeeded!"
                 echo "----- last 200 lines of $LOG_FILE -----"
                 tail -n 200 "$LOG_FILE"
-                # 可选：清理日志或保留以备查
+                # Optional: remove the logs or keep them for reference
                 # rm "$LOG_FILE" "$ERROR_LOG"
             fi
             echo "START TO INSTALL WHEEL"
@@ -154,6 +159,7 @@ jobs:
 
           if [[ ! -f "$XML_FILE" ]]; then
             echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
+            echo "If the build failed, its logs are kept under $NAS_RESULT_DIR/ (build.log / error.log)." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 

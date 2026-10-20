@@ -7,8 +7,18 @@ import re
 import signal
 from junit_xml import TestCase, TestSuite
 
-# Configuration: output file name
+# Configuration: output file name and per-case timeout limit
 OUTPUT_XML = "test-results.xml"
+DEFAULT_TIMEOUT_SECONDS = 1200
+# Number of trailing output lines attached to a failed case in the XML report
+ERROR_LOG_TAIL_LINES = 50
+# Max characters kept per log line (tensor dumps / assert diffs can be huge single lines)
+ERROR_LOG_MAX_LINE_CHARS = 500
+# Kernel log digest appended to a failed case's error log: lines matching
+# fail/error (case-insensitive), newest last, tail capped
+KERNEL_KEYWORD_RE = re.compile(r"fail|error", re.IGNORECASE)
+KERNEL_LOG_TAIL_LINES = 20
+KERNEL_LOG_MAX_LINE_CHARS = 300
 
 
 def derive_test_name(case_command):
@@ -19,6 +29,58 @@ def derive_test_name(case_command):
     single underscore so the name is a single token in the JUnit report.
     """
     return re.sub(r"\s+", "_", case_command.strip())
+
+
+def truncate_line(line, limit=ERROR_LOG_MAX_LINE_CHARS):
+    """Cut an over-long log line, noting how many characters were dropped."""
+    if len(line) <= limit:
+        return line
+    return f"{line[:limit]} ...[truncated {len(line) - limit} chars]"
+
+
+def collect_kernel_error_lines():
+    """Return the last kernel log lines matching fail/error, or None when the
+    kernel log is unavailable (missing dmesg command, restricted container)
+    or has no matching lines."""
+    try:
+        result = subprocess.run(
+            ["dmesg", "-T"], capture_output=True, text=True,
+            errors="replace", timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    matched = [
+        truncate_line(line, KERNEL_LOG_MAX_LINE_CHARS)
+        for line in result.stdout.splitlines()
+        if KERNEL_KEYWORD_RE.search(line)
+    ]
+    return matched[-KERNEL_LOG_TAIL_LINES:] or None
+
+
+def error_log_tail(output, case_command, reason, extra_lines=(), kernel_lines=None):
+    """Build the tail of a failed case's output for the XML system-err field,
+    which the summary renderer shows in its Error Log column.
+
+    Only the last few lines are kept and each line is truncated (tensor
+    dumps / assert diffs can be huge single lines), mirroring the FA
+    runner's error log handling. No separate log files are written; the
+    full output stays in the job log. Kernel log lines matching fail/error
+    are appended as a second section when available.
+    """
+    tail = [truncate_line(line) for line in (output or "").strip("\n").splitlines()]
+    tail = tail[-ERROR_LOG_TAIL_LINES:]
+    tail.extend(truncate_line(line) for line in extra_lines)
+    case_line_count = len(tail)
+    if kernel_lines:
+        tail.append("")
+        tail.append(f"===== kernel log lines matching fail|error (last {len(kernel_lines)}) =====")
+        tail.extend(kernel_lines)
+    if not tail:
+        tail = ["(no output)"]
+    header = f"===== last {case_line_count} lines of `{case_command}` ({reason}) ====="
+    return "\n".join([header, *tail])
 
 
 def run_one_case(i, case_command, total_count):
@@ -49,7 +111,7 @@ def run_one_case(i, case_command, total_count):
             start_new_session=True,
         )
 
-        output, _ = process.communicate(timeout=1200)
+        output, _ = process.communicate(timeout=DEFAULT_TIMEOUT_SECONDS)
         if output:
             print(output, end='')
             stdout_output.append(output)
@@ -68,6 +130,10 @@ def run_one_case(i, case_command, total_count):
             msg = f"Exit code: {process.returncode}, Failed keyword: {failed_keyword_found}"
             print(f">>> Result: [FAIL] ({msg})")
             junit_case.add_failure_info(message="Test failed", output="".join(stdout_output))
+            junit_case.stderr = error_log_tail(
+                "".join(stdout_output), case_command, msg,
+                kernel_lines=collect_kernel_error_lines(),
+            )
             return junit_case, False
 
     except subprocess.TimeoutExpired:
@@ -78,10 +144,15 @@ def run_one_case(i, case_command, total_count):
             stdout_output.append(output)
         duration = time.time() - start_time
         junit_case.elapsed_sec = duration
+        reason = f"timeout after {DEFAULT_TIMEOUT_SECONDS}s"
         print(f"Timeout: {test_name}")
         junit_case.add_failure_info(
             message="Timeout",
             output="".join(stdout_output) or "Test timed out",
+        )
+        junit_case.stderr = error_log_tail(
+            "".join(stdout_output), case_command, reason,
+            kernel_lines=collect_kernel_error_lines(),
         )
         return junit_case, False
 
@@ -90,6 +161,10 @@ def run_one_case(i, case_command, total_count):
         junit_case.elapsed_sec = duration
         print(f"Exception: {test_name}, error: {e}")
         junit_case.add_error_info(message="Exception occurred", output=str(e))
+        junit_case.stderr = error_log_tail(
+            None, case_command, "exception", extra_lines=(str(e),),
+            kernel_lines=collect_kernel_error_lines(),
+        )
         return junit_case, False
 
 
@@ -168,7 +243,6 @@ def run_cases(caselist_path, build_dir, output_xml=OUTPUT_XML):
 
     print(f"\nTests completed. Total: {total_count}, Passed: {global_passed_count}")
     print(f"Report generated: {output_xml_path}")
-
     if global_passed_count < total_count:
         sys.exit(1)
 
