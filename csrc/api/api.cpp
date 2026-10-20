@@ -4,6 +4,7 @@
  ******************************************************************************/
 #include "dense_decode.h"
 #include "sparse_fwd.h"
+#include "sparse_quant_fwd.h"
 #ifdef FLASHMLA_C_ENABLE_DECODE_SPARSE
 #include "sparse_decode.h"
 #endif
@@ -21,6 +22,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_decode_fwd", &sparse_attn_decode_interface);
 #endif
     m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface);
+    m.def("sparse_quant_fwd", &sparse_attn_quant_prefill_interface);
 }
 
 #else
@@ -40,6 +42,9 @@ TORCH_LIBRARY(_flashmla_C, m) {
 
     m.def("sparse_prefill_fwd", make_pytorch_shim(&sparse_attn_prefill_interface));
     m.impl("sparse_prefill_fwd", torch::kCUDA, make_pytorch_shim(&sparse_attn_prefill_interface));
+
+    m.def("sparse_quant_fwd", make_pytorch_shim(&sparse_attn_quant_prefill_interface));
+    m.impl("sparse_quant_fwd", torch::kCUDA, make_pytorch_shim(&sparse_attn_quant_prefill_interface));
 }
 
 PyMODINIT_FUNC PyInit__flashmla_C() {

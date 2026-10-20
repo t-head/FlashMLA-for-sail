@@ -26,6 +26,12 @@ def get_sources():
         "csrc/ppu/decode/dense/instantiations/hdim576_512_fp8.cu",
         "csrc/ppu/decode/dense/instantiations/splitkv_mla_bf16.cu",
         "csrc/ppu/prefill/sparse/instantiations/dispatch_bf16.cu",
+        "csrc/ppu/prefill/sparse/instantiations/wg_v41_quant_sm89.cu",
+        "csrc/ppu/prefill/sparse/instantiations/wg_v41_quant_narrow_sm89.cu",
+        "csrc/ppu/prefill/sparse/instantiations/wg_v40_quant_sm89.cu",
+        "csrc/ppu/prefill/sparse/instantiations/wg_v40_quant_narrow_sm89.cu",
+        "csrc/ppu/prefill/sparse/instantiations/wg_v41_quant_allvalid_tail_check_sm89.cu",
+        "csrc/ppu/prefill/sparse/instantiations/wg_v41_quant_gpu_checked_fp8_sm89.cu",
         "csrc/ppu/decode/sparse/instantiations/hdim576_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/hdim512_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/sparse_decode_wg_hs64_bf16.cu",
@@ -88,7 +94,7 @@ ext_modules.append(
         name="flash_mla_cuda",
         sources=get_sources(),
         extra_compile_args={
-            "cxx": cxx_args + get_features_args(),
+            "cxx": cxx_args + get_features_args() + ["-DFLASHMLA_ENABLE_V40_PREFILL"],
             "nvcc": append_hgcc_threads(
                 [
                     "-O3",
@@ -118,6 +124,9 @@ ext_modules.append(
                     "-mllvm",
                     "-ppu-force-vregrr=true",
                     "-DUSE_PPU",
+                    # PPU 1.0/1.5 support LDSM; HGGC's version numbers differ
+                    # from the NVIDIA-style compiler check in pinned ACTL.
+                    "-DCUTE_ARCH_LDSM_PPU_ENABLED=1",
                     "-DUSE_AIU=1",
                     "-DACOMPUTE_VERSION=10000"
                 ]

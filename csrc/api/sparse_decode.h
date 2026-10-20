@@ -4,12 +4,16 @@
  ******************************************************************************/
 #pragma once
 
+#include <cstdlib>
+
 #ifdef FLASHMLA_C_ENABLE_DECODE_SPARSE
 
 #include "common.h"
 #include "params.h"
 #include "kerutils/common/static_switch.h"
 #include "decode/sparse/sparse_decode_wg.h"
+#include "decode/sparse/sparse_quant_decode.h"
+#include "decode/sparse/shared_quant_q_layout.h"
 
 template<typename T, bool IsFP8, int Headdim, int Headdim_V,
          bool IsV41FP8, bool IsExtraFP4 = false>
@@ -50,10 +54,30 @@ sparse_attn_decode_interface(
 
         int num_sm_parts = get_num_sm_parts(ngroups, num_heads_k, batch_size, /*is_sparse_attn=*/true);
 
-        // HS64 advances by 128 tokens. FP8 and the M128 WG kernel
-        // preserve main's original 64-token scheduler quantum.
-        int block_size_n = flashmla::dsa::sparse_decode_metadata_block_size_n(
-            ngroups, is_fp8);
+        // The opt-in V4.1 HS64 experiment consumes two 64-token blocks per
+        // iteration, like BF16 HS64. Match the scheduler's 128-token quantum.
+        const char *wi_env = std::getenv("FLASHMLA_V41_WI");
+        const char *hs64_env = std::getenv("FLASHMLA_V41_HS64");
+        const bool v41_hs64 = is_fp8 && is_sm89_or_newer() &&
+            q.size(3) == 512 &&
+            head_size_v == 512 && kv.size(3) == 528 &&
+            ngroups == 64 && q.size(1) == 1 &&
+            wi_env && wi_env[0] == '1' && wi_env[1] == '\0' &&
+            hs64_env && hs64_env[0] == '1' && hs64_env[1] == '\0' &&
+            kv.size(1) > 0 && (kv.size(1) & (kv.size(1) - 1)) == 0 &&
+            flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
+                kv.size(0), kv.size(1), 512, 8, kv.stride(0)) &&
+            (!extra_kv.has_value() ||
+             ((extra_kv->size(3) == 528 || extra_kv->size(3) == 288) &&
+              extra_kv->size(1) > 0 &&
+              (extra_kv->size(1) & (extra_kv->size(1) - 1)) == 0 &&
+              flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
+                  extra_kv->size(0), extra_kv->size(1),
+                  extra_kv->size(3) == 288 ? 256 : 512,
+                  extra_kv->size(3) == 288 ? 4 : 8,
+                  extra_kv->stride(0))));
+        int block_size_n = v41_hs64 ? 128 :
+            flashmla::dsa::sparse_decode_metadata_block_size_n(ngroups, is_fp8);
 
         static constexpr int fixed_overhead_num_blocks = 5;
 
@@ -202,8 +226,20 @@ sparse_attn_decode_interface(
     const int seqlen_q = seqlen_q_ori * ngroups;
     const int num_heads = num_heads_k;
 
-    q = q.view({batch_size, seqlen_q_ori, num_heads_k, ngroups, head_size}).transpose(2, 3)
-            .reshape({batch_size, seqlen_q, num_heads, head_size});
+    const bool shared_quant_raw_q = flashmla::v41prefill::sparse_quant_decode_uses_raw_q_layout(
+        is_v41_fp8, q_dtype == torch::kBFloat16, is_sm89_or_newer(),
+        head_size, head_size_v, num_heads_k, ngroups, page_block_size,
+        extra_kv.has_value() ? static_cast<int>(extra_kv->size(1)) : 0);
+    if (shared_quant_raw_q) {
+        if (!flashmla::v41prefill::sparse_quant_decode_raw_q_alignment_supported(
+                q.data_ptr(), q.stride(0), q.stride(1), q.stride(2), head_size)) {
+            // clone also repairs an unaligned offset on an otherwise contiguous view.
+            q = q.clone(at::MemoryFormat::Contiguous);
+        }
+    } else {
+        q = q.view({batch_size, seqlen_q_ori, num_heads_k, ngroups, head_size}).transpose(2, 3)
+                .reshape({batch_size, seqlen_q, num_heads, head_size});
+    }
 
     auto opts = q.options();
     at::Tensor out;
@@ -336,6 +372,112 @@ sparse_attn_decode_interface(
     CHECK_CONTIGUOUS(num_splits.value());
     params.num_splits_ptr = num_splits->data_ptr<int>();
 
+    // H1 diagnostic: reuse the linked M64/N64 quantized HS64 image for MTP.
+    // Its per-query Q/indices/O mapping already uses grid.x. Keep the original
+    // returned metadata cache (64-token quantization) unchanged: the HS64 image
+    // consumes a fresh, call-local 128-token schedule and matching split table.
+    // This also keeps later calls on the legacy path safe when eligibility changes.
+    const char *hs64_mtp_wi_env = std::getenv("FLASHMLA_V41_WI");
+    constexpr int64_t hs64_mtp_max_index_row_stride = (int64_t{1} << 31) - 1;
+    const bool use_hs64_quant_mtp = is_fp8 && is_v41_fp8 &&
+        is_sm89_or_newer() && !shared_quant_raw_q &&
+        params.h == 1 && params.ngroups == 64 && params.q_orig > 1 &&
+        int64_t(params.seqlen_q) == int64_t(params.q_orig) * 64 &&
+        params.d == 512 && params.d_v == 512 && params.num_sm_parts > 0 &&
+        hs64_mtp_wi_env && hs64_mtp_wi_env[0] == '1' && hs64_mtp_wi_env[1] == '\0' &&
+        params.page_block_size > 0 &&
+        (params.page_block_size & (params.page_block_size - 1)) == 0 &&
+        params.indices_row_stride >= 0 &&
+        params.indices_row_stride <= hs64_mtp_max_index_row_stride &&
+        (params.extra_topk < 0 ||
+         (params.extra_page_block_size > 0 &&
+          (params.extra_page_block_size & (params.extra_page_block_size - 1)) == 0 &&
+          params.extra_indices_row_stride >= 0 &&
+          params.extra_indices_row_stride <= hs64_mtp_max_index_row_stride)) &&
+        flashmla::dsa::sparse_decode_hs64_v41_addressing_supported(params, is_extra_fp4);
+    // H192 diagnostic: three full M64 head tiles reuse the same guarded HS64
+    // images. grid.y selects Q/O/sink head tiles; grid.x remains the query.
+    // Reuse the call-local 128-token schedule below, preserving cached metadata.
+    const bool use_hs64_quant_h192 = is_fp8 && is_v41_fp8 &&
+        is_sm89_or_newer() && !shared_quant_raw_q &&
+        params.h == 1 && params.ngroups == 192 && params.q_orig > 0 &&
+        int64_t(params.seqlen_q) == int64_t(params.q_orig) * 192 &&
+        params.d == 512 && params.d_v == 512 && params.num_sm_parts > 0 &&
+        hs64_mtp_wi_env && hs64_mtp_wi_env[0] == '1' && hs64_mtp_wi_env[1] == '\0' &&
+        params.page_block_size > 0 &&
+        (params.page_block_size & (params.page_block_size - 1)) == 0 &&
+        params.indices_row_stride >= 0 &&
+        params.indices_row_stride <= hs64_mtp_max_index_row_stride &&
+        (params.extra_topk < 0 ||
+         (params.extra_page_block_size > 0 &&
+          (params.extra_page_block_size & (params.extra_page_block_size - 1)) == 0 &&
+          params.extra_indices_row_stride >= 0 &&
+          params.extra_indices_row_stride <= hs64_mtp_max_index_row_stride)) &&
+        flashmla::dsa::sparse_decode_hs64_v41_addressing_supported(params, is_extra_fp4);
+    at::Tensor hs64_mtp_metadata, hs64_mtp_num_splits;
+    if (use_hs64_quant_mtp || use_hs64_quant_h192) {
+        // grid.x already supplies q_orig independent query groups. Budget
+        // the call-local KV partitions across those groups, preserving the
+        // cached public schedule and the existing 128-token quantum.
+        if (use_hs64_quant_mtp && params.b <= 4 &&
+            params.q_orig <= params.num_sm_parts) {
+            params.num_sm_parts /= params.q_orig;
+        }
+        if (use_hs64_quant_h192 && params.b <= 4 && params.q_orig > 1) {
+            // Preserve at least 95% of the last-wave-inclusive CTA capacity.
+            // H192 has three M64 head tiles; query groups already run in
+            // parallel. Keep the original count if no smaller budget fits.
+            const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+            const int64_t query_head_groups = int64_t(params.q_orig) * 3;
+            if (sm_count > 0) {
+                for (int parts = 1; parts < params.num_sm_parts; ++parts) {
+                    const int64_t ctas = query_head_groups * parts;
+                    const int64_t waves = (ctas + sm_count - 1) / sm_count;
+                    if (ctas * 100 >= waves * sm_count * 95) {
+                        params.num_sm_parts = parts;
+                        break;
+                    }
+                }
+            }
+        }
+        // B8/Sq16 supplies enough independent query/head groups to use
+        // fewer KV partitions. Keep a 95% nominal CTA-wave fill budget;
+        // the H64 small-batch floor policy is intentionally not used here.
+        if (params.b == 8 && params.q_orig == 16) {
+            const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+            const int64_t query_head_groups = int64_t(params.q_orig) * (params.ngroups / 64);
+            if (sm_count > 0) {
+                for (int parts = 1; parts < params.num_sm_parts; ++parts) {
+                    const int64_t ctas = query_head_groups * parts;
+                    const int64_t waves = (ctas + sm_count - 1) / sm_count;
+                    if (ctas * 100 >= waves * sm_count * 95) {
+                        params.num_sm_parts = parts;
+                        break;
+                    }
+                }
+            }
+        }
+        const auto metadata_options = q.options().dtype(torch::kInt32);
+        hs64_mtp_metadata = torch::empty(
+            {params.num_sm_parts, TileSchedulerMetaDataSize}, metadata_options);
+        hs64_mtp_num_splits = torch::empty({params.b + 1}, metadata_options);
+        Mla_metadata_params hs64_meta_params = {};
+        hs64_meta_params.seqlens_k_ptr = nullptr;
+        hs64_meta_params.tile_scheduler_metadata_ptr = hs64_mtp_metadata.data_ptr<int>();
+        hs64_meta_params.num_splits_ptr = hs64_mtp_num_splits.data_ptr<int>();
+        hs64_meta_params.batch_size = params.b;
+        hs64_meta_params.block_size_n = 128;
+        hs64_meta_params.fixed_overhead_num_blocks = 5;
+        hs64_meta_params.num_sm_parts = params.num_sm_parts;
+        hs64_meta_params.topk = params.topk;
+        hs64_meta_params.extra_topk = params.extra_topk >= 0 ? params.extra_topk : 0;
+        hs64_meta_params.topk_length = params.topk_len_ptr;
+        hs64_meta_params.extra_topk_length = params.extra_topk_len_ptr;
+        get_mla_metadata_func(hs64_meta_params, stream);
+        params.tile_scheduler_metadata_ptr = hs64_mtp_metadata.data_ptr<int>();
+        params.num_splits_ptr = hs64_mtp_num_splits.data_ptr<int>();
+    }
+
     // splitkv
     //at::Tensor softmax_lse_accum, out_accum;
     //std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
@@ -349,7 +491,19 @@ sparse_attn_decode_interface(
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
     // TORCH_CHECK(head_size == 576);
 
-    if (is_fp8) {
+    if (use_hs64_quant_mtp || use_hs64_quant_h192) {
+        if (is_extra_fp4) {
+            flashmla::dsa::hs64::run_flash_sparse_decode_wg_kernel_hs64_v41_fp4(params, stream);
+        } else {
+            flashmla::dsa::hs64::run_flash_sparse_decode_wg_kernel_hs64_v41_fp8(params, stream);
+        }
+    } else if (shared_quant_raw_q) {
+        if (is_extra_fp4) {
+            flashmla::v41prefill::run_sparse_quant_decode_wi_fp4_extra(params, stream);
+        } else {
+            flashmla::v41prefill::run_sparse_quant_decode_wi_fp8(params, stream);
+        }
+    } else if (is_fp8) {
         if (head_size == 576) {
             run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 576, 512, false>(params, stream);
         } else if (is_v41_fp8) {

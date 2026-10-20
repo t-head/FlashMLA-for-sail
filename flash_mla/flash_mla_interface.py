@@ -266,3 +266,59 @@ def flash_mla_sparse_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length, out
     )
     return results
+
+
+def flash_mla_sparse_quant_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    num_tokens: int,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sparse prefill with V4.0 FP8 or V4.1 FP4/FP8 KV on SM89.
+
+    Args:
+        q: [s_q, 128, 512], bfloat16. The last dimension is contiguous;
+            query rows and heads must not overlap and must be aligned to
+            16 bytes. s_q * 128 must fit int32.
+        kv: [num_blocks, page_size, 1, packed_bytes], uint8. page_size is a
+            positive power of two. Each page stores all token data first,
+            followed by all token scales:
+            - FP4, packed_bytes=288: 256 bytes of E2M1 data per token, then
+              32 E4M3 scales per token, one scale per 16 values. The low nibble
+              of each byte is the first value and the high nibble is the next.
+            - FP8, packed_bytes=528: 512 E4M3 data bytes per token, then
+              16 UE8M0 scales per token, one scale per 32 values.
+            - V4.0 FP8, packed_bytes=584: 448 E4M3 NoPE data bytes and
+              64 unquantized BF16 RoPE values per token (576 data bytes),
+              then 7 UE8M0 scales plus one padding byte per token, one
+              scale per 64 NoPE values. The padding byte is ignored.
+            Pages must be contiguous internally and aligned to 16 bytes;
+            padding between pages is allowed. An existing quantized
+            cache can be passed as kv.view(torch.uint8).
+        indices: [s_q, 1, topk], int32 with a contiguous last dimension.
+            topk is at least 128 and a multiple of 128. Indices below zero
+            or at least num_tokens are masked.
+        sm_scale: Finite scale applied to QK logits before softmax. Zero and
+            negative values are supported. Those values enqueue a Q transform
+            on the current stream, which is also captured by CUDA Graphs.
+        num_tokens: Required logical KV length, excluding final-page padding.
+        attn_sink: Optional contiguous [128], float32. Scales output by
+            exp(lse) / (exp(lse) + exp(attn_sink)); max_logits and lse are
+            unchanged. Positive infinity produces zero output.
+        topk_length: Optional contiguous [s_q], int32. Each value must be
+            between zero and topk; only that prefix of the indices is used.
+        out: Optional contiguous [s_q, 128, 512], bfloat16 output buffer,
+            aligned to 16 bytes. All tensors must be on the same device.
+
+    Returns:
+        output: [s_q, 128, 512], bfloat16.
+        max_logits: [s_q, 128], float32, maximum scaled attention logit.
+        lse: [s_q, 128], float32, natural log-sum-exp before the sink.
+    """
+    return flash_mla_cuda.sparse_quant_fwd(
+        q, kv, indices, sm_scale, num_tokens, attn_sink, topk_length, out
+    )
