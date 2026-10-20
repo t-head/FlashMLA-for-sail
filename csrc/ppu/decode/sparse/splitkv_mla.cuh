@@ -988,8 +988,8 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
             __syncthreads();  // Barrier between two tiles.
         } else {
             const int n_split_idx = batch_id == begin_idx ? begin_n_split_idx : 0;
-            const int seqlen_k = params.topk;
-            int ori_block_max = cute::ceil_div(seqlen_k, kBlockN);
+            const int seqlen_k = params.topk_len_ptr ? params.topk_len_ptr[batch_id] : params.topk;
+            int ori_block_max = cute::ceil_div(std::max(seqlen_k, 1), kBlockN);
             int n_block_min = batch_id == begin_idx ? begin_seqlen / kBlockN : 0;
             int n_block_max = batch_id == end_idx ? cute::ceil_div(end_seqlen, kBlockN) : ori_block_max;
             bool NoSplit = n_block_min == 0 && n_block_max == ori_block_max;
