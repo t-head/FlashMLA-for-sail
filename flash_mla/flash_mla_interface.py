@@ -101,7 +101,7 @@ def flash_mla_with_kvcache(
                 Different modes (including fp8/bf16, sparsity, and model version (i.e. V3.2 or MODEL1)) has different KV cache layouts. See comments below for details.
                 The KV cache must be contiguously valid for sparse attention on sm100. Here "contiguously valid" means that every byte, from the very beginning of the KV cache, till the last byte in the KV cache, is valid memory address to visit (i.e. won't IMA). In other words, the KV cache could be a slice of a larger array, but cannot be a list of disjoint memory blocks.
                 Besides, some kernels also have their own requirements on the layout of k cache, including:
-                    - For sparse fp8 decoding kernel on F3, k_cache.stride(0) must be a multiple of 656B (for V32) or 576B (for MODEL1). Padding is needed sometimes.
+                    - For sparse fp8 decoding kernel on F3, k_cache.stride(0) must be a multiple of 656B (V3.2), 576B (V4), or 512B (V4.1). Padding is needed sometimes.
         block_table: (batch_size, max_num_blocks_per_seq), torch.int32. Can be None when sparse attention is used.
         cache_seqlens: (batch_size), torch.int32. Can be None when sparse attention is used.
         head_dim_v: Head_dim of v. Must be 512
@@ -126,10 +126,11 @@ def flash_mla_with_kvcache(
             - Next 16 bytes: Scale factors, containing 4 float32 values. The first float32 is the scale for the first 128 float8_e4m3 values, the second for the next 128, and so on.
             - Last 128 bytes: The "RoPE" part, containing 64 bfloat16 values. This part is not quantized for accuracy.
 
-    For DeepSeek MODEL1:
-        head_dim should be 512 while head_dim_v is also 512.
+    For DeepSeek V4 and V4.1:
+        head_dim and head_dim_v should both be 512.
 
-        In FP8+sparse mode, every block can be divided into two parts. The first parts stores NoPE0, RoPE0, NoPE1, RoPE1, ... while the second part stores scale factors: 7xue8m0, 1Bpad, 7xue8m0, 1Bpad, ...
+        In V4 FP8+sparse mode, every block has a 576-byte data row per token containing 448 FP8 NoPE values and 64 BF16 RoPE values, followed by an 8-byte scale row per token containing 7 ue8m0 scales and 1 padding byte. The exposed tensor has 584 bytes per token.
+        In V4.1 FP8+sparse mode, every block has a 512-byte FP8 data row per token followed by a 16-byte scale row per token. All 512 dimensions, including RoPE, are quantized with one ue8m0 scale per 32 values. The exposed tensor has 528 bytes per token.
 
     Return:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).

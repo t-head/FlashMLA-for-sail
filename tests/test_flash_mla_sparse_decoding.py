@@ -100,6 +100,53 @@ def gen_testcase() -> List[RawTestParam]:
                         ]
                         corner_cases.extend(cur_corner_cases)
 
+    # DeepSeek-V4.1 FP8 arm from opensource: V41 FP8 for both main and extra cache.
+    v41_fp8_cases = [
+        RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk, is_fp8=True,
+                     have_topk_length=False,
+                     enable_attn_sink=True,
+                     extra_s_k=extra_s_k,
+                     extra_topk=extra_topk,
+                     block_size=block_size,
+                     extra_block_size=extra_block_size,
+                     have_extra_topk_length=have_extra_topk_len,
+                     d_qk=512,
+                     check_correctness=True,
+                     num_runs=0,
+                     fp8_kvcache_layout=lib.quant.FP8KVCacheLayout.V41_FP8Sparse)
+        for h_q in [64, 128]
+        for have_extra_topk_len in [False, True]
+        for (s_k, topk, block_size) in [(512, 64, 64), (1024, 576, 61)]
+        for (extra_s_k, extra_topk, extra_block_size) in [(512, 64, 64), (650, 576, 53)]
+        for b in [4]
+        for s_q in [1, 3]
+        for is_varlen in [True]
+    ]
+
+    # DeepSeek-V4.1 FP4 extra_kv arm: primary KV = V41 FP8, extra KV = V41 FP4.
+    v41_fp4_extra_cases = [
+        RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk, is_fp8=True,
+                     have_topk_length=False,
+                     enable_attn_sink=True,
+                     extra_s_k=extra_s_k,
+                     extra_topk=extra_topk,
+                     block_size=block_size,
+                     extra_block_size=extra_block_size,
+                     have_extra_topk_length=have_extra_topk_len,
+                     d_qk=512,
+                     check_correctness=True,
+                     num_runs=0,
+                     fp8_kvcache_layout=lib.quant.FP8KVCacheLayout.V41_FP8Sparse,
+                     extra_fp8_kvcache_layout=lib.quant.FP8KVCacheLayout.V41_FP4Sparse)
+        for h_q in [64, 128]
+        for have_extra_topk_len in [False, True]
+        for (s_k, topk, block_size) in [(512, 64, 64), (1024, 576, 61)]
+        for (extra_s_k, extra_topk, extra_block_size) in [(512, 64, 64), (650, 576, 53)]
+        for b in [4]
+        for s_q in [1, 3]
+        for is_varlen in [True]
+    ]
+
     base_and_bszs = [
         # V3.2
         (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576), [2, 64, 74, 128]),
@@ -137,7 +184,7 @@ def gen_testcase() -> List[RawTestParam]:
                                 num_runs=0)]
 
     # return first_case
-    return correctness_cases + corner_cases + performance_cases
+    return correctness_cases + corner_cases + v41_fp8_cases + v41_fp4_extra_cases + performance_cases
 
 
 @dataclasses.dataclass
