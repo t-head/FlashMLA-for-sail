@@ -11,7 +11,8 @@
 #include "kerutils/common/static_switch.h"
 #include "decode/sparse/sparse_decode_wg.h"
 
-template<typename T, bool IsFP8, int Headdim, int Headdim_V>
+template<typename T, bool IsFP8, int Headdim, int Headdim_V,
+         bool IsV41FP8, bool IsExtraFP4 = false>
 void run_sparse_decode_fwd_dispatch(Flash_fwd_params &params, hggcStream_t stream);
 void get_mla_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
 
@@ -34,6 +35,8 @@ sparse_attn_decode_interface(
     bool is_fp8 = (kv.dtype() == torch::kFloat8_e4m3fn ||
                    kv.dtype() == torch::kInt8 ||
                    kv.dtype() == torch::kUInt8);
+    bool is_v41_fp8 = false;
+    bool is_extra_fp4 = false;
 
     // ========== Phase 1: Lazy metadata ==========
     if (!tile_scheduler_metadata.has_value()) {
@@ -149,14 +152,44 @@ sparse_attn_decode_interface(
             // V3.2 style
             bytes_per_token = 512 + 64*2 + (512/128)*4;
         } else if (head_size == 512 && head_size_v == 512) {
-            // MODEL1 style
-            bytes_per_token = 448 + 64*2 + (448/64)*1 + 1;
+            const int actual_bytes_per_token = kv.size(3);
+            TORCH_CHECK(actual_bytes_per_token == 584 || actual_bytes_per_token == 528,
+                        "DeepSeek V4/V4.1 FP8 KV cache must use 584 or 528 bytes per token, got ", actual_bytes_per_token);
+            bytes_per_token = actual_bytes_per_token;
+            is_v41_fp8 = bytes_per_token == 528;
         } else {
             TORCH_CHECK(false, "Unsupported head sizes for is_fp8_kvcache == True");
         }
         CHECK_SHAPE(kv, num_blocks, page_block_size, num_heads_k, bytes_per_token);
         TORCH_CHECK(num_heads_k == 1, "Currently the number of k heads must be 1 when is_fp8_kvcache is True");
         TORCH_CHECK(kv.stride(1) == bytes_per_token, "The whole block must be contiguous when is_fp8_cache is True");
+        if (extra_kv.has_value()) {
+            TORCH_CHECK(extra_kv->dtype() == torch::kFloat8_e4m3fn ||
+                            extra_kv->dtype() == torch::kInt8 || extra_kv->dtype() == torch::kUInt8,
+                        "FP8/FP4 extra_kv must use a one-byte storage dtype");
+            CHECK_DEVICE(extra_kv.value());
+            TORCH_CHECK(extra_kv->stride(-1) == 1,
+                        "extra_kv must have contiguous packed bytes");
+            const int extra_bytes_per_token = extra_kv->size(3);
+            is_extra_fp4 = extra_bytes_per_token == 288;
+            TORCH_CHECK(extra_bytes_per_token == bytes_per_token || (is_v41_fp8 && is_extra_fp4),
+                        "extra_kv must match the primary layout, except V4.1 FP8 may pair with V4.1 FP4 (288 bytes), got ",
+                        extra_bytes_per_token);
+            CHECK_SHAPE(extra_kv.value(), extra_kv->size(0), extra_kv->size(1), num_heads_k, extra_bytes_per_token);
+            TORCH_CHECK(extra_kv->stride(1) == extra_bytes_per_token,
+                        "extra_kv rows must expose bytes_per_token stride");
+            if (is_extra_fp4 && extra_kv->size(0) > 1) {
+                TORCH_CHECK(extra_kv->stride(0) % 512 == 0,
+                            "V4.1 FP4 blocks must be padded to 512-byte alignment");
+            }
+        }
+    } else if (extra_kv.has_value()) {
+        TORCH_CHECK(extra_kv->dtype() == kv.dtype(),
+                    "BF16 extra_kv must have the same dtype as the primary KV cache");
+        CHECK_DEVICE(extra_kv.value());
+        CHECK_SHAPE(extra_kv.value(), extra_kv->size(0), extra_kv->size(1), num_heads_k, head_size);
+        TORCH_CHECK(extra_kv->stride(-1) == 1,
+                    "BF16 extra_kv must have contiguous head dimension");
     }
 
     const int topk = indices.size(-1);
@@ -317,21 +350,22 @@ sparse_attn_decode_interface(
     // TORCH_CHECK(head_size == 576);
 
     if (is_fp8) {
-        // TORCH_CHECK(false, "Only FP8 kvcahe is supported for sparse MLA on SM90"); // TODO
         if (head_size == 576) {
-            // V3.2 style
-            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 576, 512>(params, stream);
+            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 576, 512, false>(params, stream);
+        } else if (is_v41_fp8) {
+            if (is_extra_fp4) {
+                run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 512, 512, true, true>(params, stream);
+            } else {
+                run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 512, 512, true, false>(params, stream);
+            }
         } else {
-            // MODEL1 style
-            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 512, 512>(params, stream);
+            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 512, 512, false>(params, stream);
         }
     } else {
         if (head_size == 576) {
-            // V3.2 style
-            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, false, 576, 512>(params, stream);
+            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, false, 576, 512, false>(params, stream);
         } else {
-            // MODEL1 style
-            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, false, 512, 512>(params, stream);
+            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, false, 512, 512, false>(params, stream);
         }
     }
 
