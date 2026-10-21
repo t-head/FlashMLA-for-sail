@@ -740,6 +740,11 @@ struct Hs64PrefillTraits : public Hs64Traits<HeadDimK, false, Arch> {
         offsetof(ParkedQ5SharedMemoryPlan, smem_even_high) == 229376 &&
         sizeof(ParkedQ5SharedMemoryPlan) == 262144));
 #if ACOMPUTE_VERSION >= 10500
+    // Match the paired Q descriptors using 16-byte-unit address arithmetic.
+    using SmemCopyOpQ = std::conditional_t<Arch == 89 && HeadDimK == 576 && GroupQueries && !MultiHeadTiles,
+        SparsePairedTsmUnit16<typename Base::InputT, Base::kBlockM, false, false, 8>,
+        typename Base::SmemCopyOpQ>;
+    using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, typename Base::InputT>;
     using SmemCopyOpK = std::conditional_t<Arch == 89,
         SparsePairedTsmUnit16<typename Base::InputT, Base::kBlockN, true, false, 8>,
         typename Base::SmemCopyOpK>;
