@@ -21,7 +21,7 @@
 using namespace cute;
 
 template<typename Kernel_traits, int kMaxSplits>
-__global__ void __launch_bounds__(256, 1, 1)
+__global__ void __launch_bounds__(128, 1, 1)
 flash_fwd_mla_combine_kernel_small_size(__grid_constant__ const Flash_fwd_params params) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -109,6 +109,7 @@ flash_fwd_mla_combine_kernel_small_size(__grid_constant__ const Flash_fwd_params
     Tensor tOrO = make_tensor<ElementAccum>(shape(tOgOaccum));
     clear(tOrO);
 
+#pragma unroll 4
     for (int split = 0; split < actual_num_splits; ++split) {
         cute::copy(tOgOaccum, tOrOaccum);
         ElementAccum lse_scale = sLseScale[split];
@@ -320,7 +321,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const Flash_fwd_params params) {
 namespace flash {
 
 template<typename Kernel_traits, int kMaxSplits>
-__global__ void __launch_bounds__(256, 1, 1)
+__global__ void __launch_bounds__(128, 1, 1)
 flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_params params) {
     using Element = typename Kernel_traits::ElementOutputType;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -404,6 +405,7 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_params pa
     Tensor tOrO = make_tensor<ElementAccum>(shape(tOgOaccum));
     clear(tOrO);
 
+#pragma unroll 4
     for (int split = 0; split < actual_num_splits; ++split) {
         cute::copy(tOgOaccum, tOrOaccum);
         ElementAccum lse_scale = sLseScale[split];

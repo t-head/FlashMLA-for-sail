@@ -57,6 +57,53 @@ The PPU version includes targeted optimizations around data movement, shared sto
 python setup.py install
 ```
 
+## Native FP8 on PPU0015
+
+`flash_mla_with_kvcache` selects native computation for a `float8_e4m3fn`
+cache with shape `[pages, page_size, 1, D]`. D is 512 or 576, value dimension
+is 512, and query heads are a positive multiple of eight. Q can be E4M3 or
+BF16; BF16 Q is converted inside attention. Sparse lists must encode their
+own causal/window masks. The packed byte-cache interfaces remain distinct.
+
+The direct `flash_mla_sparse_fp8_fwd` and `flash_mla_sparse_decode_fp8_fwd`
+APIs accept flat cache rows and per-tensor scales. The paged native API uses
+unit operand scales. It supports attention sinks, per-query lengths,
+preallocated BF16 output, and an additional E4M3 cache. Direct APIs return
+base-2 LSE and `-inf` for empty rows; the paged API returns natural LSE and
+`+inf` for empty rows. Empty attention outputs are zero.
+
+When `flash_mla_sparse_fp8_fwd` receives `out_fp8`, the fused inverse-RoPE/FP8
+epilogue writes only the supplied `out_fp8` and `out_scale` buffers. This mode
+requires `out=None` and `compute_aux=False`, and returns three empty tensors
+with shape `[0]`; callers must consume the supplied FP8 buffers.
+
+Decode scheduling is internal: callers do not pass `num_cta`. Split counts
+follow the device's CU count and query/head work, with full-head tiled kernels
+for sufficiently large grids. The variable-query D512/D576 verify specialization
+validates shared indices on-device before reusing KV; incompatible requests retain independent
+masks. Its measured crossover thresholds are isolated in
+`flash_mla/_sparse_native_fp8.py`. They are performance tuning values for M890P,
+not general model constraints. Retired experiment-only overrides are excluded
+from production dispatch.
+
+Native Q8/KV8/P8 is an approximate output contract. Tests prioritize final
+output relative L2, finite values, and empty/masked rows. LSE proximity does
+not justify an output-equivalent slowdown. Standard test inputs satisfy an
+aggregate output relative L2 below 4%; adversarial cancellation/shift inputs
+can exceed this bound. This is an operator-level contract, not a claim about
+full-model quality or speculative acceptance rate.
+
+### Variable draft lengths
+
+MTP and DSpark attention support 2-8 draft tokens. When verification includes
+one additional target token, pass 3-9 query rows per request. Keep per-query
+causal/window masks in `indices`; shared-index folding requires identical lists.
+Grouped native Q uses `[B,S,H,D]`. For flattened `[B*S,1,H,D]` Q, pass
+`num_queries_per_request=S` to preserve request boundaries for KV reuse.
+Without this hint, each flattened row is scheduled independently.
+Verify reuse and its independent fallback use the actual request query count;
+shape/device heuristics still decide whether reuse is worthwhile.
+
 ## Usage
 
 ### MLA Decoding
