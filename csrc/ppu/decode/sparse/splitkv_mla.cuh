@@ -1115,18 +1115,15 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
         constexpr bool USE_MMA_M8 = 0;
         constexpr bool KeepQ = true;
         constexpr static int kBlockN = 64;
-        // Warp-interleave is available for V4.1 FP8 and FP4 extra KV. On
-        // M890P the current WI kernel is slower than splitkv, so require an
-        // explicit opt-in while retaining the validated fallback by default.
+        // Select warp-interleave automatically for supported V4.1 FP8 and
+        // FP4 extra-KV inputs, using architecture and shape guards like BF16.
         // Generic T2 WI supports Headdim=576/512 and extra_topk, but requires:
         //   - page_block_size > 0 and a power of two (kPagePow2 gate below)
         //   - each MTP query has complete head tiles, so a tile uses one index row
         // BlockM=128 path: ngroups >= 128 (MTP additionally needs ngroups % 128 == 0)
         // BlockM=64 path:  64 <= ngroups < 128 (MTP additionally needs ngroups == 64)
         // Other configurations fall back to non-WI splitkv path.
-        const char *wi_opt_in = std::getenv("FLASHMLA_V41_WI");
-        const bool kCanWI = IsV41FP8 && is_sm89_or_newer()
-            && wi_opt_in && wi_opt_in[0] == '1' && wi_opt_in[1] == '\0';
+        const bool kCanWI = IsV41FP8 && is_sm89_or_newer();
         // blockM=128 path (original 8,1 atom layout)
         const bool wi_enable_m128 = kCanWI
             && (params.ngroups >= 128)
@@ -1180,7 +1177,7 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
                         run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 64>(params, stream);
                     }
                 } else {
-                    // Use splitkv when the optional WI path is unavailable.
+                    // Use splitkv when the WI path is unavailable.
                     using FallbackTraits = Flash_fwd_kernel_traits<
                         Headdim, kBlockM, kBlockN, kNwarps, KeepQ/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
                         T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,

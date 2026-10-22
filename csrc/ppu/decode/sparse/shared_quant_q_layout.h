@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
 
 namespace flashmla::v41prefill {
@@ -13,12 +12,10 @@ inline bool sparse_quant_decode_uses_raw_q_layout(
         bool is_v41_fp8, bool is_bf16_query, bool is_sm89_or_newer,
         int head_size, int head_size_v, int num_heads_k, int ngroups,
         int primary_page_size, int extra_page_size) {
-    const char *wi = std::getenv("FLASHMLA_V41_WI");
     const auto pow2 = [](int value) {
         return value > 0 && (value & (value - 1)) == 0;
     };
     return is_v41_fp8 && is_bf16_query && is_sm89_or_newer
-        && wi && wi[0] == '1' && wi[1] == '\0'
         && head_size == 512 && head_size_v == 512 && num_heads_k == 1
         && ngroups >= 128 && ngroups % 128 == 0
         && pow2(primary_page_size)

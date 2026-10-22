@@ -1,5 +1,22 @@
 # V4.0 FP8 and V4.1 FP4/FP8 warp interleave integration
 
+## Automatic Decode WI dispatch, 2026-10-23
+
+V4.1 quantized Decode now selects WI from its architecture, shape, page and
+addressing guards, following the BF16 dispatch model. `FLASHMLA_V41_WI` is
+removed and no longer affects dispatch, including when set to `0`. Supported
+H64/H128 inputs select WI automatically; H16/H32 and other ineligible inputs
+retain the SplitKV fallback. V4.0 Decode retains its existing route.
+
+The existing H128 raw-Q layout, H64 MTP and H192 paths use the same automatic
+policy. `FLASHMLA_V41_HS64` remains a separate H64 Sq1 experimental kernel
+selector: without it, eligible H64 Sq1 inputs already use generic M64 WI.
+The experiment's 128-token metadata quantum and paired launch guard stay
+coupled. No kernel implementation or BF16 dispatch threshold changes here.
+
+Historical opt-in settings and measurements below describe their original
+source versions; they do not qualify this dispatch change on a GPU.
+
 ## GitHub migration, 2026-10-20
 
 This port targets `t-head/FlashMLA-for-sail` main at `3fa3224c` and carries

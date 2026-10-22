@@ -56,13 +56,11 @@ sparse_attn_decode_interface(
 
         // The opt-in V4.1 HS64 experiment consumes two 64-token blocks per
         // iteration, like BF16 HS64. Match the scheduler's 128-token quantum.
-        const char *wi_env = std::getenv("FLASHMLA_V41_WI");
         const char *hs64_env = std::getenv("FLASHMLA_V41_HS64");
         const bool v41_hs64 = is_fp8 && is_sm89_or_newer() &&
             q.size(3) == 512 &&
             head_size_v == 512 && kv.size(3) == 528 &&
             ngroups == 64 && q.size(1) == 1 &&
-            wi_env && wi_env[0] == '1' && wi_env[1] == '\0' &&
             hs64_env && hs64_env[0] == '1' && hs64_env[1] == '\0' &&
             kv.size(1) > 0 && (kv.size(1) & (kv.size(1) - 1)) == 0 &&
             flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
@@ -377,14 +375,12 @@ sparse_attn_decode_interface(
     // returned metadata cache (64-token quantization) unchanged: the HS64 image
     // consumes a fresh, call-local 128-token schedule and matching split table.
     // This also keeps later calls on the legacy path safe when eligibility changes.
-    const char *hs64_mtp_wi_env = std::getenv("FLASHMLA_V41_WI");
     constexpr int64_t hs64_mtp_max_index_row_stride = (int64_t{1} << 31) - 1;
     const bool use_hs64_quant_mtp = is_fp8 && is_v41_fp8 &&
         is_sm89_or_newer() && !shared_quant_raw_q &&
         params.h == 1 && params.ngroups == 64 && params.q_orig > 1 &&
         int64_t(params.seqlen_q) == int64_t(params.q_orig) * 64 &&
         params.d == 512 && params.d_v == 512 && params.num_sm_parts > 0 &&
-        hs64_mtp_wi_env && hs64_mtp_wi_env[0] == '1' && hs64_mtp_wi_env[1] == '\0' &&
         params.page_block_size > 0 &&
         (params.page_block_size & (params.page_block_size - 1)) == 0 &&
         params.indices_row_stride >= 0 &&
@@ -403,7 +399,6 @@ sparse_attn_decode_interface(
         params.h == 1 && params.ngroups == 192 && params.q_orig > 0 &&
         int64_t(params.seqlen_q) == int64_t(params.q_orig) * 192 &&
         params.d == 512 && params.d_v == 512 && params.num_sm_parts > 0 &&
-        hs64_mtp_wi_env && hs64_mtp_wi_env[0] == '1' && hs64_mtp_wi_env[1] == '\0' &&
         params.page_block_size > 0 &&
         (params.page_block_size & (params.page_block_size - 1)) == 0 &&
         params.indices_row_stride >= 0 &&

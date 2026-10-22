@@ -202,7 +202,7 @@ def main():
         return
     source = args.source_dir.resolve()
     sys.path[:0] = ([str(args.module_dir.resolve())] if args.module_dir else []) + [str(source / "tests"), str(source)]
-    os.environ.update(FLASHMLA_V41_WI="1", FLASHMLA_V41_HS64="0")
+    os.environ["FLASHMLA_V41_HS64"] = "0"
     import torch
     import kernelkit as kk
     import lib

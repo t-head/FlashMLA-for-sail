@@ -1,7 +1,7 @@
 """Eight stock V4.1 generic WI decode regressions, including the H64 barrier hang.
 
 Run after building the extension:
-  FLASHMLA_V41_WI=1 python tests/test_v41_sparse_quant_decode_validation.py
+  python tests/test_v41_sparse_quant_decode_validation.py
 
 --list-cases imports no torch and launches no GPU work. The first case preserves
 the original failing seed28404. Every case uses the original decode fixture,
@@ -80,7 +80,6 @@ def main():
         return
     source = args.source_dir.resolve()
     sys.path[:0] = ([str(args.module_dir.resolve())] if args.module_dir else []) + [str(source / "tests"), str(source)]
-    os.environ["FLASHMLA_V41_WI"] = "1"
     os.environ["FLASHMLA_V41_HS64"] = "0"
     import torch
     import kernelkit as kk

@@ -1,7 +1,7 @@
 """Correctness matrix for the opt-in V4.1 H64 WI2 experiment.
 
 Run on M890P after building the sparse decode extension:
-    FLASHMLA_V41_WI=1 FLASHMLA_V41_HS64=1 \
+    FLASHMLA_V41_HS64=1 \
         python tests/test_v41_hs64_wi_validation.py
 """
 
@@ -60,8 +60,8 @@ def main():
     parser.add_argument("--only", action="append", help="Run a named case")
     parser.add_argument("--stress", action="store_true", help="Include long batch-74 pipelines, page-128 and H128 generic WI cases")
     args = parser.parse_args()
-    if os.getenv("FLASHMLA_V41_WI") != "1" or os.getenv("FLASHMLA_V41_HS64") != "1":
-        parser.error("set FLASHMLA_V41_WI=1 and FLASHMLA_V41_HS64=1")
+    if os.getenv("FLASHMLA_V41_HS64") != "1":
+        parser.error("set FLASHMLA_V41_HS64=1")
 
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device(torch.device("cuda:0"))
