@@ -35,12 +35,51 @@
 #include "kerutils/device/ppu/dequant.cuh"
 
 #include <hggc_ad.h>
+#include "prefill/sparse/wg_iteration_schedule.cuh"
+#include "prefill/sparse/wg_common_ops.cuh"
 
 using namespace cute;
 using cutlass::arch::NamedBarrier;
 
 // e8m0 scale dtype alias (matches kerutils dequant.cuh)
 using fp8_e8m0 = __hg_fp8_e8m0;
+
+// Exact word conversion shared with the validated V4.1 prefill path.
+// Decode keeps a private helper so the existing split-KV converter is unchanged.
+namespace flashmla::dsa::decode_quant {
+__forceinline__ __device__ uint4 fp4_word_to_bf16x8_bits(uint32_t word) {
+    const uint32_t hsel=((word>>1)&0x77777777u)|(word&0x11111111u);
+    const uint32_t selectors0=word&0x7777u;
+    const uint32_t selectors1=(word>>16)&0x7777u;
+    const uint32_t low0=__byte_perm(0xc0800000u,0xc0804000u,selectors0);
+    uint32_t high0;
+    asm volatile("ppu.prmt.b32 %0, %1, %2, %3;\n"
+        : "=r"(high0) : "n"(0x40403f00u), "n"(0xc0c0bf80u), "r"(hsel));
+    const uint32_t low1=__byte_perm(0xc0800000u,0xc0804000u,selectors1);
+    const uint32_t high1=__byte_perm(0x40403f00u,0xc0c0bf80u,hsel>>16);
+    return uint4{__byte_perm(low0,high0,0x5140),__byte_perm(low0,high0,0x7362),
+        __byte_perm(low1,high1,0x5140),__byte_perm(low1,high1,0x7362)};
+}
+
+__forceinline__ __device__ uint4 fp8_words_to_scaled_bf16x8_bits(
+        uint32_t first_word, uint32_t second_word, __ppu_bfloat162 scale) {
+    const uint32_t words[2] = {first_word, second_word};
+    uint32_t out_bits[4]{};
+    #pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const uint32_t packed = words[half];
+        const __hg_fp8x4_e4m3 fp8x4 = *reinterpret_cast<const __hg_fp8x4_e4m3*>(&packed);
+        const float4 vals = (float4)fp8x4;
+        const __ppu_bfloat162 scaled01 = __hmul2(
+            __float22bfloat162_rn({vals.x, vals.y}), scale);
+        const __ppu_bfloat162 scaled23 = __hmul2(
+            __float22bfloat162_rn({vals.z, vals.w}), scale);
+        out_bits[half * 2] = *reinterpret_cast<const uint32_t*>(&scaled01);
+        out_bits[half * 2 + 1] = *reinterpret_cast<const uint32_t*>(&scaled23);
+    }
+    return uint4{out_bits[0], out_bits[1], out_bits[2], out_bits[3]};
+}
+} // namespace flashmla::dsa::decode_quant
 
 // ---------------------------------------------------------------------------
 // Localized from the patch's flash_splitkv/splitkv_dsa.h: async K tile copy
@@ -158,16 +197,7 @@ __forceinline__ __device__ int get_AorC_row_idx(int local_row_idx, int idx_in_wa
     return row_idx;
 }
 
-template <typename To_type, typename Engine, typename Layout>
-inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor)
-{
-    using From_type = typename Engine::value_type;
-    constexpr int numel = decltype(size(tensor))::value;
-    NumericArrayConverterPPU<To_type, From_type, numel> convert_op;
-    // convert_op returns frag from reinterpret_cast of tensor data
-    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
-    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
-}
+using ::flashmla::sparse_wi::convert_acc;
 
 // Launch TMA copy for a range of KV tile
 // A tile has a shape of BlockN (32) x 64
@@ -274,23 +304,9 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 
 // Adapted from https://github.com/Dao-AILab/flash-attention/blob/cdaf2de6e95cb05400959b5ab984f66e4c7df317/hopper/utils.h
 // * Copyright (c) 2024, Tri Dao.
-template <
-    typename Tensor0, typename Tensor1,
-    typename Tensor2, typename TiledMma>
-__forceinline__ __device__ void gemm(Tensor2 &tCrC, Tensor0 const &tCrA, Tensor1 const &tCrB, TiledMma &tiled_mma)
-{
-    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(tCrC)); // MMA_M
-    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB)); // MMA_K
-#pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
-        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), tCrC);
-    }
-}
+using ::flashmla::sparse_wi::gemm;
 
-__forceinline__ __device__ void kernel_sleep_ns()
-{
-    __nanosleep(1);
-}
+using ::flashmla::sparse_wi::kernel_sleep_ns;
 
 // Wait for one KV-tile to be ready, and then calculate P += Q K^T for one Q-tile (BLOCK_SIZE_Mx64) and one KV-tile (PAGE_BLOCK_SIZEx64)
 // The Q-tile should be in shared memory
@@ -421,6 +437,7 @@ __forceinline__ __device__ void qkt_gemm_one_tile_rQ(
     cute::gemm(tiled_mma, thr_mma_rQ_tile(_, _, _2{}), rK_copy_view(_, _, _2{}), rP);
     cute::gemm(tiled_mma, thr_mma_rQ_tile(_, _, _3{}), rK_copy_view(_, _, _3{}), rP);
 }
+
 
 // Pipelined TMA wait and Q K^T gemm
 // In order to overlap memory copy (G->S copy for K) and computation, we divide both Q and K into tiles of shape (BLOCK_SIZE_M, 64), and (BLOCK_N, 64) respectively, and then do the computation as follows:
@@ -1627,6 +1644,23 @@ __forceinline__ __device__ const int* wg_query_indices_bf16(
     return indices + static_cast<int64_t>(query_idx) * row_stride;
 }
 
+template<bool UseExtra, typename T>
+__forceinline__ __device__ const int* wg_query_indices(
+    const Flash_fwd_mla_params &params)
+{
+    // Sq=1 can retain a partial final head tile; every tile uses query zero.
+    // MTP dispatch requires ngroups % kBlockM == 0, so its positive tile
+    // divisor and grid coordinate both fit int32. Only pointer offsets need int64.
+    int query_idx = 0;
+    if (params.seqlen_q > params.ngroups) {
+        query_idx = static_cast<int>(blockIdx.x) / (params.ngroups / T::kBlockM);
+    }
+    const int* indices = UseExtra ? params.extra_indices_ptr : params.indices_ptr;
+    const auto row_stride = UseExtra
+        ? params.extra_indices_row_stride : params.indices_row_stride;
+    return indices + static_cast<int64_t>(query_idx) * row_stride;
+}
+
 // Phase 2: Issue cp.async using precomputed token_ptr + prefetch next token index.
 // LOAD_USE_EXTRA removed: k_base_ptr is dummy (overwritten by token_ptr), only PREFETCH_USE_EXTRA matters
 template<int S, int E, bool PREFETCH_USE_EXTRA, typename T, bool DO_PREFETCH = true,
@@ -1752,7 +1786,37 @@ __forceinline__ __device__ void load_K_tiles_bf16(
 //   * Arrives ONLY barriers_K[S/4] instead of both barriers
 //   * No sV_direct parameter (V read handled elsewhere)
 // ============================================================================
-template<int S, int E, typename T, typename TensorSK, typename TensorVI>
+// Start the dependent indices -> KV-address chain before the softmax/PV work
+// in each WI iteration. The staged loader still applies the per-request valid
+// length, so it is safe to prefetch indices beyond a variable topk_len.
+template<typename T>
+__forceinline__ __device__ int prefetch_v41_token_index(
+    const Flash_fwd_mla_params &params, int batch_idx, int block_idx_kv,
+    int ori_block_max, int tidx) {
+    using Base = typename T::Base;
+    constexpr int kBlockN = Base::kBlockN;
+    constexpr int kLanesPerToken = (Base::NUM_THREADS / 2) / kBlockN;
+    static_assert(kLanesPerToken == 8);
+    const bool use_extra = (ori_block_max >= 0) && (block_idx_kv >= ori_block_max);
+    const int effective_block = use_extra ? block_idx_kv - ori_block_max : block_idx_kv;
+    const int max_topk = use_extra ? params.extra_topk : params.topk;
+    const int token_id = tidx / kLanesPerToken;
+    // All eight lanes consume one token. Issue its dependent index load once
+    // and distribute it before the conversion work instead of loading it eight times.
+    int token_idx = -1;
+    if (effective_block >= 0 && effective_block * kBlockN + token_id < max_topk
+            && tidx % kLanesPerToken == 0) {
+        const int *indices_base = use_extra
+            ? wg_query_indices<true, T>(params) + static_cast<int64_t>(batch_idx) * params.extra_indices_batch_stride
+                + effective_block * kBlockN
+            : wg_query_indices<false, T>(params) + static_cast<int64_t>(batch_idx) * params.indices_batch_stride
+                + effective_block * kBlockN;
+        token_idx = __ldg(indices_base + token_id);
+    }
+    return __shfl_sync(0xffffffff, token_idx, 0, kLanesPerToken);
+}
+
+template<int S, int E, typename T, bool PreloadedIndex = false, typename TensorSK, typename TensorVI>
 __forceinline__ __device__ void load_and_dequant_sparse_K_staged(
     const Flash_fwd_mla_params &params,
     TensorSK &sK,
@@ -1764,7 +1828,8 @@ __forceinline__ __device__ void load_and_dequant_sparse_K_staged(
     int tidx,
     int ori_block_max,
     TensorVI &smem_valid_indices,
-    int vi_buf_idx
+    int vi_buf_idx,
+    int preloaded_index = -1
 ) {
     using Base   = typename T::Base;
     using InputT = typename T::InputT;       // cutlass::bfloat16_t
@@ -1793,10 +1858,10 @@ __forceinline__ __device__ void load_and_dequant_sparse_K_staged(
     const int effective_block = use_extra ? (block_idx_kv - ori_block_max) : block_idx_kv;
 
     const int *indices_base = use_extra
-        ? (params.extra_indices_ptr
+        ? (wg_query_indices<true, T>(params)
            + static_cast<int64_t>(batch_idx) * params.extra_indices_batch_stride
            + effective_block * kBlockN)
-        : (params.indices_ptr
+        : (wg_query_indices<false, T>(params)
            + static_cast<int64_t>(batch_idx) * params.indices_batch_stride
            + effective_block * kBlockN);
     const int page_block_size = use_extra ? params.extra_page_block_size : params.page_block_size;
@@ -1826,15 +1891,151 @@ __forceinline__ __device__ void load_and_dequant_sparse_K_staged(
     if (tile_valid > kBlockN) tile_valid = kBlockN;
 
     // ---- 0. Valid indices (only for stage 0) ----
-    if constexpr (S == 0) {
+    if constexpr (S == 0 && !T::kV41FP8) {
         if (tidx < kBlockN) {
             int t_idx = (tidx < tile_valid) ? __ldg(indices_base + tidx) : -1;
             smem_valid_indices(vi_buf_idx, tidx) = (t_idx >= 0);
         }
     }
 
-    // ---- 1. Nope dequant: [kNopeDimStart, kNopeDimEnd) ----
-    if constexpr (kNopeRange > 0) {
+    // V4.1 keeps all 512 dimensions in the quantized data segment. Eight lanes
+    // serve each token; each lane handles 32 values per stage. FP8 has one E8M0
+    // scale per lane, while FP4 has two E4M3 scales (one per 16 values).
+    if constexpr (T::kV41FP8) {
+        static_assert(kNopeRange == 256 && kRopeRange == 0);
+        constexpr int kLanesPerToken = kThreadsPerWg / kBlockN;
+        static_assert(kLanesPerToken == 8);
+        const int token_id = tidx / kLanesPerToken;
+        const int lane = tidx % kLanesPerToken;
+        const int dim_begin = kDimStart + lane * 32;
+        const bool token_valid = token_id < tile_valid;
+        int page_idx = 0;
+        int off_in_page = 0;
+        int t_idx = -1;
+        if constexpr (PreloadedIndex) {
+            t_idx = token_valid ? preloaded_index : -1;
+        } else {
+            if (token_valid && lane == 0) {
+                t_idx = __ldg(indices_base + token_id);
+            }
+            t_idx = __shfl_sync(0xffffffff, t_idx, 0, kLanesPerToken);
+        }
+        if constexpr (S == 0) {
+            // Publish validity from the same index used for KV addressing.
+            if (lane == 0) smem_valid_indices(vi_buf_idx, token_id) = (t_idx >= 0);
+        }
+        if (token_valid) {
+            if (t_idx >= 0) {
+                // The V4.1 WI dispatch admits only power-of-two page sizes.
+                const int page_shift = __ffs(page_block_size) - 1;
+                page_idx = t_idx >> page_shift;
+                off_in_page = t_idx & (page_block_size - 1);
+            }
+        }
+        const bool valid = t_idx >= 0;
+        if constexpr (T::kExtraFP4) {
+            if (use_extra) {
+                // FP4 data and E4M3 scales are separate block segments.
+                const uint8_t *block = k_base + page_idx * k_batch_stride;
+                const uint8_t *data = block + off_in_page * 256 + dim_begin / 2;
+                const uint8_t *scales = block + page_block_size * 256
+                    + off_in_page * 32;
+                float scales_fp4[2] = {0.0f, 0.0f};
+                if (valid) {
+                    #pragma unroll
+                    for (int group = 0; group < 2; ++group) {
+                        const uint8_t raw = __ldg(scales + dim_begin / 16 + group);
+                        const __hg_fp8_e4m3 e4m3 = *reinterpret_cast<const __hg_fp8_e4m3*>(&raw);
+                        scales_fp4[group] = float(e4m3);
+                    }
+                }
+                // Each lane owns 16 aligned packed bytes: one 128-bit load.
+                uint4 packed4{};
+                if (valid) {
+                    packed4 = __ldg(reinterpret_cast<const uint4*>(data));
+                }
+                const __ppu_bfloat162 scales_bf16x2[2] = {
+                    __float2bfloat162_rn(scales_fp4[0]),
+                    __float2bfloat162_rn(scales_fp4[1])
+                };
+                const uint32_t words[4] = {packed4.x, packed4.y, packed4.z, packed4.w};
+                #pragma unroll
+                for (int chunk = 0; chunk < 4; ++chunk) {
+                    const uint4 decoded = flashmla::dsa::decode_quant::fp4_word_to_bf16x8_bits(words[chunk]);
+                    const uint32_t pairs[4] = {decoded.x, decoded.y, decoded.z, decoded.w};
+                    uint32_t out_bits[4]{};
+                    #pragma unroll
+                    for (int pair = 0; pair < 4; ++pair) {
+                        const uint32_t values = pairs[pair];
+                        const __ppu_bfloat162 scaled = __hmul2(
+                            *reinterpret_cast<const __ppu_bfloat162*>(&values),
+                            scales_bf16x2[chunk / 2]);
+                        out_bits[pair] = *reinterpret_cast<const uint32_t*>(&scaled);
+                    }
+                    // Swizzle<3,3,3> preserves the eight contiguous BF16 values
+                    // beginning at a multiple of eight: one aligned 16-byte store.
+                    *reinterpret_cast<uint4*>(&sK(token_id, dim_begin + chunk * 8, buf_idx)) =
+                        uint4{out_bits[0], out_bits[1], out_bits[2], out_bits[3]};
+                }
+            } else {
+                const uint8_t *block = k_base + page_idx * k_batch_stride;
+                const uint8_t *data = block + off_in_page * 512 + dim_begin;
+                const uint8_t *scales = block + page_block_size * 512
+                    + off_in_page * 16;
+                float scale = 0.0f;
+                if (valid) {
+                    const uint8_t raw = __ldg(scales + dim_begin / 32);
+                    const fp8_e8m0 e8m0 = *reinterpret_cast<const fp8_e8m0*>(&raw);
+                    scale = float(e8m0);
+                }
+                // Each lane owns 32 aligned FP8 bytes: two 128-bit loads.
+                uint4 packed_lo{}, packed_hi{};
+                if (valid) {
+                    packed_lo = __ldg(reinterpret_cast<const uint4*>(data));
+                    packed_hi = __ldg(reinterpret_cast<const uint4*>(data + 16));
+                }
+                const __ppu_bfloat162 scale_bf16x2 = __float2bfloat162_rn(scale);
+                const uint32_t words[8] = {
+                    packed_lo.x, packed_lo.y, packed_lo.z, packed_lo.w,
+                    packed_hi.x, packed_hi.y, packed_hi.z, packed_hi.w
+                };
+                #pragma unroll
+                for (int vec = 0; vec < 4; ++vec) {
+                    const uint4 out_bits = flashmla::dsa::decode_quant::fp8_words_to_scaled_bf16x8_bits(
+                        words[vec * 2], words[vec * 2 + 1], scale_bf16x2);
+                    *reinterpret_cast<uint4*>(&sK(token_id, dim_begin + vec * 8, buf_idx)) = out_bits;
+                }
+            }
+        } else {
+            const uint8_t *block = k_base + page_idx * k_batch_stride;
+            const uint8_t *data = block + off_in_page * 512 + dim_begin;
+            const uint8_t *scales = block + page_block_size * 512
+                + off_in_page * 16;
+            float scale = 0.0f;
+            if (valid) {
+                const uint8_t raw = __ldg(scales + dim_begin / 32);
+                const fp8_e8m0 e8m0 = *reinterpret_cast<const fp8_e8m0*>(&raw);
+                scale = float(e8m0);
+            }
+            uint4 packed_lo{}, packed_hi{};
+            if (valid) {
+                packed_lo = __ldg(reinterpret_cast<const uint4*>(data));
+                packed_hi = __ldg(reinterpret_cast<const uint4*>(data + 16));
+            }
+            const __ppu_bfloat162 scale_bf16x2 = __float2bfloat162_rn(scale);
+            const uint32_t words[8] = {
+                packed_lo.x, packed_lo.y, packed_lo.z, packed_lo.w,
+                packed_hi.x, packed_hi.y, packed_hi.z, packed_hi.w
+            };
+            #pragma unroll
+            for (int vec = 0; vec < 4; ++vec) {
+                const uint4 out_bits = flashmla::dsa::decode_quant::fp8_words_to_scaled_bf16x8_bits(
+                    words[vec * 2], words[vec * 2 + 1], scale_bf16x2);
+                *reinterpret_cast<uint4*>(&sK(token_id, dim_begin + vec * 8, buf_idx)) = out_bits;
+            }
+        }
+    // ---- 1. Legacy FP8 dequant: [kNopeDimStart, kNopeDimEnd) ----
+    } else if constexpr (kNopeRange > 0) {
         constexpr int kTotalNopeElems     = kBlockN * kNopeRange;
         constexpr int kNopeElemsPerThread = kTotalNopeElems / kThreadsPerWg;
         static_assert(kTotalNopeElems % kThreadsPerWg == 0,
@@ -1920,7 +2121,7 @@ __forceinline__ __device__ void load_and_dequant_sparse_K_staged(
 
     // ---- 3. Warpgroup-level sync ----
     {
-        int _bar_id = 6 + (int)(tidx >> 8);
+        int _bar_id = 6 + (int)(threadIdx.x >> 8);
         NamedBarrier::sync(
             kThreadsPerWg, static_cast<cutlass::arch::ReservedNamedBarriers>(_bar_id));
     }
@@ -2091,6 +2292,9 @@ __forceinline__ __device__ void wg0_subroutine(
     bool &precomp_valid0,
     bool &precomp_valid1
 ) {
+    // Preserve upstream BF16 supply/barrier scheduling. Quantized kernels
+    // use the validated shared iteration at compile time.
+    if constexpr (!T::IsFP8) {
     int start_token_idx = block_idx * T::kBlockN;
     int nxt_block0 = block_idx+2;
     int nxt_block1 = block_idx+3;
@@ -2259,6 +2463,125 @@ __forceinline__ __device__ void wg0_subroutine(
         cur_sK1 = sK(_, _, (kv_idx + 1) % 3);
         nxt_sK0 = sK(_, _, (kv_idx + 2) % 3);
     }
+
+    } else {
+    int start_token_idx = block_idx * T::kBlockN;
+    int nxt_block0 = block_idx+2;
+    int nxt_block1 = block_idx+3;
+
+    int prefetched_idx0 = -1, prefetched_idx1 = -1;
+    if constexpr (T::kV41FP8 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        prefetched_idx0 = prefetch_v41_token_index<T>(
+            params, batch_idx, nxt_block0, ori_block_max, idx_in_warpgroup);
+        prefetched_idx1 = prefetch_v41_token_index<T>(
+            params, batch_idx, nxt_block1, ori_block_max, idx_in_warpgroup);
+    }
+
+    // [Task #68] Derive V directly from K buffers. cur_sK0 holds even block (local),
+    // cur_sK1 holds odd block (remote). V = first 512 dims of each K buffer.
+    // Cross-WG smem_valid_indices: 4 bufs, WG0 uses 0/1, WG1 uses 2/3 (alternating)
+    int vi_softmax_wg0 = (block_idx / 2) % 2;       // 0 or 1
+    auto sV_local = make_tensor(cur_sK0.data(), (typename T::SmemLayoutVDirect){});
+    Tensor sV0L = get_half_V<T, 0>(sV_local);
+    auto sV_remote = make_tensor(cur_sK1.data(), (typename T::SmemLayoutVDirect){});
+    Tensor sV1L = get_half_V<T, 0>(sV_remote);
+
+    auto nxt_sK1 = cur_sK0;
+
+#define FLASHMLA_WI_LEGACY_DECODE 1
+#define FLASHMLA_WI_CURRENT_WG 0
+#define FLASHMLA_WI_PV_LOCAL warpgroup_cooperative_pv_gemm_localP
+#define FLASHMLA_WI_PV_REMOTE warpgroup_cooperative_pv_gemm_remoteP
+#define FLASHMLA_WI_QK warpgroup_cooperative_qkt_gemm
+#if ACOMPUTE_VERSION == 10000
+#define FLASHMLA_WI_WG0_MAKE_P_C1_C2() \
+    Tensor rPb = wg0_bunch_0< T, IS_BLK0_LAST || IS_BLK1_LAST > (rP0, rO0, sScale0, sM, rL, params.scale_softmax_log2, start_token_idx, idx_in_warpgroup, smem_valid_indices, vi_softmax_wg0);
+#define FLASHMLA_WI_WG0_MAKE_P_C1() \
+    FLASHMLA_WI_WG0_MAKE_P_C1_C2()
+#else
+#define FLASHMLA_WI_WG0_MAKE_P_C1_C3() \
+    Tensor rPb = make_tensor<typename T::InputT>(Shape<Shape<_2, _2, _2>, _1, _2>{}); \
+        wg0_bunch_0< T, IS_BLK0_LAST || IS_BLK1_LAST > (rPb, rP0, rO0, sScale0, sM, rL, params.scale_softmax_log2, start_token_idx, idx_in_warpgroup, smem_valid_indices, vi_softmax_wg0);
+#define FLASHMLA_WI_WG0_MAKE_P_C1() \
+    FLASHMLA_WI_WG0_MAKE_P_C1_C3()
+#endif
+#define FLASHMLA_WI_WG0_MAKE_P_C4()
+#define FLASHMLA_WI_WG0_MAKE_P() \
+    FLASHMLA_WI_WG0_MAKE_P_C1() \
+    FLASHMLA_WI_WG0_MAKE_P_C4()
+#define FLASHMLA_WI_WG0_FIRST_SUPPLY() \
+    if constexpr (T::kBlockM == 64) { \
+            __syncthreads(); \
+        } \
+        if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) { \
+            if constexpr (!T::IsFP8) { \
+                issue_K_load_bf16<0, 4, NEXT_EXTRA, T>(params, nxt_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0], \
+                    idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0, \
+                    pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k); \
+            } else { \
+                int vi_preload_wg0 = 1 - vi_softmax_wg0; \
+                load_and_dequant_sparse_K_staged<0, 4, T, T::kV41FP8>( \
+                    params, sK, batch_idx, nxt_block0, seqlen_k, \
+                    (kv_idx + 2) % 3, &barriers_K0[0], \
+                    idx_in_warpgroup, ori_block_max, smem_valid_indices, vi_preload_wg0, \
+                    prefetched_idx0); \
+            } \
+        }
+#define FLASHMLA_WI_WG0_SECOND_SUPPLY_BEFORE_P() \
+    if constexpr (T::kBlockM == 64) { \
+            __syncthreads(); \
+        } \
+        if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) { \
+            if constexpr (!T::IsFP8) { \
+                issue_K_load_bf16<0, 4, NEXT_EXTRA, T>(params, nxt_sK1, batch_idx, nxt_block1, seqlen_k, &barriers_K1[0], \
+                    idx_in_warpgroup, ori_block_max, precomp_ptr1, precomp_valid1, \
+                    pre_token_idx_b, nxt_block1 + 2, end_block_idx, extra_seqlen_k); \
+            } else { \
+                int vi_preload_wg1 = 3 - vi_softmax_wg0; \
+                load_and_dequant_sparse_K_staged<0, 4, T, T::kV41FP8>( \
+                    params, sK, batch_idx, nxt_block1, seqlen_k, \
+                    kv_idx, &barriers_K1[0], \
+                    idx_in_warpgroup, ori_block_max, smem_valid_indices, vi_preload_wg1, \
+                    prefetched_idx1); \
+            } \
+        }
+#define FLASHMLA_WI_WG0_AFTER_P() \
+    if constexpr (T::kBlockM == 64) { \
+            __syncthreads(); \
+        }
+#define FLASHMLA_WI_WG0_PREPARE_NEXT() \
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) { \
+            if constexpr (!T::IsFP8) { \
+                int next_nxt_block0 = block_idx + 4; \
+                precomp_ptr0 = compute_K_addr_bf16<0, NEXT_EXTRA, T>( \
+                    params, batch_idx, next_nxt_block0, seqlen_k, \
+                    idx_in_warpgroup, ori_block_max, smem_valid_indices, vi_softmax_wg0, \
+                    pre_token_idx, extra_seqlen_k, precomp_valid0); \
+                int next_nxt_block1 = block_idx + 5; \
+                int next_vi_preload_wg1 = vi_softmax_wg0 + 2; \
+                precomp_ptr1 = compute_K_addr_bf16<0, NEXT_EXTRA, T>( \
+                    params, batch_idx, next_nxt_block1, seqlen_k, \
+                    idx_in_warpgroup, ori_block_max, smem_valid_indices, next_vi_preload_wg1, \
+                    pre_token_idx_b, extra_seqlen_k, precomp_valid1); \
+            } \
+        }
+#include "prefill/sparse/wg_iteration_body.cuh"
+#undef FLASHMLA_WI_LEGACY_DECODE
+#undef FLASHMLA_WI_CURRENT_WG
+#undef FLASHMLA_WI_PV_LOCAL
+#undef FLASHMLA_WI_PV_REMOTE
+#undef FLASHMLA_WI_QK
+#undef FLASHMLA_WI_WG0_MAKE_P_C1_C2
+#undef FLASHMLA_WI_WG0_MAKE_P_C1
+#undef FLASHMLA_WI_WG0_MAKE_P_C1_C3
+#undef FLASHMLA_WI_WG0_MAKE_P_C4
+#undef FLASHMLA_WI_WG0_MAKE_P
+#undef FLASHMLA_WI_WG0_FIRST_SUPPLY
+#undef FLASHMLA_WI_WG0_SECOND_SUPPLY_BEFORE_P
+#undef FLASHMLA_WI_WG0_AFTER_P
+#undef FLASHMLA_WI_WG0_PREPARE_NEXT
+
+    }
 }
 
 template <
@@ -2328,6 +2651,9 @@ __forceinline__ __device__ void wg1_subroutine(
     bool &precomp_valid0,
     bool &precomp_valid1
 ) {
+    // Preserve upstream BF16 supply/barrier scheduling. Quantized kernels
+    // use the validated shared iteration at compile time.
+    if constexpr (!T::IsFP8) {
     int start_token_idx = block_idx * T::kBlockN;
     int nxt_block0 = block_idx+2;
     int nxt_block1 = block_idx+3;
@@ -2515,23 +2841,125 @@ __forceinline__ __device__ void wg1_subroutine(
         cur_sK0 = sK(_, _, (kv_idx + 1) % 3);
         nxt_sK1 = sK(_, _, (kv_idx + 2) % 3);
     }
-}
 
-// A helper function for determining the length of the causal mask for one q token
-__forceinline__ __device__ int get_mask_len(const Flash_fwd_mla_params &params, int m_block_idx, int local_seq_q_idx) {
-    int global_seq_q_idx = m_block_idx*Config::BLOCK_SIZE_M + local_seq_q_idx;
-    if (global_seq_q_idx < params.seqlen_q) {
-        int s_q_idx = global_seq_q_idx / params.ngroups;
-        return params.q_orig - s_q_idx - 1;
     } else {
-        // Out-of-bound request, regard as no masks
-        return 0;
+    int start_token_idx = block_idx * T::kBlockN;
+    int nxt_block0 = block_idx+2;
+    int nxt_block1 = block_idx+3;
+
+    int prefetched_idx0 = -1, prefetched_idx1 = -1;
+    if constexpr (T::kV41FP8 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        prefetched_idx0 = prefetch_v41_token_index<T>(
+            params, batch_idx, nxt_block0, ori_block_max, idx_in_warpgroup);
+        prefetched_idx1 = prefetch_v41_token_index<T>(
+            params, batch_idx, nxt_block1, ori_block_max, idx_in_warpgroup);
+    }
+
+    auto nxt_sK0 = cur_sK1;
+    // Derive V directly from K buffers. In wg1_subroutine, due to
+    // LAUNCH_WG1_SUBROUTINE arg-swap: cur_sK0 = odd block (local for wg1),
+    // cur_sK1 = even block (remote from wg0). V = first 512 dims of each K buffer.
+    // Cross-WG smem_valid_indices: 4 bufs, WG0 uses 0/1, WG1 uses 2/3 (alternating)
+    int vi_softmax_wg1 = 2 + (block_idx / 2) % 2;    // 2 or 3
+    auto sV_local = make_tensor(cur_sK0.data(), (typename T::SmemLayoutVDirect){});
+    Tensor sV0R = get_half_V<T, 1>(sV_local);
+    auto sV_remote = make_tensor(cur_sK1.data(), (typename T::SmemLayoutVDirect){});
+    Tensor sV1R = get_half_V<T, 1>(sV_remote);
+
+
+#define FLASHMLA_WI_LEGACY_DECODE 1
+#define FLASHMLA_WI_CURRENT_WG 1
+#define FLASHMLA_WI_PV_LOCAL warpgroup_cooperative_pv_gemm_localP
+#define FLASHMLA_WI_PV_REMOTE warpgroup_cooperative_pv_gemm_remoteP
+#define FLASHMLA_WI_QK warpgroup_cooperative_qkt_gemm
+#define FLASHMLA_WI_WG1_INITIAL_SUPPLY() \
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) { \
+            constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem; \
+            if constexpr (!T::IsFP8) { \
+                issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T>(params, nxt_sK1, batch_idx, nxt_block1, seqlen_k, &barriers_K1[1], \
+                    idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0, \
+                    pre_token_idx, nxt_block1 + 2, end_block_idx, extra_seqlen_k); \
+            } else { \
+                load_and_dequant_sparse_K_staged<4, kNumTiles, T, T::kV41FP8>( \
+                    params, sK, batch_idx, nxt_block1, seqlen_k, \
+                    (kv_idx + 2) % 3, &barriers_K1[0], \
+                    idx_in_warpgroup, ori_block_max, smem_valid_indices, 0, \
+                    prefetched_idx1); \
+            } \
+        }
+#define FLASHMLA_WI_WG1_EARLY_PACKET_SUPPLY()
+#define FLASHMLA_WI_WG1_FINISH_FIRST()
+#define FLASHMLA_WI_WG1_SECOND_PACKET()
+#define FLASHMLA_WI_WG1_FINISH_FIRST_AFTER_P()
+#define FLASHMLA_WI_WG1_PRE_CURMAX() \
+    wg1_bunch_0_pre<T, IS_BLK0_LAST>(r_cur_max, rP1, params.scale_softmax_log2, idx_in_warpgroup, smem_valid_indices, vi_softmax_wg1);
+#if ACOMPUTE_VERSION == 10000
+#define FLASHMLA_WI_WG1_MAKE_P_C1_C2() \
+    Tensor rP1b = wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, false>(sScale1, rO1, sM, rL, sScale0, rP1, params.scale_softmax_log2, start_token_idx+T::kBlockN, idx_in_warpgroup, smem_valid_indices, vi_softmax_wg1, r_cur_max);
+#define FLASHMLA_WI_WG1_MAKE_P_C1() \
+    FLASHMLA_WI_WG1_MAKE_P_C1_C2()
+#else
+#define FLASHMLA_WI_WG1_MAKE_P_C1_C3() \
+    Tensor rP1b = make_tensor<typename T::InputT>(Shape<Shape<_2, _2, _2>, _1, _2>{}); \
+        wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, false>(rP1b, sScale1, rO1, sM, rL, sScale0, rP1, params.scale_softmax_log2, start_token_idx+T::kBlockN, idx_in_warpgroup, smem_valid_indices, vi_softmax_wg1, r_cur_max);
+#define FLASHMLA_WI_WG1_MAKE_P_C1() \
+    FLASHMLA_WI_WG1_MAKE_P_C1_C3()
+#endif
+#define FLASHMLA_WI_WG1_MAKE_P_C4()
+#define FLASHMLA_WI_WG1_MAKE_P() \
+    FLASHMLA_WI_WG1_MAKE_P_C1() \
+    FLASHMLA_WI_WG1_MAKE_P_C4()
+#define FLASHMLA_WI_WG1_SECOND_SUPPLY_AND_ADDRESS() \
+    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) { \
+            constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem; \
+            if constexpr (!T::IsFP8) { \
+                issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T>(params, nxt_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[1], \
+                    idx_in_warpgroup, ori_block_max, precomp_ptr1, precomp_valid1, \
+                    pre_token_idx_b, nxt_block0 + 2, end_block_idx, extra_seqlen_k); \
+            } else { \
+                load_and_dequant_sparse_K_staged<4, kNumTiles, T, T::kV41FP8>( \
+                    params, sK, batch_idx, nxt_block0, seqlen_k, \
+                    kv_idx, &barriers_K0[0], \
+                    idx_in_warpgroup, ori_block_max, smem_valid_indices, 0, \
+                    prefetched_idx0); \
+            } \
+        } \
+        if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) { \
+            if constexpr (!T::IsFP8) { \
+                int next_nxt_block1 = block_idx + 5; \
+                precomp_ptr0 = compute_K_addr_bf16<4, NEXT_EXTRA, T>( \
+                    params, batch_idx, next_nxt_block1, seqlen_k, \
+                    idx_in_warpgroup, ori_block_max, smem_valid_indices, 0, \
+                    pre_token_idx, extra_seqlen_k, precomp_valid0); \
+                int next_nxt_block0 = block_idx + 4; \
+                precomp_ptr1 = compute_K_addr_bf16<4, NEXT_EXTRA, T>( \
+                    params, batch_idx, next_nxt_block0, seqlen_k, \
+                    idx_in_warpgroup, ori_block_max, smem_valid_indices, 0, \
+                    pre_token_idx_b, extra_seqlen_k, precomp_valid1); \
+            } \
+        }
+#include "prefill/sparse/wg_iteration_body.cuh"
+#undef FLASHMLA_WI_LEGACY_DECODE
+#undef FLASHMLA_WI_CURRENT_WG
+#undef FLASHMLA_WI_PV_LOCAL
+#undef FLASHMLA_WI_PV_REMOTE
+#undef FLASHMLA_WI_QK
+#undef FLASHMLA_WI_WG1_INITIAL_SUPPLY
+#undef FLASHMLA_WI_WG1_EARLY_PACKET_SUPPLY
+#undef FLASHMLA_WI_WG1_FINISH_FIRST
+#undef FLASHMLA_WI_WG1_SECOND_PACKET
+#undef FLASHMLA_WI_WG1_FINISH_FIRST_AFTER_P
+#undef FLASHMLA_WI_WG1_PRE_CURMAX
+#undef FLASHMLA_WI_WG1_MAKE_P_C1_C2
+#undef FLASHMLA_WI_WG1_MAKE_P_C1
+#undef FLASHMLA_WI_WG1_MAKE_P_C1_C3
+#undef FLASHMLA_WI_WG1_MAKE_P_C4
+#undef FLASHMLA_WI_WG1_MAKE_P
+#undef FLASHMLA_WI_WG1_SECOND_SUPPLY_AND_ADDRESS
+
     }
 }
 
-
-// [SPARSE-WI Stage B] Is_causal template parameter dropped: sparse decode
-// expresses causal masking via indices, not via traditional causal mask path.
 template<typename T>
 __global__ void __launch_bounds__(T::NUM_THREADS, 1, 1)
 flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params params) {
@@ -2903,16 +3331,12 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
             // Phase 1: prefetch/compute for primary cache (NEXT_EXTRA=false)
             int p1_end = min(ori_block_max >= 0 ? ori_block_max - 4 : end_block_idx - 2, end_block_idx - 2);
             #pragma unroll 1
-            for (; block_idx < p1_end; block_idx += 2) {
-                LAUNCH_WG0_SUBROUTINE(false, false, false);
-            }
+            FLASHMLA_WI_PAIR_RANGE(block_idx < p1_end, LAUNCH_WG0_SUBROUTINE(false, false, false))
             // Phase 2: prefetch/compute for extra cache (NEXT_EXTRA=true)
             #pragma unroll 1
-            for (; block_idx < end_block_idx-2; block_idx += 2) {
-                LAUNCH_WG0_SUBROUTINE(false, false, true);
-            }
+            FLASHMLA_WI_PAIR_RANGE(block_idx < end_block_idx-2, LAUNCH_WG0_SUBROUTINE(false, false, true))
             // Phase 3: last 2 blocks (no K load/prefetch/compute_addr)
-            LAUNCH_WG0_SUBROUTINE(false, true, false);
+            FLASHMLA_WI_PAIR_FINAL(LAUNCH_WG0_SUBROUTINE(false, true, false))
         } else {
             // // Warpgroup 1
             // Tensor rP1 = make_tensor<float>((typename T::rP0Layout){});
@@ -2979,16 +3403,12 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
             // Phase 1: prefetch/compute for primary cache (NEXT_EXTRA=false)
             int p1_end = min(ori_block_max >= 0 ? ori_block_max - 4 : end_block_idx - 2, end_block_idx - 2);
             #pragma unroll 1
-            for (; block_idx < p1_end; block_idx += 2) {
-                LAUNCH_WG1_SUBROUTINE(false, false, false);
-            }
+            FLASHMLA_WI_PAIR_RANGE(block_idx < p1_end, LAUNCH_WG1_SUBROUTINE(false, false, false))
             // Phase 2: prefetch/compute for extra cache (NEXT_EXTRA=true)
             #pragma unroll 1
-            for (; block_idx < end_block_idx-2; block_idx += 2) {
-                LAUNCH_WG1_SUBROUTINE(false, false, true);
-            }
+            FLASHMLA_WI_PAIR_RANGE(block_idx < end_block_idx-2, LAUNCH_WG1_SUBROUTINE(false, false, true))
             // Phase 3: last 2 blocks
-            LAUNCH_WG1_SUBROUTINE(false, true, false);
+            FLASHMLA_WI_PAIR_FINAL(LAUNCH_WG1_SUBROUTINE(false, true, false))
         }
 
         // Reduce rL across threads within the same warp
@@ -3239,11 +3659,17 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params param
     }
 }
 
-template <typename InputT, int Arch, bool IsFP8, int BlockM>
+template <typename InputT, int Arch, bool IsFP8, int BlockM,
+          bool IsV41FP8, bool IsExtraFP4>
 void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_t stream)
 {
     if constexpr (!IsFP8) {
         FLASH_ASSERT(params.ngroups > 0 && params.ngroups % BlockM == 0);
+    } else {
+        FLASH_ASSERT(params.ngroups > 0);
+        if (params.seqlen_q > params.ngroups) {
+            FLASH_ASSERT(params.ngroups % BlockM == 0);
+        }
     }
     // Correct the internal launch geometry without changing API metadata,
     // num_splits, scratch capacity, or params.num_sm_parts. Host SDK version
@@ -3282,10 +3708,11 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
     }
     // [SPARSE-WI Stage B] BOOL_SWITCH on is_causal removed -- only one
     // instantiation; sparse path ignores params.is_causal.
+    if constexpr (!IsV41FP8) {
     if (params.d == 576) {
         // [SPARSE-WI Stage D-step1] Switch to Traits_v2 -- adds fp8 nope/scales
         // and indices SMEM regions; everything else inherits 1:1 from splitkv.
-        using T = Traits_v2<InputT, 576, IsFP8, BlockM>;
+        using T = Traits_v2<InputT, 576, IsFP8, BlockM, IsV41FP8, IsExtraFP4>;
 
         auto mla_kernel = &flash_sparse_decode_wg_kernel<T>;
         if constexpr (Arch == 89 && !IsFP8 && BlockM == 128 &&
@@ -3353,9 +3780,12 @@ void run_flash_sparse_decode_wg_kernel(Flash_fwd_mla_params &params, hggcStream_
         CHECK_CUDA_KERNEL_LAUNCH();
 
         run_flash_mla_combine_kernel<InputT>(params, stream);
-    } else {
+        return;
+    }
+    }
+    {
         // Headdim=512
-        using T = Traits_v2<InputT, 512, IsFP8, BlockM>;
+        using T = Traits_v2<InputT, 512, IsFP8, BlockM, IsV41FP8, IsExtraFP4>;
 
         auto mla_kernel = &flash_sparse_decode_wg_kernel<T>;
         if constexpr (Arch == 89 && !IsFP8 && BlockM == 128 &&

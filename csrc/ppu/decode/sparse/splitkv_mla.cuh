@@ -11,6 +11,7 @@
 #include <cute/util/debug.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
+#include <cstdlib>
 
 #include <c10/cuda/CUDAException.h>
 
@@ -22,6 +23,7 @@
 #include "utils.h"
 #include "ppuxx/decode/combine/combine.cuh"
 #include "decode/sparse/sparse_decode_wg.h"
+#include "decode/sparse/sparse_quant_decode.h"
 #include "kerutils/host/host.h"
 
 #include <hggc_ad.h>
@@ -30,6 +32,7 @@
 namespace flash {
 using namespace cute;
 
+#define FLASHMLA_SPLITKV_COMPUTE_QUANT 1
 template<typename Kernel_traits, bool IsV41FP8, bool IsExtraFP4, typename Params>
 __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     const Params &params, const int batch_id, const int bidh, const int m_block,
@@ -443,37 +446,19 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         __syncthreads();
 
         auto qk_softmax_fused = [&]() {
-            auto tSsk_curr = make_tensor(tSsK.data() + buf_idx * size(sK), layout(tSsK));
-            if constexpr (Kernel_traits::Is_Q_in_regs) {
-                flash::gemm_rss<Kernel_traits::KEEP_Q_NUM>(
-                        acc_s, tSrQ, tSrK, tSsQ, tSsk_curr, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
-                        smem_thr_copy_Q, smem_thr_copy_K
-                );
-            } else {
-                flash::gemm<false>(
-                        acc_s, tSrQ, tSrK, tSsQ, tSsk_curr, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
-                        smem_thr_copy_Q, smem_thr_copy_K
-                );
-            }
+#define FLASHMLA_SPLITKV_COMPUTE_QK 1
+#include "splitkv_compute_body.cuh"
+#undef FLASHMLA_SPLITKV_COMPUTE_QK
 
             // scale load n+1
             if constexpr (!IS_LAST_BLOCK & kBlockM >= 64) {
                 load_scale(scale_load);
             }
 
-            constexpr int MMA_N_S = kBlockN / decltype(typename Kernel_traits::TiledMmaS{}.template tile_size_mnk<1>())::value;
-            const int warpN_idx = (warp_idx / AtomLayoutQ) * MMA_N_S;
-            flash::apply_indices_mask(acc_s, smem_valid_indices, warpN_idx, buf_idx);
+#define FLASHMLA_SPLITKV_COMPUTE_MASK_SOFTMAX_P 1
+#include "splitkv_compute_body.cuh"
+#undef FLASHMLA_SPLITKV_COMPUTE_MASK_SOFTMAX_P
 
-            if constexpr (IS_FIRST_BLOCK) {
-                softmax.template softmax_rescale_per_warp</*Is_first=*/true,  /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.scale_softmax_log2);
-            } else {
-                softmax.template softmax_rescale_per_warp</*Is_first=*/false, /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.scale_softmax_log2);
-            }
-
-            Tensor rS = flash::convert_type<Element>(acc_s);
-            Tensor tSaS = smem_thr_copy_S.retile_S(rS);     // ((Atom,AtomNum), MMA_N, MMA_N)
-            cute::copy(smem_tiled_copy_S, tSaS, tSsS);
         };
 
         if (warp_idx < kNWarps0) {
@@ -484,13 +469,9 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         if constexpr (!IS_LAST_BLOCK & kBlockM < 64) {
             load_scale(scale_load);
         }
-        if constexpr (!IS_FIRST_BLOCK) {
-            softmax.template softmax_rescale_o(acc_o, smem_row_scale);
-        }
-
-        auto tOsVt_curr = make_tensor(tOsVt.data() + buf_idx * size(sK), layout(tOsVt));
-        flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_curr, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
-                smem_thr_copy_P, smem_thr_copy_V);
+#define FLASHMLA_SPLITKV_COMPUTE_RESCALE_PV 1
+#include "splitkv_compute_body.cuh"
+#undef FLASHMLA_SPLITKV_COMPUTE_RESCALE_PV
 
         if constexpr (!IS_LAST_BLOCK) {
             smem_valid_indices(nxt_buf_idx, col_in_indices) = valid;
@@ -546,12 +527,13 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     softmax.template softmax_rescale_o(acc_o, smem_row_scale);
 
     // Epilogue
-    if (NoSplit) {
-        flash::store<Kernel_traits, false, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
-    } else {
-        flash::store<Kernel_traits, true, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
-    }
+#define FLASHMLA_SPLITKV_COMPUTE_FINAL_STORE 1
+#include "splitkv_compute_body.cuh"
+#undef FLASHMLA_SPLITKV_COMPUTE_FINAL_STORE
+
 }
+
+#undef FLASHMLA_SPLITKV_COMPUTE_QUANT
 
 template<typename Kernel_traits, typename Params>
 __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
@@ -900,38 +882,19 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
         }
         __syncthreads();
 
-        auto tSsk_curr = make_tensor(tSsK.data() + buf_idx * size(sK), layout(tSsK));
-        if constexpr (Kernel_traits::Is_Q_in_regs) {
-            flash::gemm_rss<Kernel_traits::KEEP_Q_NUM>(
-                acc_s, tSrQ, tSrK, tSsQ, tSsk_curr, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
-                smem_thr_copy_Q, smem_thr_copy_K);
-        } else {
-            flash::gemm<false>(
-                acc_s, tSrQ, tSrK, tSsQ, tSsk_curr, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
-                smem_thr_copy_Q, smem_thr_copy_K
-            );
-        }
+#define FLASHMLA_SPLITKV_COMPUTE_QK 1
+#include "splitkv_compute_body.cuh"
+#undef FLASHMLA_SPLITKV_COMPUTE_QK
 
-        constexpr int MMA_N_S = kBlockN / decltype(typename Kernel_traits::TiledMmaS{}.template tile_size_mnk<1>())::value;
-        const int warpN_idx = (warp_idx / AtomLayoutQ) * MMA_N_S;
-        flash::apply_indices_mask(acc_s, smem_valid_indices, warpN_idx, buf_idx);
-
-        block_idx == n_block_min
-            ? softmax.template softmax_rescale_per_warp</*Is_first=*/true,  /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.scale_softmax_log2)
-            : softmax.template softmax_rescale_per_warp</*Is_first=*/false, /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.scale_softmax_log2);
-
-        Tensor rS = flash::convert_type<Element>(acc_s);
-        Tensor tSaS = smem_thr_copy_S.retile_S(rS);
-        cute::copy(smem_tiled_copy_S, tSaS, tSsS);
+#define FLASHMLA_SPLITKV_COMPUTE_MASK_SOFTMAX_P 1
+#include "splitkv_compute_body.cuh"
+#undef FLASHMLA_SPLITKV_COMPUTE_MASK_SOFTMAX_P
 
         __syncthreads();
-        if (block_idx > n_block_min) {
-            softmax.template softmax_rescale_o(acc_o, smem_row_scale);
-        }
+#define FLASHMLA_SPLITKV_COMPUTE_RESCALE_PV 1
+#include "splitkv_compute_body.cuh"
+#undef FLASHMLA_SPLITKV_COMPUTE_RESCALE_PV
 
-        auto tOsVt_curr = make_tensor(tOsVt.data() + buf_idx * size(sK), layout(tOsVt));
-        flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_curr, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
-            smem_thr_copy_P, smem_thr_copy_V);
     };
 
     if constexpr (kHeadDim == 512) {
@@ -962,11 +925,10 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     softmax.template softmax_rescale_o(acc_o, smem_row_scale);
 
     // Epilogue
-    if (NoSplit) {
-        flash::store<Kernel_traits, false, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
-    } else {
-        flash::store<Kernel_traits, true, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
-    }
+#define FLASHMLA_SPLITKV_COMPUTE_FINAL_STORE 1
+#include "splitkv_compute_body.cuh"
+#undef FLASHMLA_SPLITKV_COMPUTE_FINAL_STORE
+
 }
 
 template<typename Kernel_traits, bool IsFP8 = false, bool IsV41FP8 = false,
@@ -1153,24 +1115,25 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
         constexpr bool USE_MMA_M8 = 0;
         constexpr bool KeepQ = true;
         constexpr static int kBlockN = 64;
-        // Warp-interleave compile-time gate: enabled for sparse-FP8 paths.
-        // WI v2 supports Headdim=576/512, extra_topk, but requires:
+        // Select warp-interleave automatically for supported V4.1 FP8 and
+        // FP4 extra-KV inputs, using architecture and shape guards like BF16.
+        // Generic T2 WI supports Headdim=576/512 and extra_topk, but requires:
         //   - page_block_size > 0 and a power of two (kPagePow2 gate below)
-        //   - seqlen_q == ngroups (s_q_ori==1, single m_block only)
-        // BlockM=128 path: ngroups >= 128
-        // BlockM=64 path:  64 <= ngroups < 128 (cross-cut layout)
+        //   - each MTP query has complete head tiles, so a tile uses one index row
+        // BlockM=128 path: ngroups >= 128 (MTP additionally needs ngroups % 128 == 0)
+        // BlockM=64 path:  64 <= ngroups < 128 (MTP additionally needs ngroups == 64)
         // Other configurations fall back to non-WI splitkv path.
-        const bool kCanWI = false; //is_sm89_or_newer();
+        const bool kCanWI = IsV41FP8 && is_sm89_or_newer();
         // blockM=128 path (original 8,1 atom layout)
         const bool wi_enable_m128 = kCanWI
             && (params.ngroups >= 128)
-            && (params.seqlen_q == params.ngroups)
+            && (params.seqlen_q == params.ngroups || params.ngroups % 128 == 0)
             && (params.page_block_size > 0);
         // blockM=64 path (cross-cut 4,2 atom layout, for h_q=64)
         const bool wi_enable_m64 = kCanWI
             && (params.ngroups >= 64)
             && (params.ngroups < 128)
-            && (params.seqlen_q == params.ngroups)
+            && (params.seqlen_q == params.ngroups || params.ngroups % 64 == 0)
             && (params.page_block_size > 0);
         SEQLENG_SWITCH_ALIGN(params.seqlen_q, [&] {
             IS_PAGE_POWER2(params.page_block_size, params.extra_page_block_size, [&] {
@@ -1179,17 +1142,49 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
                 constexpr int kNwarps = 16;
                 constexpr int AtomLayoutP = kBlockM == 64 ? 2 : 1; // to save regs(sum/max in softmax)
                 if (wi_enable_m128 && kPagePow2) {
-                    run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 128>(params, stream);
+                    if constexpr (IsV41FP8) {
+                        if (params.ngroups % 128 == 0) {
+                            if constexpr (IsExtraFP4) {
+                                flashmla::v41prefill::run_sparse_quant_decode_wi_fp4_extra(params, stream);
+                            } else {
+                                flashmla::v41prefill::run_sparse_quant_decode_wi_fp8(params, stream);
+                            }
+                        } else {
+                            run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 128, true, IsExtraFP4>(params, stream);
+                        }
+                    } else {
+                        run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 128>(params, stream);
+                    }
                 } else if (wi_enable_m64 && kPagePow2) {
-                    run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 64>(params, stream);
+                    if constexpr (IsV41FP8) {
+                        const char *hs64_opt_in = std::getenv("FLASHMLA_V41_HS64");
+                        if (hs64_opt_in && hs64_opt_in[0] == '1' &&
+                            hs64_opt_in[1] == '\0' && params.ngroups == 64 &&
+                            params.seqlen_q == params.ngroups &&
+                            flashmla::dsa::sparse_decode_hs64_v41_addressing_supported(
+                                params, IsExtraFP4)) {
+                            if constexpr (IsExtraFP4) {
+                                flashmla::dsa::hs64::run_flash_sparse_decode_wg_kernel_hs64_v41_fp4(
+                                    params, stream);
+                            } else {
+                                flashmla::dsa::hs64::run_flash_sparse_decode_wg_kernel_hs64_v41_fp8(
+                                    params, stream);
+                            }
+                        } else {
+                            run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 64, true, IsExtraFP4>(params, stream);
+                        }
+                    } else {
+                        run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 64>(params, stream);
+                    }
                 } else {
-                    // WI v2 rejected (ngroups < 64):
-                    // fall back to non-WI sparse decode (splitkv compute path).
-                    run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
+                    // Use splitkv when the WI path is unavailable.
+                    using FallbackTraits = Flash_fwd_kernel_traits<
                         Headdim, kBlockM, kBlockN, kNwarps, KeepQ/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
                         T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,
                         kBlockN/*kBlockNPagedPerAiuLoad*/, 2/*kStages*/, kNwarps0, kPagePow2
-                        >, IsFP8, IsV41FP8, IsExtraFP4>(params, stream);
+                        >;
+                    run_flash_sparse_decode_fwd<FallbackTraits, IsFP8, IsV41FP8,
+                        IsExtraFP4>(params, stream);
                 }
             });
         });
