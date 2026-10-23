@@ -22,6 +22,8 @@ void run_flash_sparse_prefill_fwd_hs64(SparsePrefillParams &params);
 
 template<typename T>
 void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
+    const auto *props = at::cuda::getCurrentDeviceProperties();
+    const bool sm89 = props->major > 8 || (props->major == 8 && props->minor >= 9);
     // constexpr int B_H = 64; // kBlockM
     constexpr int B_TOPK = 64;    // kBlockM
     // constexpr int NUM_THREADS = 128*4; // 16*32
@@ -34,15 +36,15 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
 
     // The double-warpgroup pipeline amortizes its setup on long topk;
     // retain the standard prefill kernel for short sparse rows.
-    const bool use_hs64 = params.h_q % 128 == 64 && params.h_kv == 1 &&
-        params.topk >= 512;
+    const bool use_hs64 = params.h_kv == 1 &&
+        params.h_q % 128 == 64 && params.topk >= 512;
     const bool warp_interleave = ((params.s_q % 128 == 0) || (params.s_q > 256)) &&
         params.h_q == 128 && params.s_kv >= params.topk;
 
     if constexpr (std::is_same_v<T, cutlass::bfloat16_t>) {
         if (use_hs64) {
             DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-                if (is_sm89_or_newer()) {
+                if (sm89) {
                     flashmla::dsa::hs64::run_flash_sparse_prefill_fwd_hs64<HEAD_DIM_QK, 89>(params);
                 } else {
                     flashmla::dsa::hs64::run_flash_sparse_prefill_fwd_hs64<HEAD_DIM_QK, 80>(params);
@@ -54,7 +56,7 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
 
     if (warp_interleave) {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            if (!is_sm89_or_newer()) {
+            if (!sm89) {
                 run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 80, HEAD_DIM_QK>(params);
             } else {
                 run_flash_sparse_prefill_fwd_wg<cutlass::bfloat16_t, 89, HEAD_DIM_QK>(params);
