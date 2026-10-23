@@ -42,6 +42,17 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
         params.h_q == 128 && params.s_kv >= params.topk;
 
     if constexpr (std::is_same_v<T, cutlass::bfloat16_t>) {
+        if (warp_interleave && params.topk == 128 && params.topk_length != nullptr && sm89) {
+            // Split short sparse rows into two resident M64 CTAs per SM.
+            // Keep the existing standard-kernel path for short query grids.
+            DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+                using ShortTraits = Flash_fwd_kernel_traits<
+                    HEAD_DIM_QK, 64, 32, 8, false, false, T, 512, true, false,
+                    4, 1, 32, 2, 8>;
+                run_flash_sparse_prefill_fwd<ShortTraits, true, true>(params);
+            });
+            return;
+        }
         if (use_hs64) {
             DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
                 if (sm89) {
@@ -71,18 +82,36 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
         // constexpr static int kBlockM = 64;
         constexpr int AtomLayoutQ = kBlockM / 16;
         constexpr int AtomLayoutP = 1;
-        constexpr int kNwarps0 = AtomLayoutQ * (kBlockN / 16);
         constexpr int kNwarps = 16;
         constexpr bool Is_Q_in_regs = 0; //(kBlockM == 16) ? 1 : 0;
 
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
-                run_flash_sparse_prefill_fwd<Flash_fwd_kernel_traits<
-                    HEAD_DIM_QK/*Headdim*/, kBlockM, kBlockN, kNwarps,
-                    Is_Q_in_regs/*Is_Q_in_regs*/, Is_Q_in_regs/*Share_Q_K_smem*/, T, 512/*Headdim_V*/,
-                    1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,
-                    kBlockN/*kBlockNPagedPerAiuLoad*/, 2/*kStages*/, kNwarps0
-                    >, HAVE_TOPK_LENGTH>(params);
+                // Small query batches retain full QK parallelism to minimize latency.
+                DISPATCH_BOOLEAN_FLAG(params.s_q >= 32, REDUCE_QK_WARPS, [&]() {
+                    constexpr bool reduce_qk_warps = REDUCE_QK_WARPS && kBlockM == 64 &&
+                        std::is_same_v<T, cutlass::bfloat16_t>;
+                    if constexpr (HAVE_TOPK_LENGTH && reduce_qk_warps && HEAD_DIM_QK == 512) {
+                        if (params.h_q == 64 && params.topk == 128) {
+                            // Preserve per-query parallelism on short grids; require enough
+                            // independent queries to benefit from two resident CTAs.
+                            constexpr int kMinCtaWaves = 8;
+                            if (sm89 && params.s_q >= kMinCtaWaves * props->multiProcessorCount) {
+                                using ShortTraits = Flash_fwd_kernel_traits<
+                                    512, 64, 32, 8, false, false, T, 512, true, false, 4, 1, 32, 2, 8>;
+                                run_flash_sparse_prefill_fwd<ShortTraits, true, true>(params);
+                                return;
+                            }
+                        }
+                    }
+                    constexpr int kNwarps0 = AtomLayoutQ * (reduce_qk_warps ? 2 : kBlockN / 16);
+                    run_flash_sparse_prefill_fwd<Flash_fwd_kernel_traits<
+                        HEAD_DIM_QK/*Headdim*/, kBlockM, kBlockN, kNwarps,
+                        Is_Q_in_regs/*Is_Q_in_regs*/, Is_Q_in_regs/*Share_Q_K_smem*/, T, 512/*Headdim_V*/,
+                        1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,
+                        kBlockN/*kBlockNPagedPerAiuLoad*/, 2/*kStages*/, kNwarps0
+                        >, HAVE_TOPK_LENGTH>(params);
+                });
             });
         });
     });
