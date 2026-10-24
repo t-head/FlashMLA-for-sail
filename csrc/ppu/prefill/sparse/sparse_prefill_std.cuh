@@ -23,11 +23,13 @@ using namespace cute;
 
 namespace flash {
 
-template<typename Kernel_traits, bool HAVE_TOPK_LENGTH, bool Is_causal = false, bool CrossCut = true>
+template<typename Kernel_traits, bool HAVE_TOPK_LENGTH, bool Is_causal = false, bool CrossCut = true,
+         bool SINGLE_KV = false>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
 flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams params) {
 
     static_assert(CrossCut);
+    static_assert(!SINGLE_KV || (Kernel_traits::kStages == 2 && !Kernel_traits::Share_Q_K_smem));
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
@@ -112,7 +114,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     Tensor sVt = make_tensor(sK.data(), SmemLayoutVtNoAiu{});
     Tensor sVtNoSwizzle = make_tensor(sK.data(), SmemLayoutVtNoSwizzle{}); // only for layout
 
-    Tensor sK_double = make_tensor(sK.data() + size(sK), SmemLayoutKNoAiu{});
+    Tensor sK_double = make_tensor(sK.data() + (SINGLE_KV ? 0 : size(sK)), SmemLayoutKNoAiu{});
 #if DSA_SIM_AIU
     Tensor sKSim_double = make_tensor(sK_double.data(), SmemLayoutKSim{});
 #endif
@@ -290,7 +292,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
         flash::cp_async_wait<0>();
         __syncthreads();
 
-        if (n_block < n_block_max -1) {
+        if (!SINGLE_KV && n_block < n_block_max -1) {
             // int row = load_col_idx + (n_block+1) * kBlockN;
             auto tKsK_current = kv_store_num % 2 == 0 ? tKsK : tKsK_double;
             int indice_idx = nxt_token_idx;
@@ -317,13 +319,40 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
         auto tOsVt_current = kv_load_num % 2 == 0 ? tOsVt : tOsVt_double;
 
         if (warp_idx < kNWarps0) {
-            flash::gemm<Kernel_traits::Is_Q_in_regs>(
-                acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
-                smem_thr_copy_Q, smem_thr_copy_K
-            );
+            if constexpr (SINGLE_KV) {
+                constexpr int kKeepQSteps = 8;
+                if (n_block == 0) {
+                    Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+                    #pragma unroll
+                    for (int k = 0; k < kKeepQSteps; ++k)
+                        cute::copy(smem_tiled_copy_Q, tSsQ(_, _, k), tSrQ_copy_view(_, _, k));
+                }
+                flash::gemm_qstep_keep<kKeepQSteps>(
+                    acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
+                    smem_thr_copy_Q, smem_thr_copy_K);
+            } else {
+                flash::gemm<Kernel_traits::Is_Q_in_regs>(
+                    acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
+                    smem_thr_copy_Q, smem_thr_copy_K);
+            }
 
             constexpr int MMA_N_S = kBlockN / decltype(typename Kernel_traits::TiledMmaS{}.template tile_size_mnk<1>())::value;
-            flash::apply_indices_mask(acc_s, smem_valid_indices, (warp_idx / AtomLayoutQ) * MMA_N_S, kv_load_num % 2);
+            if constexpr (MMA_N_S == 1) {
+                flash::apply_indices_mask(acc_s, smem_valid_indices, (warp_idx / AtomLayoutQ) * MMA_N_S, kv_load_num % 2);
+            } else {
+                auto score_coords = thr_mma_s.partition_C(
+                    make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{}));
+                #pragma unroll
+                for (int i = 0; i < size(acc_s); ++i) {
+                    int col = get<1>(score_coords(i));
+#if ACOMPUTE_VERSION == 10000
+                    // Match col_in_indices used when storing valid indices.
+                    col = (col % 4) * 16 + (col / 16) * 4 + (col % 16) / 4;
+#endif
+                    if (!smem_valid_indices(kv_load_num % 2, col))
+                        acc_s(i) = -INFINITY;
+                }
+            }
 
             n_block == 0
                 ? softmax.template softmax_rescale_per_warp</*Is_first=*/true,  /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.sm_scale_div_log2)
@@ -340,6 +369,28 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
         flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_current,
             tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
             smem_thr_copy_P, smem_thr_copy_V);
+        if (SINGLE_KV && n_block < n_block_max -1) {
+            // Complete every PV reader before reusing the only KV buffer.
+            __syncthreads();
+            auto tKsK_current = kv_store_num % 2 == 0 ? tKsK : tKsK_double;
+            int indice_idx = nxt_token_idx;
+            bool is_token_valid = indice_idx >= 0 && indice_idx < params.s_kv;
+            if constexpr (HAVE_TOPK_LENGTH) {
+                is_token_valid &= ((load_col_idx + (n_block + 1) * kBlockN) < topk_length);
+            }
+            tKgK.data() = gK_base + indice_idx * (index_t)params.stride_kv_s_kv + (tidx%8)*8;
+
+            gmem_tiled_copy_K.pred = is_token_valid;
+
+            cute::copy(gmem_tiled_copy_K, tKgK, tKsK_current);
+
+            smem_valid_indices(kv_store_num%2, col_in_indices) = is_token_valid;
+            if (n_block < n_block_max - 2) {
+                nxt_token_idx = __ldg(gIndices_ptr + (n_block + 2)* kBlockN);
+            }
+            cute::cp_async_fence();
+            kv_store_num++;
+        }
         kv_load_num++;
     }
 
@@ -451,19 +502,17 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
 #include <hggc_ad.h>
 #endif
 
-template<typename Kernel_traits, bool HAVE_TOPK_LENGTH>
+template<typename Kernel_traits, bool HAVE_TOPK_LENGTH, bool SINGLE_KV = false>
 void run_flash_sparse_prefill_fwd(SparsePrefillParams &params) {
-    // TODO.
-    constexpr size_t smem_size = Kernel_traits::kSmemSize + Kernel_traits::kBlockN * 2 * sizeof(bool);
+    constexpr size_t smem_size = (SINGLE_KV
+        ? std::max(Kernel_traits::kSmemQSize + Kernel_traits::kSmemKVSize / 2 +
+                   Kernel_traits::kSmemCrossCut, Kernel_traits::OSmemSize)
+        : Kernel_traits::kSmemSize) + Kernel_traits::kBlockN * 2 * sizeof(bool);
     const int num_m_block = params.s_q*cute::ceil_div(params.h_q, Kernel_traits::kBlockM);
 
-    auto kernel = &flash::flash_sparse_prefill_fwd_kernel<Kernel_traits, HAVE_TOPK_LENGTH>;
+    auto kernel = &flash::flash_sparse_prefill_fwd_kernel<Kernel_traits, HAVE_TOPK_LENGTH, false, true, SINGLE_KV>;
     flash::printf_prefill_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size);
     CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    if (smem_size >= 48 * 1024) {
-        hggcFuncSetAttribute(
-            kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    }
 #ifdef __HGGCCC__
        //TODO
         const void *flash_func = reinterpret_cast<const void*>(kernel);
