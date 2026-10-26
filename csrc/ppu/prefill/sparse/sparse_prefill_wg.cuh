@@ -1669,310 +1669,310 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
         dsa_query_all_indices_valid<T>(params, q_idx, seqlen_k, smem_valid_indices);
 
     auto run_query_body = [&](auto query_tag) __attribute__((always_inline)) {
-    constexpr bool query_all_valid = decltype(query_tag)::value;
-    int* gIndices_ptr = params.indices + (int64_t)q_idx * params.stride_indices_s_q + idx_in_warpgroup / 8;
-    InputT* gK_base = reinterpret_cast<InputT*>(params.kv);
-    int nxt_token_idx0 = -1;
-    int nxt_token_idx1 = -1;
-    InputT *precomp_ptr0 = nullptr, *precomp_ptr1 = nullptr;
-    bool precomp_valid0 = false, precomp_valid1 = false;
-    // [Even-align] seqlen_k and the block range are computed BEFORE the initial
-    // token-index reads so those reads can be guarded by the REAL block count.
-    // real_end_block_idx: true topk block count (ceil(seqlen_k/kBlockN)) -- the
-    //   ONLY bound ever used to guard gIndices reads; the indices row has
-    //   exactly topk entries, so the rounded-up padding block has no backing
-    //   memory there.
-    // end_block_idx: real_end rounded UP to an even block count (seqlen_k
-    //   rounded to 2 blocks = 64 tokens
-    int start_block_idx = 0;
-    int real_end_block_idx = cute::ceil_div(seqlen_k, kBlockN);
-    int end_block_idx = cute::ceil_div(cute::round_up(seqlen_k, 2 * kBlockN), kBlockN);
+        constexpr bool query_all_valid = decltype(query_tag)::value;
+        int* gIndices_ptr = params.indices + (int64_t)q_idx * params.stride_indices_s_q + idx_in_warpgroup / 8;
+        InputT* gK_base = reinterpret_cast<InputT*>(params.kv);
+        int nxt_token_idx0 = -1;
+        int nxt_token_idx1 = -1;
+        InputT *precomp_ptr0 = nullptr, *precomp_ptr1 = nullptr;
+        bool precomp_valid0 = false, precomp_valid1 = false;
+        // [Even-align] seqlen_k and the block range are computed BEFORE the initial
+        // token-index reads so those reads can be guarded by the REAL block count.
+        // real_end_block_idx: true topk block count (ceil(seqlen_k/kBlockN)) -- the
+        //   ONLY bound ever used to guard gIndices reads; the indices row has
+        //   exactly topk entries, so the rounded-up padding block has no backing
+        //   memory there.
+        // end_block_idx: real_end rounded UP to an even block count (seqlen_k
+        //   rounded to 2 blocks = 64 tokens
+        int start_block_idx = 0;
+        int real_end_block_idx = cute::ceil_div(seqlen_k, kBlockN);
+        int end_block_idx = cute::ceil_div(cute::round_up(seqlen_k, 2 * kBlockN), kBlockN);
 
-    if (warpgroup_idx == 0) {
-        nxt_token_idx0 = 0 < real_end_block_idx ? __ldg(gIndices_ptr) : -1;
-    } else {
-        nxt_token_idx1 = 1 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN) : -1;
-    }
-
-    bool cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
-
-    Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<InputT*>(params.kv)),
-                        Shape<Int<kBlockN>, Int<T::kHeadDim>>{},
-                        make_stride(params.stride_kv_s_kv, _1{}));
-
-    // Copy K0 and K1
-    GmemTiledCopyKNoAiu gmem_tiled_copy_K;
-#if DSA_SIM_AIU
-    int sim_cross_tid;
-    if constexpr (T::Arch_value == 80) {
-        int cross_tid_h = (idx_in_warpgroup & 0xFFFFFFF8) >> 3;
-        int cross_tid_l = idx_in_warpgroup & 0x7;
-        int cross_bias = (cross_tid_l / 2 == 1) ? 2 : ((cross_tid_l / 2 == 2) ? 1 : cross_tid_l / 2);
-        cross_tid_h = (cross_tid_h & 0xFFFFFFFC) | (((cross_tid_h & 0x3) + cross_bias) & 0x3);
-        sim_cross_tid = (cross_tid_h << 3) | cross_tid_l;
-    } else {
-        sim_cross_tid = idx_in_warpgroup;
-    }
-    auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(sim_cross_tid);
-#else
-    auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(idx_in_warpgroup);
-#endif
-    Tensor tKgK = gmem_thr_copy_K.partition_S(gK); // (KCPY, KCPY_N, KCPY_K)
-
-    Tensor cur_sK0 = sK(_, _, 0);
-    Tensor cur_sK1 = sK(_, _, 1);
-    Tensor nxt_sK0 = sK(_, _, 2);
-#if DSA_SIM_AIU
-    Tensor cur_sKSim0 = sKSim(_, _, 0);
-    Tensor cur_sKSim1 = sKSim(_, _, 1);
-    Tensor tKsK0 = gmem_thr_copy_K.partition_D(cur_sKSim0);
-    Tensor tKsK1 = gmem_thr_copy_K.partition_D(cur_sKSim1);
-#else
-    Tensor tKsK0 = gmem_thr_copy_K.partition_D(cur_sK0);
-    Tensor tKsK1 = gmem_thr_copy_K.partition_D(cur_sK1);
-#endif
-
-    if (warpgroup_idx == 0 && seqlen_k != 0) {
-        InputT *addr_blk0; bool valid_blk0;
-        dsa_compute_K_addr<T, true, query_all_valid>(params, gK_base, nxt_token_idx0, start_block_idx, seqlen_k, idx_in_warpgroup,
-            smem_valid_indices, (start_block_idx/2)%2, addr_blk0, valid_blk0);
-        dsa_issue_K_load<4, T::NUM_TILES, T, false>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K0[1],
-            cur_sK1, idx_in_warpgroup, addr_blk0, valid_blk0,
-            gIndices_ptr, 0, real_end_block_idx, nxt_token_idx0);
-        dsa_issue_K_load<0, 4, T, false>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K0[0],
-            cur_sK0, idx_in_warpgroup, addr_blk0, valid_blk0,
-            gIndices_ptr, 0, real_end_block_idx, nxt_token_idx0);
-        // [Even-align] guarded by the REAL block count; padding blocks -> -1 (invalid).
-        nxt_token_idx0 = 2 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN * 2) : -1;
-        nxt_token_idx1 = 3 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN * 3) : -1;
-        // WG-scope barrier: makes the flag stores above visible to all 256 threads
-        // of WG0 before iteration-0's wg0_bunch_0 reads them (no other barrier sits
-        // between the prolog write and that read). WG0-only: does not couple the
-        // WG0/WG1 arrive/wait skew, hence no cross-WG sync stall.
-        if constexpr (!query_all_valid)
-            NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup0);
-        if (start_block_idx + 2 < end_block_idx) {
-            dsa_compute_K_addr<T, true, query_all_valid>(params, gK_base, nxt_token_idx0, start_block_idx + 2, seqlen_k, idx_in_warpgroup,
-                smem_valid_indices, (start_block_idx/2+1)%2, precomp_ptr0, precomp_valid0);
+        if (warpgroup_idx == 0) {
+            nxt_token_idx0 = 0 < real_end_block_idx ? __ldg(gIndices_ptr) : -1;
+        } else {
+            nxt_token_idx1 = 1 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN) : -1;
         }
-        if (start_block_idx + 3 < end_block_idx) {
-            dsa_compute_K_addr<T, false, query_all_valid>(params, gK_base, nxt_token_idx1, start_block_idx + 3, seqlen_k, idx_in_warpgroup,
-                smem_valid_indices, 0, precomp_ptr1, precomp_valid1);
-        }
-    }
 
-    if (start_block_idx+1 < end_block_idx) {
-        if (warpgroup_idx == 1) {
-            InputT *addr_blk1; bool valid_blk1;
-            dsa_compute_K_addr<T, true, query_all_valid>(params, gK_base, nxt_token_idx1, start_block_idx + 1, seqlen_k, idx_in_warpgroup,
-                smem_valid_indices, 2+(start_block_idx/2)%2, addr_blk1, valid_blk1);
-            dsa_issue_K_load<4, T::NUM_TILES, T, false>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K1[1],
-                cur_sK0, idx_in_warpgroup, addr_blk1, valid_blk1,
+        bool cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
+
+        Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<InputT*>(params.kv)),
+                            Shape<Int<kBlockN>, Int<T::kHeadDim>>{},
+                            make_stride(params.stride_kv_s_kv, _1{}));
+
+        // Copy K0 and K1
+        GmemTiledCopyKNoAiu gmem_tiled_copy_K;
+#if DSA_SIM_AIU
+        int sim_cross_tid;
+        if constexpr (T::Arch_value == 80) {
+            int cross_tid_h = (idx_in_warpgroup & 0xFFFFFFF8) >> 3;
+            int cross_tid_l = idx_in_warpgroup & 0x7;
+            int cross_bias = (cross_tid_l / 2 == 1) ? 2 : ((cross_tid_l / 2 == 2) ? 1 : cross_tid_l / 2);
+            cross_tid_h = (cross_tid_h & 0xFFFFFFFC) | (((cross_tid_h & 0x3) + cross_bias) & 0x3);
+            sim_cross_tid = (cross_tid_h << 3) | cross_tid_l;
+        } else {
+            sim_cross_tid = idx_in_warpgroup;
+        }
+        auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(sim_cross_tid);
+#else
+        auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(idx_in_warpgroup);
+#endif
+        Tensor tKgK = gmem_thr_copy_K.partition_S(gK); // (KCPY, KCPY_N, KCPY_K)
+
+        Tensor cur_sK0 = sK(_, _, 0);
+        Tensor cur_sK1 = sK(_, _, 1);
+        Tensor nxt_sK0 = sK(_, _, 2);
+#if DSA_SIM_AIU
+        Tensor cur_sKSim0 = sKSim(_, _, 0);
+        Tensor cur_sKSim1 = sKSim(_, _, 1);
+        Tensor tKsK0 = gmem_thr_copy_K.partition_D(cur_sKSim0);
+        Tensor tKsK1 = gmem_thr_copy_K.partition_D(cur_sKSim1);
+#else
+        Tensor tKsK0 = gmem_thr_copy_K.partition_D(cur_sK0);
+        Tensor tKsK1 = gmem_thr_copy_K.partition_D(cur_sK1);
+#endif
+
+        if (warpgroup_idx == 0 && seqlen_k != 0) {
+            InputT *addr_blk0; bool valid_blk0;
+            dsa_compute_K_addr<T, true, query_all_valid>(params, gK_base, nxt_token_idx0, start_block_idx, seqlen_k, idx_in_warpgroup,
+                smem_valid_indices, (start_block_idx/2)%2, addr_blk0, valid_blk0);
+            dsa_issue_K_load<4, T::NUM_TILES, T, false>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K0[1],
+                cur_sK1, idx_in_warpgroup, addr_blk0, valid_blk0,
                 gIndices_ptr, 0, real_end_block_idx, nxt_token_idx0);
-            dsa_issue_K_load<0, 4, T, false>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K1[0],
-                cur_sK1, idx_in_warpgroup, addr_blk1, valid_blk1,
+            dsa_issue_K_load<0, 4, T, false>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K0[0],
+                cur_sK0, idx_in_warpgroup, addr_blk0, valid_blk0,
                 gIndices_ptr, 0, real_end_block_idx, nxt_token_idx0);
             // [Even-align] guarded by the REAL block count; padding blocks -> -1 (invalid).
             nxt_token_idx0 = 2 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN * 2) : -1;
             nxt_token_idx1 = 3 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN * 3) : -1;
-            // [Opt-A] WG1-scope barrier, mirroring the mGroup0 one above:
-            // iteration-0's dsa_wg1_bunch_0_pre now reads the block-1 flags
-            // BEFORE the subroutine's sScale0Ready arrive_and_wait (which used
-            // to be the sole visibility cover -- see the comment at the flag
-            // store above), so the stores need their own WG1-scope barrier,
-            // exactly like WG0's mGroup0. WG1-only (256 threads): does not
-            // couple the WG0/WG1 arrive/wait skew, hence no cross-WG stall.
+            // WG-scope barrier: makes the flag stores above visible to all 256 threads
+            // of WG0 before iteration-0's wg0_bunch_0 reads them (no other barrier sits
+            // between the prolog write and that read). WG0-only: does not couple the
+            // WG0/WG1 arrive/wait skew, hence no cross-WG sync stall.
             if constexpr (!query_all_valid)
-                NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup1);
-            if (start_block_idx + 3 < end_block_idx) {
-                dsa_compute_K_addr<T, true, query_all_valid>(params, gK_base, nxt_token_idx1, start_block_idx + 3, seqlen_k, idx_in_warpgroup,
-                    smem_valid_indices, 2+(start_block_idx/2+1)%2, precomp_ptr0, precomp_valid0);
-            }
+                NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup0);
             if (start_block_idx + 2 < end_block_idx) {
-                dsa_compute_K_addr<T, false, query_all_valid>(params, gK_base, nxt_token_idx0, start_block_idx + 2, seqlen_k, idx_in_warpgroup,
+                dsa_compute_K_addr<T, true, query_all_valid>(params, gK_base, nxt_token_idx0, start_block_idx + 2, seqlen_k, idx_in_warpgroup,
+                    smem_valid_indices, (start_block_idx/2+1)%2, precomp_ptr0, precomp_valid0);
+            }
+            if (start_block_idx + 3 < end_block_idx) {
+                dsa_compute_K_addr<T, false, query_all_valid>(params, gK_base, nxt_token_idx1, start_block_idx + 3, seqlen_k, idx_in_warpgroup,
                     smem_valid_indices, 0, precomp_ptr1, precomp_valid1);
             }
         }
-    }
-
-    Tensor rO = partition_fragment_C((typename T::TiledMma){}, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV / 2>>{});	// ((2, 2, 32), 1, 1)
-    float rL[2];
-    rL[0] = rL[1] = 0.0f;
-
-    // Clear buffers
-    cute::fill(rO, 0.);
-
-    while(!cutlass::arch::test_wait(barrier_Q, cur_phase_Q, 1)) {
-        kernel_sleep_ns();
-    }
-    cur_phase_Q = (cur_phase_Q + 1) & 1;
-
-    // rQ8 stores the last tile of Q (tile 8 for 576, tile 7 for 512) to leave smem room for sP0/sP1
-    Tensor rQ8 = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
-    if constexpr (T::kCacheLastQ) {
-        retrieve_rP_from_sP<T>(rQ8, local_tile(sQ, Shape<_128, _64>{}, Coord<_0, Int<T::NUM_TILES - 1>>{}), idx_in_warpgroup);
-    }
-
-    if (warpgroup_idx == 0) {
-        // Warpgroup 0
-        // Tensor rP0 = make_tensor<float>((typename T::rP0Layout){});
-        Tensor rP0 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kBlockN>>{});  // MMA, MMA_M, MMA_K
-        const int wg_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
-
-        // NOTE We don't use the pipelined version of Q K^T here since it leads
-        // to a slow-down (or even register spilling, thanks to the great NVCC)
-        // Issue P0 = Q @ K0^T, wait
-        if (seqlen_k !=0) {
-            cute::clear(rP0);
-            dsa_warpgroup_cooperative_qkt_gemm<T, 1>(sQ, cur_sK0, cur_sK1, rP0, rQ8, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
-        }
-
-        int idx = 0;
-        #define DSA_LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
-            dsa_wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, query_all_valid>(                            \
-            gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
-            rP0, rO, rL,                   \
-            barriers_K0, barriers_K1, cur_phase_K0, params, gIndices_ptr, seqlen_k, \
-            block_idx, end_block_idx, real_end_block_idx, idx_in_warpgroup, wg_idx, idx, nxt_token_idx0, nxt_token_idx1, precomp_ptr0, precomp_ptr1, precomp_valid0, precomp_valid1 \
-            , smem_valid_indices);
-
-        int block_idx = start_block_idx;
-
-        #pragma unroll 1
-        for (; block_idx < end_block_idx-2; block_idx += 2) {
-            DSA_LAUNCH_WG0_SUBROUTINE(false, false);
-        }
-
-        // [Even-align] end_block_idx is always even, so the loop leaves exactly
-        // one uniform 2-block tail; the IS_BLK0_LAST single-block branch is
-        // unreachable and removed (mirrors decode's single tail form).
-        if (block_idx < end_block_idx) {
-            DSA_LAUNCH_WG0_SUBROUTINE(false, true);
-        }
-    }
-    else {
-        // // Warpgroup 1
-        // Tensor rP1 = make_tensor<float>((typename T::rP0Layout){});
-        Tensor rP1 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kBlockN>>{});  // MMA, MMA_M, MMA_K
-        const int wg_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
 
         if (start_block_idx+1 < end_block_idx) {
-            // Issue rP1 = sQ @ sK1, wait
-            dsa_warpgroup_cooperative_qkt_gemm<T, 1>(sQ, cur_sK1, cur_sK0, rP1, rQ8, barriers_K1, cur_phase_K1, idx_in_warpgroup, wg_idx);
+            if (warpgroup_idx == 1) {
+                InputT *addr_blk1; bool valid_blk1;
+                dsa_compute_K_addr<T, true, query_all_valid>(params, gK_base, nxt_token_idx1, start_block_idx + 1, seqlen_k, idx_in_warpgroup,
+                    smem_valid_indices, 2+(start_block_idx/2)%2, addr_blk1, valid_blk1);
+                dsa_issue_K_load<4, T::NUM_TILES, T, false>(gmem_tiled_copy_K, tKgK, tKsK0, &barriers_K1[1],
+                    cur_sK0, idx_in_warpgroup, addr_blk1, valid_blk1,
+                    gIndices_ptr, 0, real_end_block_idx, nxt_token_idx0);
+                dsa_issue_K_load<0, 4, T, false>(gmem_tiled_copy_K, tKgK, tKsK1, &barriers_K1[0],
+                    cur_sK1, idx_in_warpgroup, addr_blk1, valid_blk1,
+                    gIndices_ptr, 0, real_end_block_idx, nxt_token_idx0);
+                // [Even-align] guarded by the REAL block count; padding blocks -> -1 (invalid).
+                nxt_token_idx0 = 2 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN * 2) : -1;
+                nxt_token_idx1 = 3 < real_end_block_idx ? __ldg(gIndices_ptr + kBlockN * 3) : -1;
+                // [Opt-A] WG1-scope barrier, mirroring the mGroup0 one above:
+                // iteration-0's dsa_wg1_bunch_0_pre now reads the block-1 flags
+                // BEFORE the subroutine's sScale0Ready arrive_and_wait (which used
+                // to be the sole visibility cover -- see the comment at the flag
+                // store above), so the stores need their own WG1-scope barrier,
+                // exactly like WG0's mGroup0. WG1-only (256 threads): does not
+                // couple the WG0/WG1 arrive/wait skew, hence no cross-WG stall.
+                if constexpr (!query_all_valid)
+                    NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup1);
+                if (start_block_idx + 3 < end_block_idx) {
+                    dsa_compute_K_addr<T, true, query_all_valid>(params, gK_base, nxt_token_idx1, start_block_idx + 3, seqlen_k, idx_in_warpgroup,
+                        smem_valid_indices, 2+(start_block_idx/2+1)%2, precomp_ptr0, precomp_valid0);
+                }
+                if (start_block_idx + 2 < end_block_idx) {
+                    dsa_compute_K_addr<T, false, query_all_valid>(params, gK_base, nxt_token_idx0, start_block_idx + 2, seqlen_k, idx_in_warpgroup,
+                        smem_valid_indices, 0, precomp_ptr1, precomp_valid1);
+                }
+            }
         }
 
-        int idx = 0;
-        #define DSA_LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
-            dsa_wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, query_all_valid>(                            \
-            gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
-            rP1, rO, rL,                 \
-            barriers_K0, barriers_K1, cur_phase_K1, params, gIndices_ptr, seqlen_k, \
-            block_idx, end_block_idx, real_end_block_idx, idx_in_warpgroup, wg_idx, idx, nxt_token_idx0, nxt_token_idx1, precomp_ptr0, precomp_ptr1, precomp_valid0, precomp_valid1 \
-            , smem_valid_indices);
+        Tensor rO = partition_fragment_C((typename T::TiledMma){}, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV / 2>>{});	// ((2, 2, 32), 1, 1)
+        float rL[2];
+        rL[0] = rL[1] = 0.0f;
 
-        int block_idx = start_block_idx;
-        // [Even-align] end_block_idx is always even: bound end-2 gives the same
-        // trip count as the old end-3, and the loop leaves exactly one uniform
-        // 2-block tail. 
-        #pragma unroll 1
-        for (; block_idx < end_block_idx-2; block_idx += 2) {
-            DSA_LAUNCH_WG1_SUBROUTINE(false, false);
+        // Clear buffers
+        cute::fill(rO, 0.);
+
+        while(!cutlass::arch::test_wait(barrier_Q, cur_phase_Q, 1)) {
+            kernel_sleep_ns();
+        }
+        cur_phase_Q = (cur_phase_Q + 1) & 1;
+
+        // rQ8 stores the last tile of Q (tile 8 for 576, tile 7 for 512) to leave smem room for sP0/sP1
+        Tensor rQ8 = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
+        if constexpr (T::kCacheLastQ) {
+            retrieve_rP_from_sP<T>(rQ8, local_tile(sQ, Shape<_128, _64>{}, Coord<_0, Int<T::NUM_TILES - 1>>{}), idx_in_warpgroup);
         }
 
-        if (block_idx < end_block_idx) {
-            DSA_LAUNCH_WG1_SUBROUTINE(false, true);
+        if (warpgroup_idx == 0) {
+            // Warpgroup 0
+            // Tensor rP0 = make_tensor<float>((typename T::rP0Layout){});
+            Tensor rP0 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kBlockN>>{});  // MMA, MMA_M, MMA_K
+            const int wg_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
+
+            // NOTE We don't use the pipelined version of Q K^T here since it leads
+            // to a slow-down (or even register spilling, thanks to the great NVCC)
+            // Issue P0 = Q @ K0^T, wait
+            if (seqlen_k !=0) {
+                cute::clear(rP0);
+                dsa_warpgroup_cooperative_qkt_gemm<T, 1>(sQ, cur_sK0, cur_sK1, rP0, rQ8, barriers_K0, cur_phase_K0, idx_in_warpgroup, wg_idx);
+            }
+
+            int idx = 0;
+            #define DSA_LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
+                dsa_wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, query_all_valid>(                            \
+                gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
+                rP0, rO, rL,                   \
+                barriers_K0, barriers_K1, cur_phase_K0, params, gIndices_ptr, seqlen_k, \
+                block_idx, end_block_idx, real_end_block_idx, idx_in_warpgroup, wg_idx, idx, nxt_token_idx0, nxt_token_idx1, precomp_ptr0, precomp_ptr1, precomp_valid0, precomp_valid1 \
+                , smem_valid_indices);
+
+            int block_idx = start_block_idx;
+
+            #pragma unroll 1
+            for (; block_idx < end_block_idx-2; block_idx += 2) {
+                DSA_LAUNCH_WG0_SUBROUTINE(false, false);
+            }
+
+            // [Even-align] end_block_idx is always even, so the loop leaves exactly
+            // one uniform 2-block tail; the IS_BLK0_LAST single-block branch is
+            // unreachable and removed (mirrors decode's single tail form).
+            if (block_idx < end_block_idx) {
+                DSA_LAUNCH_WG0_SUBROUTINE(false, true);
+            }
         }
-    }
+        else {
+            // // Warpgroup 1
+            // Tensor rP1 = make_tensor<float>((typename T::rP0Layout){});
+            Tensor rP1 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kBlockN>>{});  // MMA, MMA_M, MMA_K
+            const int wg_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
 
-    // Reduce rL across threads within the same warp
-    rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 1);
-    rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 2);
-    rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 1);
-    rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 2);
+            if (start_block_idx+1 < end_block_idx) {
+                // Issue rP1 = sQ @ sK1, wait
+                dsa_warpgroup_cooperative_qkt_gemm<T, 1>(sQ, cur_sK1, cur_sK0, rP1, rQ8, barriers_K1, cur_phase_K1, idx_in_warpgroup, wg_idx);
+            }
 
-    // Reduce rL across warpgroups
-    int my_row = get_AorC_row_idx(0, idx_in_warpgroup);
-    float pre_sink0 = 0.0f, pre_sink1 = 0.0f;
-    if (params.attn_sink != nullptr && seqlen_k > 0) {
-        int head_block_idx = m_block_idx % (params.h_q / T::kBlockM);
-        pre_sink0 = __ldg(params.attn_sink + head_block_idx * T::BLOCK_SIZE_M + my_row);
-        pre_sink1 = __ldg(params.attn_sink + head_block_idx * T::BLOCK_SIZE_M + my_row + 8);
-    }
-    if (idx_in_warpgroup % 4 == 0) {
-        sL_reduction_wksp[my_row + warpgroup_idx * 128] = rL[0];
-        sL_reduction_wksp[my_row + 8 + warpgroup_idx * 128] = rL[1];
-    }
-    __syncthreads();
+            int idx = 0;
+            #define DSA_LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
+                dsa_wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, query_all_valid>(                            \
+                gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
+                rP1, rO, rL,                 \
+                barriers_K0, barriers_K1, cur_phase_K1, params, gIndices_ptr, seqlen_k, \
+                block_idx, end_block_idx, real_end_block_idx, idx_in_warpgroup, wg_idx, idx, nxt_token_idx0, nxt_token_idx1, precomp_ptr0, precomp_ptr1, precomp_valid0, precomp_valid1 \
+                , smem_valid_indices);
 
-    if (warpgroup_idx == 0) {
-        rL[0] += sL_reduction_wksp[my_row + 128];
-        rL[1] += sL_reduction_wksp[my_row + 8 + 128];
-    }
-    else {
-        if (idx_in_warpgroup % 4 == 0)
-        {
-            sL_reduction_wksp[my_row] += rL[0];
-            sL_reduction_wksp[my_row + 8] += rL[1];
+            int block_idx = start_block_idx;
+            // [Even-align] end_block_idx is always even: bound end-2 gives the same
+            // trip count as the old end-3, and the loop leaves exactly one uniform
+            // 2-block tail.
+            #pragma unroll 1
+            for (; block_idx < end_block_idx-2; block_idx += 2) {
+                DSA_LAUNCH_WG1_SUBROUTINE(false, false);
+            }
+
+            if (block_idx < end_block_idx) {
+                DSA_LAUNCH_WG1_SUBROUTINE(false, true);
+            }
         }
-        __syncwarp();
-        rL[0] = sL_reduction_wksp[my_row];
-        rL[1] = sL_reduction_wksp[my_row + 8];
-    }
 
-    // Prune out when rL is 0.0f or NaN
-    // rL may be 0.0f if there are large values (~10^12) in QK^T, which leads
-    // to exp2f(P(i)*scale-max) = 0.0f or +inf due to FMA error.
-    // When this happens, we set rL to 1.0f. This aligns with the old version
-    // of the MLA kernel.
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < 2; ++i)
-        rL[i] = (rL[i] == 0.0f || rL[i] != rL[i]) ? 1.0f : rL[i];
+        // Reduce rL across threads within the same warp
+        rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 1);
+        rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 2);
+        rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 1);
+        rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 2);
 
-    // Apply attention sink: adjust rL to account for the sink term in the normalization denominator.
-    // rL_adjusted = rL + exp2f(sink_log2 - sM[row])
-    // where sink_log2 = attn_sink[head_idx] * M_LOG2E (convert natural log to log2 space)
-    // and sM[row] is the log2-space scaled max (max(raw_score) * sm_scale_div_log2)
-    // This ensures output = rO / rL_adjusted = sum(P*V) / (sum(P) + exp(attn_sink))
-    // LSE and max_logits outputs are NOT affected (they read from sL_reduction_wksp, not rL)
-    if (params.attn_sink != nullptr && seqlen_k > 0) {
+        // Reduce rL across warpgroups
+        int my_row = get_AorC_row_idx(0, idx_in_warpgroup);
+        float pre_sink0 = 0.0f, pre_sink1 = 0.0f;
+        if (params.attn_sink != nullptr && seqlen_k > 0) {
+            int head_block_idx = m_block_idx % (params.h_q / T::kBlockM);
+            pre_sink0 = __ldg(params.attn_sink + head_block_idx * T::BLOCK_SIZE_M + my_row);
+            pre_sink1 = __ldg(params.attn_sink + head_block_idx * T::BLOCK_SIZE_M + my_row + 8);
+        }
+        if (idx_in_warpgroup % 4 == 0) {
+            sL_reduction_wksp[my_row + warpgroup_idx * 128] = rL[0];
+            sL_reduction_wksp[my_row + 8 + warpgroup_idx * 128] = rL[1];
+        }
+        __syncthreads();
+
+        if (warpgroup_idx == 0) {
+            rL[0] += sL_reduction_wksp[my_row + 128];
+            rL[1] += sL_reduction_wksp[my_row + 8 + 128];
+        }
+        else {
+            if (idx_in_warpgroup % 4 == 0)
+            {
+                sL_reduction_wksp[my_row] += rL[0];
+                sL_reduction_wksp[my_row + 8] += rL[1];
+            }
+            __syncwarp();
+            rL[0] = sL_reduction_wksp[my_row];
+            rL[1] = sL_reduction_wksp[my_row + 8];
+        }
+
+        // Prune out when rL is 0.0f or NaN
+        // rL may be 0.0f if there are large values (~10^12) in QK^T, which leads
+        // to exp2f(P(i)*scale-max) = 0.0f or +inf due to FMA error.
+        // When this happens, we set rL to 1.0f. This aligns with the old version
+        // of the MLA kernel.
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < 2; ++i) {
-            int row_idx = get_AorC_row_idx(i, idx_in_warpgroup);
-            // attn_sink value pre-issued above (pre_sink0/pre_sink1, before the
-            // rL-reduction __syncthreads); only the arithmetic stays here.
-            float sink_log2 = (i == 0 ? pre_sink0 : pre_sink1) * (float)M_LOG2E;
-            rL[i] += exp2f(sink_log2 - sM(row_idx));
+        for (int i = 0; i < 2; ++i)
+            rL[i] = (rL[i] == 0.0f || rL[i] != rL[i]) ? 1.0f : rL[i];
+
+        // Apply attention sink: adjust rL to account for the sink term in the normalization denominator.
+        // rL_adjusted = rL + exp2f(sink_log2 - sM[row])
+        // where sink_log2 = attn_sink[head_idx] * M_LOG2E (convert natural log to log2 space)
+        // and sM[row] is the log2-space scaled max (max(raw_score) * sm_scale_div_log2)
+        // This ensures output = rO / rL_adjusted = sum(P*V) / (sum(P) + exp(attn_sink))
+        // LSE and max_logits outputs are NOT affected (they read from sL_reduction_wksp, not rL)
+        if (params.attn_sink != nullptr && seqlen_k > 0) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < 2; ++i) {
+                int row_idx = get_AorC_row_idx(i, idx_in_warpgroup);
+                // attn_sink value pre-issued above (pre_sink0/pre_sink1, before the
+                // rL-reduction __syncthreads); only the arithmetic stays here.
+                float sink_log2 = (i == 0 ? pre_sink0 : pre_sink1) * (float)M_LOG2E;
+                rL[i] += exp2f(sink_log2 - sM(row_idx));
+            }
         }
-    }
 
-    // Epilogue
-    int num_valid_seq_q = min(params.s_q * params.h_q - m_block_idx * T::BLOCK_SIZE_M, T::BLOCK_SIZE_M);
-    InputT *o_ptr = (InputT *)params.out + (int64_t)m_block_idx * T::BLOCK_SIZE_M * T::kHeadDimV;
-    float *softmax_lse_ptr = (float *)params.lse + m_block_idx * T::BLOCK_SIZE_M;
-    float *mlogits_ptr = (float *)params.max_logits + m_block_idx * T::BLOCK_SIZE_M;
+        // Epilogue
+        int num_valid_seq_q = min(params.s_q * params.h_q - m_block_idx * T::BLOCK_SIZE_M, T::BLOCK_SIZE_M);
+        InputT *o_ptr = (InputT *)params.out + (int64_t)m_block_idx * T::BLOCK_SIZE_M * T::kHeadDimV;
+        float *softmax_lse_ptr = (float *)params.lse + m_block_idx * T::BLOCK_SIZE_M;
+        float *mlogits_ptr = (float *)params.max_logits + m_block_idx * T::BLOCK_SIZE_M;
 
-    Tensor gO = make_tensor(make_gmem_ptr(o_ptr), make_layout(
-                                                        Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV>>{},
-                                                        make_stride(T::kHeadDimV, _1{})));
-    Tensor gSoftmaxLse = make_tensor(make_gmem_ptr(softmax_lse_ptr), Layout<
-                                                                            Shape<Int<T::BLOCK_SIZE_M>>,
-                                                                            Stride<_1>>{});
-    Tensor gMLogits = make_tensor(make_gmem_ptr(mlogits_ptr), Layout<
-                                                                            Shape<Int<T::BLOCK_SIZE_M>>,
-                                                                            Stride<_1>>{});
+        Tensor gO = make_tensor(make_gmem_ptr(o_ptr), make_layout(
+                                                            Shape<Int<T::BLOCK_SIZE_M>, Int<T::kHeadDimV>>{},
+                                                            make_stride(T::kHeadDimV, _1{})));
+        Tensor gSoftmaxLse = make_tensor(make_gmem_ptr(softmax_lse_ptr), Layout<
+                                                                                Shape<Int<T::BLOCK_SIZE_M>>,
+                                                                                Stride<_1>>{});
+        Tensor gMLogits = make_tensor(make_gmem_ptr(mlogits_ptr), Layout<
+                                                                                Shape<Int<T::BLOCK_SIZE_M>>,
+                                                                                Stride<_1>>{});
 
-    dsa_store_o<T>(rO, gO, rL, sO_addr, k_head_idx, m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
+        dsa_store_o<T>(rO, gO, rL, sO_addr, k_head_idx, m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
 
-    int i = threadIdx.x;
-    if (i < num_valid_seq_q) {
-        float cur_L = sL_reduction_wksp[i];
-        gSoftmaxLse(i) = (cur_L == 0.0f || cur_L != cur_L) ? INFINITY : logf(cur_L) + sM(i) / (float)M_LOG2E;
-        // sM is monotonically non-decreasing from its init MAX_INIT_VAL_SM; staying at the
-        // init value means no column ever exceeded it, i.e. the row is entirely masked out
-        // (seqlen_k==0, or all selected tokens invalid / beyond the border). Emit -inf then,
-        // matching the reference max_logits semantics.
-        gMLogits(i) = (seqlen_k == 0 || sM(i) <= MAX_INIT_VAL_SM) ? -INFINITY : sM(i) * M_LN2;
-    }
+        int i = threadIdx.x;
+        if (i < num_valid_seq_q) {
+            float cur_L = sL_reduction_wksp[i];
+            gSoftmaxLse(i) = (cur_L == 0.0f || cur_L != cur_L) ? INFINITY : logf(cur_L) + sM(i) / (float)M_LOG2E;
+            // sM is monotonically non-decreasing from its init MAX_INIT_VAL_SM; staying at the
+            // init value means no column ever exceeded it, i.e. the row is entirely masked out
+            // (seqlen_k==0, or all selected tokens invalid / beyond the border). Emit -inf then,
+            // matching the reference max_logits semantics.
+            gMLogits(i) = (seqlen_k == 0 || sM(i) <= MAX_INIT_VAL_SM) ? -INFINITY : sM(i) * M_LN2;
+        }
     };
     if constexpr (!EnableQueryValidation)
         run_query_body(cute::false_type{});
