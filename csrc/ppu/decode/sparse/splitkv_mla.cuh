@@ -30,7 +30,7 @@
 namespace flash {
 using namespace cute;
 
-template<typename Kernel_traits, typename Params>
+template<typename Kernel_traits, bool IsV41FP8, bool IsExtraFP4, typename Params>
 __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     const Params &params, const int batch_id, const int bidh, const int m_block,
     const int n_split_idx, const int n_block_min, const int n_block_max, const bool NoSplit,
@@ -63,7 +63,19 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 
     if (row_base >= params.seqlen_q) return;
 
-    using KVCacheGmem = KVCacheG2SFP8<kBlockN, Kernel_traits::kNThreads, kHeadDim>;
+    constexpr bool RegisterFP4 = IsExtraFP4 && kBlockM <= 32;
+    using KVCacheGmemFP4 = KVCacheG2SFP4<kBlockN, Kernel_traits::kNThreads, RegisterFP4>;
+    uint32_t* fp4_lut = nullptr;
+    if constexpr (IsExtraFP4 && !RegisterFP4) {
+        fp4_lut = reinterpret_cast<uint32_t*>(
+            smem_ + Kernel_traits::kSmemSizeAccum + kBlockN * 2 * sizeof(int));
+        for (int i = tidx; i < KVCacheGmemFP4::kLutEntries; i += Kernel_traits::kNThreads) {
+            fp4_lut[i] = fp4_pair_to_bf16x2_bits(uint8_t(i / KVCacheGmemFP4::kLutReplicas));
+        }
+        __syncthreads();
+    }
+
+    using KVCacheGmem = KVCacheG2SFP8<kBlockN, Kernel_traits::kNThreads, kHeadDim, IsV41FP8>;
 
     using ElementKVCache = typename KVCacheGmem::ElementKVCache;
     using SmemLayoutKNoAiu = typename KVCacheGmem::SmemLayoutK;
@@ -146,10 +158,25 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 
     auto load_scale = [&](FragScale& scale) {
         if constexpr (kHeadDim == 512) {
-            fp8_e8m0* gK_scale = (fp8_e8m0*)(
-                k_ptr + block_index * batch_stride + page_block_size * KVCacheGmem::BytesPerToken
-                    + rel_idx_in_block * 8);
+            if constexpr (IsExtraFP4) {
+                if (k_ptr == gExK_base) {
+                    scale(0) = int64_t(0);
+                    scale(1) = int64_t(0);
+                    return;
+                }
+            }
+            fp8_e8m0* gK_scale;
+            if constexpr (IsV41FP8) {
+                gK_scale = reinterpret_cast<fp8_e8m0*>(k_ptr + block_index * batch_stride
+                    + index_t(rel_idx_in_block) * KVCacheGmem::BytesPerToken + kHeadDim);
+            } else {
+                gK_scale = reinterpret_cast<fp8_e8m0*>(k_ptr + block_index * batch_stride
+                    + page_block_size * KVCacheGmem::BytesPerToken + rel_idx_in_block * 8);
+            }
             scale(0) = valid ? __ldg((int64_t*)gK_scale) : int64_t(0);
+            if constexpr (IsV41FP8) {
+                scale(1) = valid ? __ldg((int64_t*)gK_scale + 1) : int64_t(0);
+            }
         } else {
             float4* gK_scale = (float4*)(k_ptr + block_index * batch_stride + rel_idx_in_block * row_stride + kHeadDimV);
             if (valid) {
@@ -297,11 +324,23 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 #endif
 
     KVCacheGmem kvload_gmem(tidx);
+    KVCacheGmemFP4 fp4load_gmem(tidx, fp4_lut);
 
     update_block(real_block);
     load_scale(tKrScale);
 
-    kvload_gmem.template load_g2s_async(k_ptr, sK, block_index, rel_idx_in_block, batch_stride, row_stride, valid);
+    if constexpr (IsExtraFP4) {
+        if (n_block_min >= ori_block_max) {
+            fp4load_gmem.load_g2s_async(reinterpret_cast<const uint8_t*>(gExK_base), sK,
+                block_index, rel_idx_in_block, extra_batch_stride, valid);
+        } else {
+            kvload_gmem.template load_g2s_async(k_ptr, sK, block_index, rel_idx_in_block,
+                batch_stride, row_stride, valid);
+        }
+    } else {
+        kvload_gmem.template load_g2s_async(k_ptr, sK, block_index, rel_idx_in_block,
+            batch_stride, row_stride, valid);
+    }
 
 
     real_block = n_block_min + 1;
@@ -377,7 +416,13 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
             update_block(blk_update_idx);
 
             auto sK_load = make_tensor(sK.data() + nxt_buf_idx * size(sK), layout(sK));
-            kvload_gmem.template load_g2s_async(k_ptr, sK_load, block_index, rel_idx_in_block, batch_stride, row_stride, valid);
+            if constexpr (IsExtraFP4 && NXT_IS_EXTRA_BLOCK) {
+                fp4load_gmem.load_g2s_async(reinterpret_cast<const uint8_t*>(gExK_base), sK_load,
+                    block_index, rel_idx_in_block, extra_batch_stride, valid);
+            } else {
+                kvload_gmem.template load_g2s_async(k_ptr, sK_load, block_index,
+                    rel_idx_in_block, batch_stride, row_stride, valid);
+            }
 
             if (block_idx < n_block_max - 2) {
                 load_token(real_block);
@@ -390,7 +435,15 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         }
 
         auto sK_cvt = make_tensor(sK.data() + buf_idx * size(sK), layout(sK));
-        kvload_gmem.template cvt_fp8_store(sK_cvt, sK_cvt, tKrScale);
+        if constexpr (IsExtraFP4) {
+            if (block_idx < ori_block_max) {
+                kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
+            } else {
+                fp4load_gmem.cvt_fp4_store(sK_cvt);
+            }
+        } else {
+            kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
+        }
         __syncthreads();
 
         auto qk_softmax_fused = [&]() {
@@ -920,8 +973,8 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
     }
 }
 
-template<typename Kernel_traits, bool IsFP8 = false,
-         int MetadataBlockN = Kernel_traits::kBlockN>
+template<typename Kernel_traits, bool IsFP8 = false, bool IsV41FP8 = false,
+         bool IsExtraFP4 = false, int MetadataBlockN = Kernel_traits::kBlockN>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
 flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     constexpr int kBlockN = Kernel_traits::kBlockN;
@@ -974,7 +1027,7 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
             int ori_block_max = cute::ceil_div(seqlen_kpad, kBlockN);
 
             if constexpr (IsFP8) {
-                compute_attn_fp8_sparse_splitkv<Kernel_traits>(
+                compute_attn_fp8_sparse_splitkv<Kernel_traits, IsV41FP8, IsExtraFP4>(
                     params, batch_id, bidh, m_block, n_split_idx,
                     n_block_min, n_block_max, NoSplit, seqlen_k,
                     ori_block_max, extra_seqlen_k);
@@ -995,7 +1048,7 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
             bool NoSplit = n_block_min == 0 && n_block_max == ori_block_max;
 
             if constexpr (IsFP8) {
-                compute_attn_fp8_sparse_splitkv<Kernel_traits>(
+                compute_attn_fp8_sparse_splitkv<Kernel_traits, IsV41FP8, IsExtraFP4>(
                     params, batch_id, bidh, m_block, n_split_idx,
                     n_block_min, n_block_max, NoSplit, seqlen_k,
                     ori_block_max, 0);
@@ -1015,14 +1068,16 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
 } // namespace flash
 
 ////
-template<typename Kernel_traits, bool IsFP8,
-         int MetadataBlockN = Kernel_traits::kBlockN>
+template<typename Kernel_traits, bool IsFP8, bool IsV41FP8 = false,
+         bool IsExtraFP4 = false, int MetadataBlockN = Kernel_traits::kBlockN>
 void run_flash_sparse_decode_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     // TODO.
-    constexpr size_t smem_size = Kernel_traits::kSmemSizeAccum + Kernel_traits::kBlockN * 2 * sizeof(int);
+    constexpr size_t smem_size = Kernel_traits::kSmemSizeAccum
+        + Kernel_traits::kBlockN * 2 * sizeof(int)
+        + (IsExtraFP4 && Kernel_traits::kBlockM > 32 ? flash::kFp4LutEntries * sizeof(uint32_t) : 0);
     const int num_m_block = (params.seqlen_q / params.ngroups) * cute::ceil_div(params.ngroups, Kernel_traits::kBlockM);
 
-        auto kernel = &flash::flash_sparse_decode_fwd_kernel<Kernel_traits, IsFP8, MetadataBlockN>;
+        auto kernel = &flash::flash_sparse_decode_fwd_kernel<Kernel_traits, IsFP8, IsV41FP8, IsExtraFP4, MetadataBlockN>;
         flash::printf_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size, false, true, IsFP8);
         //CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         if (smem_size >= 48 * 1024) {
@@ -1088,8 +1143,10 @@ void run_flash_sparse_decode_fwd(Flash_fwd_params &params, hggcStream_t stream) 
     }
 }
 
-template<typename T, bool IsFP8, int Headdim, int Headdim_V>
+template<typename T, bool IsFP8, int Headdim, int Headdim_V, bool IsV41FP8, bool IsExtraFP4>
 void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t stream) {
+    static_assert(!IsV41FP8 || (IsFP8 && Headdim == 512));
+    static_assert(!IsExtraFP4 || (IsV41FP8 && IsFP8 && Headdim == 512));
     constexpr int TOPK_BLOCK_SIZE = 64;    // kBlockN
     // constexpr int NUM_THREADS = 128*4; // 16*32
     // static constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits)
@@ -1136,7 +1193,7 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
                         Headdim, kBlockM, kBlockN, kNwarps, KeepQ/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
                         T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,
                         kBlockN/*kBlockNPagedPerAiuLoad*/, 2/*kStages*/, kNwarps0, kPagePow2
-                        >, IsFP8>(params, stream);
+                        >, IsFP8, IsV41FP8, IsExtraFP4>(params, stream);
                 }
             });
         });
@@ -1181,7 +1238,7 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
                     if constexpr (kBlockM == 64) {
                         if (flashmla::dsa::sparse_decode_needs_128_token_quantum(
                                 params.ngroups, false)) {
-                            run_flash_sparse_decode_fwd<FallbackTraits, false, 128>(params, stream);
+                            run_flash_sparse_decode_fwd<FallbackTraits, false, false, false, 128>(params, stream);
                             return;
                         }
                     }

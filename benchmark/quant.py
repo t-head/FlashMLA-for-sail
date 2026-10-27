@@ -6,16 +6,44 @@ import torch
 class FP8KVCacheLayout(enum.Enum):
     V32_FP8Sparse = 1
     MODEL1_FP8Sparse = 2
+    V41_FP8Sparse = 3
+    V41_FP4Sparse = 4
 
     def get_meta(self) -> Tuple[int, int, int, int, int]:
         # Return: (d, d_nope, d_rope, tile_size, num_tiles)
         return {
             FP8KVCacheLayout.V32_FP8Sparse: (576, 512, 64, 128, 4),
-            FP8KVCacheLayout.MODEL1_FP8Sparse: (512, 448, 64, 64, 7)
+            FP8KVCacheLayout.MODEL1_FP8Sparse: (512, 448, 64, 64, 7),
+            FP8KVCacheLayout.V41_FP8Sparse: (512, 448, 64, 32, 16),
+            FP8KVCacheLayout.V41_FP4Sparse: (512, 448, 64, 16, 32),
         }[self]
 
 def _cast_scale_inv_to_ue8m0(scales_inv: torch.Tensor, out_dtype = torch.float32) -> torch.Tensor:
     return torch.pow(2, torch.clamp_min(scales_inv, 1e-4).log2().ceil()).to(out_dtype)
+
+_E2M1_MAGNITUDES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+
+def _quantize_to_e2m1(x: torch.Tensor) -> torch.Tensor:
+    x = x.float()
+    if x.numel() > (1 << 26):
+        out = torch.empty(x.shape, dtype=torch.uint8, device=x.device)
+        for i in range(0, x.numel(), 1 << 26):
+            out.reshape(-1)[i:i + (1 << 26)] = _quantize_to_e2m1(x.reshape(-1)[i:i + (1 << 26)])
+        return out
+    mags = _E2M1_MAGNITUDES.to(x.device)
+    sign = torch.signbit(x).to(torch.uint8) << 3
+    a = torch.nan_to_num(x.abs(), nan=0.0, posinf=6.0).clamp_max(6.0)
+    mids = (mags[:-1] + mags[1:]) / 2
+    code = torch.bucketize(a, mids, right=True)
+    on_tie = (a.unsqueeze(-1) == mids).any(dim=-1)
+    tie_code = torch.bucketize(a, mids, right=False)
+    code = torch.where(on_tie, tie_code + (tie_code & 1), code)
+    return sign | code.to(torch.uint8)
+
+def _dequantize_e2m1(codes: torch.Tensor) -> torch.Tensor:
+    mags = _E2M1_MAGNITUDES.to(codes.device)
+    val = mags[(codes & 7).long()]
+    return torch.where((codes & 8) != 0, -val, val)
 
 def quantize_k_cache(
     input_k_cache: torch.Tensor,    # (num_blocks, block_size, h_k, d)
@@ -74,6 +102,44 @@ def quantize_k_cache(
         result = result.view(num_blocks, block_size, 1, -1)
         return result
 
+    elif kvcache_layout == FP8KVCacheLayout.V41_FP8Sparse:
+        bytes_per_token = d_nope + d_rope + num_tiles
+        result = torch.empty((num_blocks, block_size, bytes_per_token), dtype=torch.float8_e4m3fn, device=input_k_cache.device)
+        result_k_data = result[..., :d_nope+d_rope]
+        result_k_scale = result[..., d_nope+d_rope:].view(torch.float8_e8m0fnu)
+
+        for tile_idx in range(num_tiles):
+            cur_scale_factors_inv = torch.abs(input_k_cache[..., tile_idx*tile_size:(tile_idx+1)*tile_size]).max(dim=-1).values.float() / 448.0
+            cur_scale_factors_inv = _cast_scale_inv_to_ue8m0(cur_scale_factors_inv)
+            result_k_scale[:, :, tile_idx] = cur_scale_factors_inv.to(torch.float8_e8m0fnu)
+            cur_quantized = (input_k_cache[..., tile_idx*tile_size:(tile_idx+1)*tile_size].float() / cur_scale_factors_inv.unsqueeze(-1)).to(torch.float8_e4m3fn)
+            result_k_data[..., tile_idx*tile_size:(tile_idx+1)*tile_size] = cur_quantized
+
+        return result.view(num_blocks, block_size, 1, -1)
+
+    elif kvcache_layout == FP8KVCacheLayout.V41_FP4Sparse:
+        bytes_per_token = d // 2 + num_tiles
+        result = torch.empty((num_blocks, block_size, bytes_per_token), dtype=torch.float8_e4m3fn,
+                             device=input_k_cache.device)
+        result_k_data = result[..., :d // 2].view(torch.uint8)
+        result_k_scale = result[..., d // 2:]
+
+        blocks_per_chunk = max(1, (1 << 26) // (block_size * d))
+        for b0 in range(0, num_blocks, blocks_per_chunk):
+            b1 = min(b0 + blocks_per_chunk, num_blocks)
+            n = b1 - b0
+            x = input_k_cache[b0:b1].float()
+            amax = torch.nan_to_num(x.abs(), nan=float("inf")).view(
+                n, block_size, num_tiles, tile_size).amax(dim=-1)
+            scale = torch.clamp(amax / 6.0, 2.0**-9, 448.0).to(torch.float8_e4m3fn)
+            scale = torch.where(torch.isinf(amax), torch.full_like(scale, float("nan")), scale)
+            normalized = x.view(n, block_size, num_tiles, tile_size) / scale.float().unsqueeze(-1)
+            codes = _quantize_to_e2m1(normalized).view(n, block_size, d)
+            result_k_data[b0:b1] = codes[..., 0::2] | (codes[..., 1::2] << 4)
+            result_k_scale[b0:b1] = scale
+
+        return result.view(num_blocks, block_size, 1, -1)
+
     else:
         raise NotImplementedError(f"Unsupported kvcache_layout: {kvcache_layout}")
     
@@ -115,6 +181,33 @@ def dequantize_k_cache(
             cur_nope = input_nope[..., tile_idx*tile_size:(tile_idx+1)*tile_size].to(torch.bfloat16)
             cur_scales = input_scale[:, :, tile_idx].to(torch.bfloat16).unsqueeze(-1)
             result[..., tile_idx*tile_size: (tile_idx+1)*tile_size] = cur_nope * cur_scales
+
+    elif kvcache_layout == FP8KVCacheLayout.V41_FP8Sparse:
+        quant_k_cache = quant_k_cache.view(num_blocks, block_size, -1)
+        input_data = quant_k_cache[..., :d_nope+d_rope]
+        input_scale = quant_k_cache[..., d_nope+d_rope:].view(torch.float8_e8m0fnu)
+
+        for tile_idx in range(num_tiles):
+            cur_data = input_data[..., tile_idx*tile_size:(tile_idx+1)*tile_size].to(torch.bfloat16)
+            cur_scales = input_scale[:, :, tile_idx].to(torch.bfloat16).unsqueeze(-1)
+            result[..., tile_idx*tile_size:(tile_idx+1)*tile_size] = cur_data * cur_scales
+
+    elif kvcache_layout == FP8KVCacheLayout.V41_FP4Sparse:
+        quant_k_cache = quant_k_cache.view(num_blocks, block_size, -1)
+        input_data = quant_k_cache[..., :d // 2].view(torch.uint8)
+        input_scale = quant_k_cache[..., d // 2:].view(torch.float8_e4m3fn)
+
+        blocks_per_chunk = max(1, (1 << 26) // (block_size * d))
+        for b0 in range(0, num_blocks, blocks_per_chunk):
+            b1 = min(b0 + blocks_per_chunk, num_blocks)
+            codes = torch.empty((b1 - b0, block_size, d), dtype=torch.uint8,
+                                device=quant_k_cache.device)
+            codes[..., 0::2] = input_data[b0:b1] & 0xF
+            codes[..., 1::2] = input_data[b0:b1] >> 4
+            values = _dequantize_e2m1(codes).view(
+                b1 - b0, block_size, num_tiles, tile_size)
+            result[b0:b1] = (values * input_scale[b0:b1].float().unsqueeze(-1)).view(
+                b1 - b0, block_size, d).to(torch.bfloat16)
             
     else:
         raise NotImplementedError(f"Unsupported kvcache_layout: {kvcache_layout}")

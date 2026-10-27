@@ -101,7 +101,8 @@ def flash_mla_with_kvcache(
                 Different modes (including fp8/bf16, sparsity, and model version (i.e. V3.2 or MODEL1)) has different KV cache layouts. See comments below for details.
                 The KV cache must be contiguously valid for sparse attention on sm100. Here "contiguously valid" means that every byte, from the very beginning of the KV cache, till the last byte in the KV cache, is valid memory address to visit (i.e. won't IMA). In other words, the KV cache could be a slice of a larger array, but cannot be a list of disjoint memory blocks.
                 Besides, some kernels also have their own requirements on the layout of k cache, including:
-                    - For sparse fp8 decoding kernel on F3, k_cache.stride(0) must be a multiple of 656B (for V32) or 576B (for MODEL1). Padding is needed sometimes.
+                    - For sparse fp8 decoding kernel on F3, k_cache.stride(0) must be a multiple of 656B (V3.2) or 576B (V4). Padding is needed sometimes.
+                    - V4.1 stores data and scales per token; no 512-byte page padding is required.
         block_table: (batch_size, max_num_blocks_per_seq), torch.int32. Can be None when sparse attention is used.
         cache_seqlens: (batch_size), torch.int32. Can be None when sparse attention is used.
         head_dim_v: Head_dim of v. Must be 512
@@ -114,7 +115,7 @@ def flash_mla_with_kvcache(
                     Pay attention that indices_in_kvcache[i][j][k] = (the index of the page block where token t resides) * block_size + (the offset of token t among the page block),
                     where t is the k-th token of the j-th q-sequence in the i-th batch.
         attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
-        extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. This is used to support MODEL1. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
+        extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. This is used to support MODEL1. Their format requirements match the primary inputs, except V4.1 FP8 primary KV may pair with V4.1 FP4 extra KV.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
         out: Optional pre-allocated output tensor with shape (batch_size, seq_len_q, num_heads_q, head_dim_v), same dtype as q, and contiguous. If provided, the result will be written into this buffer to avoid allocation. For dense attention, only num_heads_k == 1 (MLA) is supported.
 
@@ -126,10 +127,12 @@ def flash_mla_with_kvcache(
             - Next 16 bytes: Scale factors, containing 4 float32 values. The first float32 is the scale for the first 128 float8_e4m3 values, the second for the next 128, and so on.
             - Last 128 bytes: The "RoPE" part, containing 64 bfloat16 values. This part is not quantized for accuracy.
 
-    For DeepSeek MODEL1:
-        head_dim should be 512 while head_dim_v is also 512.
+    For DeepSeek V4 and V4.1:
+        head_dim and head_dim_v should both be 512.
 
-        In FP8+sparse mode, every block can be divided into two parts. The first parts stores NoPE0, RoPE0, NoPE1, RoPE1, ... while the second part stores scale factors: 7xue8m0, 1Bpad, 7xue8m0, 1Bpad, ...
+        In V4 FP8+sparse mode, every block has a 576-byte data row per token containing 448 FP8 NoPE values and 64 BF16 RoPE values, followed by an 8-byte scale row per token containing 7 ue8m0 scales and 1 padding byte. The exposed tensor has 584 bytes per token.
+        In V4.1 FP8+sparse mode, each token stores 512 E4M3 bytes immediately followed by 16 UE8M0 scale bytes, one per 32 dimensions, including RoPE. The exposed tensor has 528 bytes per token.
+        V4.1 FP8 primary KV may pair with FP4 extra KV: each extra token stores 256 E2M1 bytes followed by 32 E4M3 scale bytes, one per 16 dimensions. Even dimensions occupy the low nibble. The exposed tensor has 288 bytes per token.
 
     Return:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).

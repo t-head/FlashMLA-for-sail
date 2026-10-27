@@ -90,8 +90,8 @@ __device__ __forceinline__ void fp8_to_bf16(Tensor0 src, Tensor1 dst, float scal
         dst_64b[m].y = __byte_perm(tmp, dst_64b[m].y, 0x7632);
     }
 #else
-    bf16x8 &result = recast<bf16x8>(dst)[0];
-    fp8x8  &inputs = recast<fp8x8>(src)[0];
+    auto dstv = recast<bf16x8>(dst);
+    auto srcv = recast<fp8x8>(src);
     __ppu_bfloat162 scale_bf162 = __float2bfloat162_rn(scale);
 
     #define DEQUANT_FP8x4(OUTPUT_BF16_LO, OUTPUT_BF16_HI, FP8x4) \
@@ -101,12 +101,67 @@ __device__ __forceinline__ void fp8_to_bf16(Tensor0 src, Tensor1 dst, float scal
         OUTPUT_BF16_HI = __float22bfloat162_rn({fp32x4.z, fp32x4.w})*scale_bf162; \
     }
 
-    DEQUANT_FP8x4(result.a01, result.a23, inputs.lo);
-    DEQUANT_FP8x4(result.a45, result.a67, inputs.hi);
+    #pragma unroll
+    for (int _di = 0; _di < size(srcv); ++_di) {
+        bf16x8 &result = dstv[_di];
+        fp8x8  &inputs = srcv[_di];
+        DEQUANT_FP8x4(result.a01, result.a23, inputs.lo);
+        DEQUANT_FP8x4(result.a45, result.a67, inputs.hi);
+    }
 #endif
 }
 
 
+
+static constexpr int kFp4LutReplicas = 32;
+static constexpr int kFp4LutEntries = 256 * kFp4LutReplicas;
+
+__device__ __forceinline__ uint16_t fp4_e2m1_to_bf16_bits(uint8_t code) {
+    uint16_t magnitude = code & 0x7;
+    uint16_t value = magnitude == 0 ? 0
+        : (magnitude == 1 ? 0x3f00 : uint16_t(0x3f00 + (magnitude << 6)));
+    return value | uint16_t((code & 0x8) << 12);
+}
+
+__device__ __forceinline__ uint32_t fp4_pair_to_bf16x2_bits(uint8_t pair) {
+    return uint32_t(fp4_e2m1_to_bf16_bits(pair & 0xF))
+        | (uint32_t(fp4_e2m1_to_bf16_bits(pair >> 4)) << 16);
+}
+
+__device__ __forceinline__ uint4 fp4_word_to_bf16x2_bits(uint32_t word) {
+    const uint32_t high_selectors = ((word >> 1) & 0x77777777u) | (word & 0x11111111u);
+    const uint32_t low_selectors0 = word & 0x7777u;
+    const uint32_t low_selectors1 = (word >> 16) & 0x7777u;
+    const uint32_t low0 = __byte_perm(0xc0800000u, 0xc0804000u, low_selectors0);
+    const uint32_t high0 = __byte_perm(0x40403f00u, 0xc0c0bf80u, high_selectors);
+    const uint32_t low1 = __byte_perm(0xc0800000u, 0xc0804000u, low_selectors1);
+    const uint32_t high1 = __byte_perm(0x40403f00u, 0xc0c0bf80u, high_selectors >> 16);
+    return uint4{__byte_perm(low0, high0, 0x5140), __byte_perm(low0, high0, 0x7362),
+                 __byte_perm(low1, high1, 0x5140), __byte_perm(low1, high1, 0x7362)};
+}
+
+template <bool RegisterDecode = false, typename Tensor0>
+__device__ __forceinline__ void fp4x16_to_bf16(
+        uint64_t packed, Tensor0 dst, float scale, const uint32_t* lut) {
+    auto dst_bf16x2 = recast<__ppu_bfloat162>(dst);
+    __ppu_bfloat162 scale_bf16x2 = __float2bfloat162_rn(scale);
+    if constexpr (RegisterDecode) {
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const uint4 values = fp4_word_to_bf16x2_bits(uint32_t(packed >> (half * 32)));
+            dst_bf16x2[half * 4 + 0] = __hmul2(*reinterpret_cast<const __ppu_bfloat162*>(&values.x), scale_bf16x2);
+            dst_bf16x2[half * 4 + 1] = __hmul2(*reinterpret_cast<const __ppu_bfloat162*>(&values.y), scale_bf16x2);
+            dst_bf16x2[half * 4 + 2] = __hmul2(*reinterpret_cast<const __ppu_bfloat162*>(&values.z), scale_bf16x2);
+            dst_bf16x2[half * 4 + 3] = __hmul2(*reinterpret_cast<const __ppu_bfloat162*>(&values.w), scale_bf16x2);
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            uint32_t values = lut[uint8_t(packed >> (i * 8)) * kFp4LutReplicas];
+            dst_bf16x2[i] = __hmul2(*reinterpret_cast<__ppu_bfloat162*>(&values), scale_bf16x2);
+        }
+    }
+}
 
 template <typename ElementKVCache, int kBlockN, int kNThreads, int kHeadDim_ = 576, int kHeadDimV_ = 512>
 struct KVCacheGmemBf16 {
@@ -352,7 +407,7 @@ struct KVCacheGmemFP8 {
 
 };
 
-template<int kBlockN, int kNThreads, int kHeadDim_>
+template<int kBlockN, int kNThreads, int kHeadDim_, bool IsV41FP8_ = false>
 struct KVCacheG2SFP8 {
     using ElementKVCache = cutlass::float_e4m3_t;
     using Element = cutlass::bfloat16_t;
@@ -361,12 +416,14 @@ struct KVCacheG2SFP8 {
     static constexpr int kBlockKSmemFp8 = 128;
     static constexpr int kSwizzle = 3;
     static constexpr int kHeadDim = kHeadDim_;
-    static constexpr int BytesPerToken = kHeadDim_ == 576 ? 656 : 576;
+    static constexpr bool IsV41FP8 = IsV41FP8_;
+    static_assert(!IsV41FP8 || kHeadDim == 512);
+    static constexpr int BytesPerToken = kHeadDim == 576 ? 656 : (IsV41FP8 ? 528 : 576);
     static constexpr int kHeadDimV = 512;
     static constexpr int kHeadDimRope = 64;
-    static constexpr int kHeadDimNope = kHeadDim - kHeadDimRope;
+    static constexpr int kHeadDimNope = IsV41FP8 ? kHeadDim : kHeadDim - kHeadDimRope;
     static constexpr int kGroupNope = 128;
-    static constexpr int NUM_SCALES = 8;
+    static constexpr int NUM_SCALES = kHeadDim == 576 ? 4 : (IsV41FP8 ? 16 : 8);
 
 
     // smem layout for MLA
@@ -445,10 +502,27 @@ struct KVCacheG2SFP8 {
                                Stride<Int<kSmemThreadsPerRowNope>, _1>>{},
                         Layout<Shape<_1, Int<kSmemElemsPerStoreNope>>, Stride<Int<kSmemElemsPerStoreNope>, _1>>{}));
 
+    // V4.1-only 16-elem wide s2r/r2s (8->4 tiles).
+    static constexpr int kSmemElemsWideNope = 16;
+    using S2RTileCopyNopeWide = decltype(
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopy, ElementKVCache>{},
+                        Layout<Shape<Int<kNThreads / kSmemThreadsPerRowNope>, Int<kSmemThreadsPerRowNope>>,
+                               Stride<Int<kSmemThreadsPerRowNope>, _1>>{},
+                        Layout<Shape<_1, Int<kSmemElemsWideNope>>, Stride<Int<kSmemElemsWideNope>, _1>>{}));
+    using R2STileCopyNopeWide = decltype(
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopy, Element>{},
+                        Layout<Shape<Int<kNThreads / kSmemThreadsPerRowNope>, Int<kSmemThreadsPerRowNope>>,
+                               Stride<Int<kSmemThreadsPerRowNope>, _1>>{},
+                        Layout<Shape<_1, Int<kSmemElemsWideNope>>, Stride<Int<kSmemElemsWideNope>, _1>>{}));
+
     using FragScale = std::conditional_t<
         kHeadDim == 576,
         decltype(make_fragment_like<float>(Layout<Shape<_4>>{})),
-        decltype(make_fragment_like<int64_t>(Layout<Shape<_1>>{}))
+        std::conditional_t<
+            IsV41FP8,
+            decltype(make_fragment_like<int64_t>(Layout<Shape<_2>>{})),
+            decltype(make_fragment_like<int64_t>(Layout<Shape<_1>>{}))
+        >
     >;
 
     TensortKgKNope tKgK_nope;
@@ -457,6 +531,8 @@ struct KVCacheG2SFP8 {
     GmemTiledCopyRope gmem_tiled_copy_K_rope;
     S2RTileCopyNope s2r_tile_copy_K_nope;
     R2STileCopyNope r2s_tile_copy_K_nope;
+    S2RTileCopyNopeWide s2r_wide;
+    R2STileCopyNopeWide r2s_wide;
 
     const int tidx;
     ElementKVCache* gK_nope = nullptr;
@@ -481,8 +557,12 @@ struct KVCacheG2SFP8 {
         Tensor tKsK_rope = gmem_tiled_copy_K_rope.get_thread_slice(tidx).partition_D(sK_rope);
 
         if constexpr (kHeadDim == 512) {
-            gK_nope = gK_ptr + blk_idx * stride_b + rel_idx_in_blk * BytesPerToken;
-            gK_rope = (Element*)(gK_nope + kHeadDimNope);
+            if constexpr (IsV41FP8) {
+                gK_nope = gK_ptr + blk_idx * stride_b + index_t(rel_idx_in_blk) * BytesPerToken;
+            } else {
+                gK_nope = gK_ptr + blk_idx * stride_b + rel_idx_in_blk * BytesPerToken;
+                gK_rope = (Element*)(gK_nope + kHeadDimNope);
+            }
         } else {
             gK_nope = gK_ptr + blk_idx * stride_b + rel_idx_in_blk * stride_r;
             gK_rope = (Element*)(gK_nope + kHeadDimV + 4 * sizeof(float));
@@ -492,14 +572,16 @@ struct KVCacheG2SFP8 {
         gmem_tiled_copy_K_nope.pred = is_token_valid;
         cute::copy(gmem_tiled_copy_K_nope, tKgK_nope(_, 0, _), tKsK_nope(_, 0, _));
 
-        tKgK_rope.data() = gK_rope + (tidx % kGmemThreadsPerRowRope) * kGmemElemsPerLoadRope;
-        gmem_tiled_copy_K_rope.pred = is_token_valid;
-        cute::copy(gmem_tiled_copy_K_rope, tKgK_rope(_, 0, _), tKsK_rope(_, 0, _));
+        if constexpr (!IsV41FP8) {
+            tKgK_rope.data() = gK_rope + (tidx % kGmemThreadsPerRowRope) * kGmemElemsPerLoadRope;
+            gmem_tiled_copy_K_rope.pred = is_token_valid;
+            cute::copy(gmem_tiled_copy_K_rope, tKgK_rope(_, 0, _), tKsK_rope(_, 0, _));
+        }
 
         cute::cp_async_fence();
     }
 
-    template <typename Tensor0, typename Tensor1, typename Tensor2>
+    template <bool RegisterV41Scale = true, typename Tensor0, typename Tensor1, typename Tensor2>
     __forceinline__ __device__ void
     cvt_fp8_store(Tensor0& Tsr_org, Tensor1& Tsr_bf16, Tensor2& scale) {
         auto addr_fp8 = make_smem_ptr(reinterpret_cast<ElementKVCache*>(Tsr_org.data().get()));
@@ -512,14 +594,48 @@ struct KVCacheG2SFP8 {
         Tensor tKrK_bf16 = make_fragment_like(tKsK_bf16);
 
         if constexpr (kHeadDim == 512) {
-            fp8_e8m0* fp8_scale = (fp8_e8m0*)(scale.data());
+            constexpr int kNumQuantTiles = IsV41FP8 ? size<2>(tKrK_fp8) : size<2>(tKrK_fp8) - 1;
 
-            #pragma unroll
-            for (int k = size<2>(tKrK_fp8) - 2; k >= 0; --k) {
-                // last 64 elements is rope
-                cute::copy(s2r_tile_copy_K_nope, tKsK_fp8(_, _, k), tKrK_fp8(_, _, k));
-                fp8_to_bf16(tKrK_fp8(_, _, k), tKrK_bf16(_, _, k), float(fp8_scale[k]));
-                cute::copy(r2s_tile_copy_K_nope, tKrK_bf16(_, _, k), tKsK_bf16(_, _, k));
+            if constexpr (IsV41FP8) {
+                // 16-elem wide s2r/r2s + load-hoisted dequant.
+                // per-32 scale: thread's 16 dims are within one 32-region -> w*4 + (tid%8)/2.
+                Tensor tKsK_fp8_w = s2r_wide.get_thread_slice(tidx).partition_D(sK_fp8);
+                Tensor tKrK_fp8_w = make_fragment_like(tKsK_fp8_w);
+                Tensor tKsK_bf16_w = r2s_wide.get_thread_slice(tidx).partition_D(sK_bf16);
+                Tensor tKrK_bf16_w = make_fragment_like(tKsK_bf16_w);
+                constexpr int kWideTiles = size<2>(tKrK_fp8_w);
+                #pragma unroll
+                for (int w = kWideTiles - 1; w >= 0; --w) {
+                    cute::copy(s2r_wide, tKsK_fp8_w(_, _, w), tKrK_fp8_w(_, _, w));
+                }
+                if constexpr (RegisterV41Scale) {
+                    cute::for_each(make_seq<kWideTiles>{}, [&](auto tile) {
+                        constexpr int w = kWideTiles - 1 - decltype(tile)::value;
+                        // Keep scale words in registers instead of indexing their byte address.
+                        const uint64_t scale_word = static_cast<uint64_t>(scale(Int<w / 2>{}));
+                        const int scale_byte = (w % 2) * 4 + ((tidx % kSmemThreadsPerRowNope) / 2);
+                        fp8_e8m0 scale_value;
+                        scale_value.__x = static_cast<uint8_t>(scale_word >> (scale_byte * 8));
+                        fp8_to_bf16(tKrK_fp8_w(_, _, w), tKrK_bf16_w(_, _, w), float(scale_value));
+                        cute::copy(r2s_wide, tKrK_bf16_w(_, _, w), tKsK_bf16_w(_, _, w));
+                    });
+                } else {
+                    fp8_e8m0* fp8_scale = (fp8_e8m0*)(scale.data());
+                    #pragma unroll
+                    for (int w = kWideTiles - 1; w >= 0; --w) {
+                        int scale_idx = w * 4 + ((tidx % kSmemThreadsPerRowNope) / 2);
+                        fp8_to_bf16(tKrK_fp8_w(_, _, w), tKrK_bf16_w(_, _, w), float(fp8_scale[scale_idx]));
+                        cute::copy(r2s_wide, tKrK_bf16_w(_, _, w), tKsK_bf16_w(_, _, w));
+                    }
+                }
+            } else {
+                fp8_e8m0* fp8_scale = (fp8_e8m0*)(scale.data());
+                #pragma unroll
+                for (int k = kNumQuantTiles - 1; k >= 0; --k) {
+                    cute::copy(s2r_tile_copy_K_nope, tKsK_fp8(_, _, k), tKrK_fp8(_, _, k));
+                    fp8_to_bf16(tKrK_fp8(_, _, k), tKrK_bf16(_, _, k), float(fp8_scale[k]));
+                    cute::copy(r2s_tile_copy_K_nope, tKrK_bf16(_, _, k), tKsK_bf16(_, _, k));
+                }
             }
         } else {
             #pragma unroll
@@ -528,6 +644,80 @@ struct KVCacheG2SFP8 {
                 fp8_to_bf16(tKrK_fp8(_, _, k), tKrK_bf16(_, _, k), scale[k/2]);
                 cute::copy(r2s_tile_copy_K_nope, tKrK_bf16(_, _, k), tKsK_bf16(_, _, k));
             }
+        }
+    }
+};
+
+template<int kBlockN, int kNThreads, bool RegisterDecode = false>
+struct KVCacheG2SFP4 {
+    using Base = KVCacheG2SFP8<kBlockN, kNThreads, 512, true>;
+    using index_t = int64_t;
+    using SmemLayoutKBF16 = typename Base::SmemLayoutKNopeBF16;
+    using R2STileCopyWide = typename Base::R2STileCopyNopeWide;
+
+    static constexpr int kDataBytesPerToken = 256;
+    static constexpr int kScalesPerToken = 32;
+    static constexpr int kThreadsPerRow = 8;
+    static constexpr int kWideTiles = 4;
+    static constexpr int kLutReplicas = kFp4LutReplicas;
+    static constexpr int kLutEntries = kFp4LutEntries;
+    static_assert(kNThreads == kBlockN * kThreadsPerRow);
+
+    R2STileCopyWide r2s_wide;
+    const int tidx;
+    const uint32_t* lut;
+
+    CUTLASS_DEVICE
+    KVCacheG2SFP4(int tidx, const uint32_t* lut)
+        : tidx(tidx), lut(RegisterDecode ? lut : lut + tidx % kLutReplicas) {}
+
+    // Stage packed data and scales in the sK buffer while the current block runs.
+    template <typename Tensor0>
+    __forceinline__ __device__ void
+    load_g2s_async(const uint8_t* gK_ptr, Tensor0& sK, int blk_idx, int rel_idx_in_blk,
+                   index_t stride_b, bool is_token_valid) {
+        const uint8_t* block = gK_ptr + blk_idx * stride_b;
+        const uint8_t* data_row = block + index_t(rel_idx_in_blk) * (kDataBytesPerToken + kScalesPerToken);
+        const uint8_t* scale_row = data_row + kDataBytesPerToken;
+        const int lane_in_row = tidx % kThreadsPerRow;
+        uint64_t* sdata = reinterpret_cast<uint64_t*>(sK.data().get());
+        uint32_t* sscale = reinterpret_cast<uint32_t*>(
+            reinterpret_cast<uint8_t*>(sK.data().get()) + kBlockN * kDataBytesPerToken);
+        #pragma unroll
+        for (int w = 0; w < kWideTiles; ++w) {
+            const uint64_t* g = reinterpret_cast<const uint64_t*>(data_row + w * 64 + lane_in_row * 8);
+            PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint64_t>::copy(*g, sdata[tidx * kWideTiles + w], is_token_valid);
+        }
+        const uint32_t* gscale = reinterpret_cast<const uint32_t*>(scale_row + lane_in_row * 4);
+        PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint32_t>::copy(*gscale, sscale[tidx], is_token_valid);
+        cute::cp_async_fence();
+    }
+
+    // Dequantize staged values in place after all threads finish reading them.
+    template <typename Tensor0>
+    __forceinline__ __device__ void
+    cvt_fp4_store(Tensor0& sK) {
+        auto sK_bf16 = make_tensor(sK.data(), SmemLayoutKBF16{});
+        auto tKsK_bf16 = r2s_wide.get_thread_slice(tidx).partition_D(sK_bf16);
+        auto tKrK_bf16 = make_fragment_like(tKsK_bf16);
+        const uint64_t* sdata = reinterpret_cast<const uint64_t*>(sK.data().get());
+        const uint8_t* sscale = reinterpret_cast<const uint8_t*>(sK.data().get())
+            + kBlockN * kDataBytesPerToken;
+        const int lane_in_row = tidx % kThreadsPerRow;
+        const int token = tidx / kThreadsPerRow;
+        uint64_t packed[kWideTiles];
+        uint8_t scale_raw[kWideTiles];
+        #pragma unroll
+        for (int w = 0; w < kWideTiles; ++w) {
+            packed[w] = sdata[tidx * kWideTiles + w];
+            scale_raw[w] = sscale[token * kScalesPerToken + w * kThreadsPerRow + lane_in_row];
+        }
+        __syncthreads();  // staging read done before in-place bf16 write clobbers it
+        #pragma unroll
+        for (int w = 0; w < kWideTiles; ++w) {
+            __hg_fp8_e4m3 scale_e4m3 = *reinterpret_cast<const __hg_fp8_e4m3*>(&scale_raw[w]);
+            fp4x16_to_bf16<RegisterDecode>(packed[w], tKrK_bf16(_, _, w), float(scale_e4m3), lut);
+            cute::copy(r2s_wide, tKrK_bf16(_, _, w), tKsK_bf16(_, _, w));
         }
     }
 };

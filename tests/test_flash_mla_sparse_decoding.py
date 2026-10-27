@@ -1,6 +1,7 @@
 import time
 import dataclasses
 from typing import Tuple, List, Dict, Optional
+import random
 import copy
 
 import rich.console
@@ -14,6 +15,7 @@ import flash_mla
 import lib
 from lib import TestParam
 from lib import RawTestParamForDecode as RawTestParam
+import quant
 import ref
 
 """
@@ -137,7 +139,134 @@ def gen_testcase() -> List[RawTestParam]:
                                 num_runs=0)]
 
     # return first_case
-    return correctness_cases + corner_cases + performance_cases
+    return correctness_cases + corner_cases + performance_cases + gen_v41_testcase()
+
+
+def gen_v41_testcase() -> List[RawTestParam]:
+    kk.set_random_seed(0)
+
+    correctness_cases = []
+    corner_cases = []
+    for have_extra_k in [False, True]:
+        for fp8_kvcache_layout, extra_fp8_kvcache_layout in [
+            (quant.FP8KVCacheLayout.V41_FP8Sparse, None),
+            (quant.FP8KVCacheLayout.V41_FP8Sparse, quant.FP8KVCacheLayout.V41_FP4Sparse),
+        ]:
+            if extra_fp8_kvcache_layout is not None and not have_extra_k:
+                continue
+            for h_q in [64, 128]:
+                have_topk_len = random.choice([False, True])
+                have_extra_topk_len = random.choice([False, True, True]) if have_extra_k else False
+                cur_correctness_cases = [
+                    RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
+                                have_topk_length=have_topk_len,
+                                enable_attn_sink=random.randint(0, 1) == 1,
+                                extra_s_k=extra_s_k,
+                                extra_topk=extra_topk,
+                                block_size=block_size,
+                                extra_block_size=extra_block_size,
+                                have_extra_topk_length=have_extra_topk_len,
+                                d_qk=512,
+                                fp8_kvcache_layout=fp8_kvcache_layout,
+                                extra_fp8_kvcache_layout=extra_fp8_kvcache_layout,
+                                check_correctness=True,
+                                num_runs=0)
+                    for (s_k, topk, block_size) in [
+                        (512, 64, 5),
+                        (512, 64, 69),
+                        (1024, 576, 2),
+                        (1024, 576, 61),
+                        (2046, 2048, 1),
+                        (2046, 2048, 64),
+                        (2046, 2048, 576)
+                    ]
+                    for (extra_s_k, extra_topk, extra_block_size) in ([
+                        (512, 64, 5),
+                        (512, 64, 69),
+                        (1024, 576, 2),
+                        (1024, 576, 123),
+                        (2046, 2048, 1),
+                        (2046, 2048, 576)
+                    ] if have_extra_k else [(None, None, None)])
+                    for b in [4, 74, 321]
+                    for s_q in [1, 3]
+                    for is_varlen in ([True, False] if (b == 74 and not have_topk_len and not have_extra_topk_len) else [True])
+                ]
+                correctness_cases.extend(cur_correctness_cases)
+
+                cur_corner_cases = [
+                    RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
+                                is_all_indices_invalid=is_all_indices_invalid,
+                                have_zero_seqlen_k=have_zero_seqlen_k,
+                                have_topk_length=have_topk_len,
+                                enable_attn_sink=enable_attn_sink,
+                                extra_s_k=extra_s_k,
+                                extra_topk=extra_topk,
+                                block_size=block_size,
+                                extra_block_size=extra_block_size,
+                                have_extra_topk_length=have_extra_topk_len,
+                                d_qk=512,
+                                fp8_kvcache_layout=fp8_kvcache_layout,
+                                extra_fp8_kvcache_layout=extra_fp8_kvcache_layout,
+                                check_correctness=True,
+                                num_runs=0,
+                    )
+                    for (s_k, topk, block_size) in [
+                        (512, 64, 61),
+                        (650, 576, 53),
+                    ]
+                    for (extra_s_k, extra_topk, extra_block_size) in ([
+                        (512, 64, 61),
+                        (650, 576, 53),
+                    ] if have_extra_k else [(None, None, None)])
+                    for b in [1, 74, 321]
+                    for s_q in [3]
+                    for is_varlen in ([True, False] if (b == 74 and not have_topk_len and not have_extra_topk_len) else [True])
+                    for is_all_indices_invalid in [True, False]
+                    for have_zero_seqlen_k in [True, False]
+                    for enable_attn_sink in [True, False]
+                    if (is_all_indices_invalid or have_zero_seqlen_k or enable_attn_sink)
+                ]
+                corner_cases.extend(cur_corner_cases)
+
+    partial_extra_block_cases = [
+        RawTestParam(4, 128, 3, 1, 512, True, 128,
+                    extra_s_k=512, extra_topk=100, block_size=64, extra_block_size=64,
+                    d_qk=512,
+                    fp8_kvcache_layout=fp8_kvcache_layout,
+                    extra_fp8_kvcache_layout=extra_fp8_kvcache_layout,
+                    check_correctness=True, num_runs=0)
+        for fp8_kvcache_layout, extra_fp8_kvcache_layout in [
+            (quant.FP8KVCacheLayout.V41_FP8Sparse, None),
+            (quant.FP8KVCacheLayout.V41_FP8Sparse, quant.FP8KVCacheLayout.V41_FP4Sparse),
+        ]
+    ]
+
+    base_and_bszs = [
+        (RawTestParam(0, 64, 4, 1, 256, True, topk=128, d_qk=512, extra_s_k=2048, extra_topk=512, block_size=256, extra_block_size=64, fp8_kvcache_layout=quant.FP8KVCacheLayout.V41_FP8Sparse), [64, 128, 256, 512]),
+        (RawTestParam(0, 128, 4, 1, 256, True, topk=128, d_qk=512, extra_s_k=2048, extra_topk=512, block_size=256, extra_block_size=64, fp8_kvcache_layout=quant.FP8KVCacheLayout.V41_FP8Sparse), [64, 128, 256, 512]),
+        (RawTestParam(0, 64, 4, 1, 256, True, topk=128, d_qk=512, extra_s_k=2048, extra_topk=512, block_size=256, extra_block_size=64, fp8_kvcache_layout=quant.FP8KVCacheLayout.V41_FP8Sparse, extra_fp8_kvcache_layout=quant.FP8KVCacheLayout.V41_FP4Sparse), [64, 128, 256, 512]),
+        (RawTestParam(0, 128, 4, 1, 256, True, topk=128, d_qk=512, extra_s_k=2048, extra_topk=512, block_size=256, extra_block_size=64, fp8_kvcache_layout=quant.FP8KVCacheLayout.V41_FP8Sparse, extra_fp8_kvcache_layout=quant.FP8KVCacheLayout.V41_FP4Sparse), [64, 128, 256, 512]),
+    ]
+    performance_cases = [
+        dataclasses.replace(base, b=b)
+        for base, bszs in base_and_bszs
+        for b in bszs
+    ]
+    performance_cases_prefill_as_decode = [
+        RawTestParam(1, h_q, 4096, 1, 4096, False, 128, extra_s_k=4096, extra_topk=512, extra_block_size=64, d_qk=512, fp8_kvcache_layout=fp8_kvcache_layout, extra_fp8_kvcache_layout=extra_fp8_kvcache_layout)
+        for h_q in [64, 128]
+        for fp8_kvcache_layout, extra_fp8_kvcache_layout in [
+            (quant.FP8KVCacheLayout.V41_FP8Sparse, quant.FP8KVCacheLayout.V41_FP8Sparse),
+            (quant.FP8KVCacheLayout.V41_FP8Sparse, quant.FP8KVCacheLayout.V41_FP4Sparse),
+        ]
+    ]
+
+    testcases = correctness_cases + corner_cases + partial_extra_block_cases + performance_cases + performance_cases_prefill_as_decode
+    for idx, raw in enumerate(testcases):
+        if raw.seed == -1:
+            raw.seed = idx
+    return testcases
 
 
 @dataclasses.dataclass
@@ -188,6 +317,10 @@ def test_flash_mla(p: TestParam) -> Result:
 
         splitkv_kernel_name = "flash_sparse_decode_fwd_kernel"
         combine_kernel_name = "flash_fwd_splitkv_mla_combine_kernel"
+        if p.fp8_kvcache_layout == quant.FP8KVCacheLayout.V41_FP8Sparse and any(
+            "flash_mla_combine_kernel" in name for name in result.get_kernel_names()
+        ):
+            combine_kernel_name = "flash_mla_combine_kernel"
 
         # Get individual kernel time usages
         kernel_time_usages_us: Dict[str, Optional[float]] = {}

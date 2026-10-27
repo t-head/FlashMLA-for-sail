@@ -590,7 +590,7 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
     const int seqlen_q_max = IsSparse ? params.ngroups - h_k_idx * kBlockM : params.seqlen_q - m_block * kBlockM;
 
     const index_t row_offset_o = bidb * params.o_batch_stride + bidh * params.o_head_stride + row_base * params.o_row_stride;
-    const index_t row_offset_oaccum = (((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + row_base) * params.d_v;
+    const index_t row_offset_oaccum = (((index_t(split_offset) + n_split_idx) * params.h + bidh) * params.seqlen_q + row_base) * params.d_v;
     const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + row_base;
     const index_t row_offset_lseaccum = ((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + row_base;
 

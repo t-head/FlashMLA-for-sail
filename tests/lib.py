@@ -42,6 +42,8 @@ class TestParam:
     have_topk_length: bool = False
     is_fp8: bool = True
     decode: Optional[ExtraTestParamForDecode] = None
+    fp8_kvcache_layout: Optional[quant.FP8KVCacheLayout] = None
+    extra_fp8_kvcache_layout: Optional[quant.FP8KVCacheLayout] = None
 
 @dataclasses.dataclass
 class RawTestParamForDecode:
@@ -72,6 +74,8 @@ class RawTestParamForDecode:
     check_correctness: bool = True
     num_runs: int = 10
     seed: int = -1
+    fp8_kvcache_layout: Optional[quant.FP8KVCacheLayout] = None
+    extra_fp8_kvcache_layout: Optional[quant.FP8KVCacheLayout] = None
 
     def to_test_param(self) -> TestParam:
         return TestParam(
@@ -86,7 +90,9 @@ class RawTestParamForDecode:
                 self.b, self.is_varlen, self.have_zero_seqlen_k,
                 self.extra_s_k, self.extra_topk,
                 self.block_size, self.extra_block_size, self.have_extra_topk_length
-            )
+            ),
+            fp8_kvcache_layout=self.fp8_kvcache_layout,
+            extra_fp8_kvcache_layout=self.extra_fp8_kvcache_layout
         )
 
 @dataclasses.dataclass
@@ -202,20 +208,22 @@ class KVScope:
     topk_length: Optional[torch.Tensor]
     blocked_k_quantized: Optional[torch.Tensor] = None
 
-    def quant_and_dequant_(self):
+    def quant_and_dequant_(self, layout_override: 'Optional[quant.FP8KVCacheLayout]' = None):
         """
         For FP8 cases, we need to quantize the KV cache for Flash MLA.
         Besides, the quantization error may be too large to be distinguished from wrong kernels, so we de-quantize kvcache here to mitigate quantization error
         """
         if self.t.is_fp8:
-            fp8_kvcache_layout = None
-            if self.t.d_qk == 576:
-                fp8_kvcache_layout = quant.FP8KVCacheLayout.V32_FP8Sparse
-            elif self.t.d_qk == 512:
-                assert self.abs_indices is not None
-                fp8_kvcache_layout = quant.FP8KVCacheLayout.MODEL1_FP8Sparse
-            else:
-                assert False
+            fp8_kvcache_layout = layout_override or self.t.fp8_kvcache_layout
+            if fp8_kvcache_layout is None:
+                if self.t.d_qk == 576:
+                    fp8_kvcache_layout = quant.FP8KVCacheLayout.V32_FP8Sparse
+                elif self.t.d_qk == 512:
+                    assert self.abs_indices is not None
+                    fp8_kvcache_layout = quant.FP8KVCacheLayout.MODEL1_FP8Sparse
+                else:
+                    assert False
+            assert fp8_kvcache_layout.get_meta()[0] == self.t.d_qk
             self.blocked_k_quantized = quant.quantize_k_cache(self.blocked_k, fp8_kvcache_layout)
             blocked_k_dequantized = quant.dequantize_k_cache(self.blocked_k_quantized, fp8_kvcache_layout)
             self.blocked_k = blocked_k_dequantized
@@ -259,6 +267,7 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
     kk.set_random_seed(t.seed)
     assert t.h_q % t.h_kv == 0
     assert t.decode is not None
+    is_v41 = t.is_fp8 and t.fp8_kvcache_layout == quant.FP8KVCacheLayout.V41_FP8Sparse
 
     q = torch.randn((t.decode.b, t.s_q, t.h_q, t.d_qk))
     q.clamp_(min=-1.0, max=1.0)
@@ -289,7 +298,10 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
         block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
         block_table = block_table.view(-1)[torch.randperm(block_table.numel())].view(b, -1)
 
-        blocked_k = kk.gen_non_contiguous_randn_tensor((block_table.numel(), block_size, t.h_kv, t.d_qk)) / 10
+        if is_v41:
+            blocked_k = torch.randn((block_table.numel(), block_size, t.h_kv, t.d_qk)) * 0.1
+        else:
+            blocked_k = kk.gen_non_contiguous_randn_tensor((block_table.numel(), block_size, t.h_kv, t.d_qk)) / 10
         blocked_k.clamp_(min=-1.0, max=1.0)
 
         abs_indices = torch.empty((b, t.s_q, topk), dtype=torch.int32)
@@ -326,7 +338,7 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
         if t.decode.extra_block_size is None:
             t.decode.extra_block_size = t.decode.block_size
         kv_scope1 = generate_one_k_scope(t.decode.extra_s_k, t.decode.extra_block_size, t.decode.extra_topk, t.decode.is_varlen, t.decode.have_zero_seqlen_k, t.is_all_indices_invalid, t.decode.have_extra_topk_length)
-        kv_scope1.quant_and_dequant_()
+        kv_scope1.quant_and_dequant_(t.extra_fp8_kvcache_layout)
     else:
         assert t.decode.extra_block_size is None and t.decode.extra_s_k is None and not t.decode.have_extra_topk_length
         kv_scope1 = None
@@ -417,14 +429,24 @@ def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode) -> Flo
         num_unique_tokens = indices.unique().numel()    # type: ignore
         return num_unique_tokens
 
-    num_attended_tokens = get_num_attended_tokens(t.kv_scope) + (get_num_attended_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0)
-    num_retrieved_tokens = get_num_retrieved_tokens(t.kv_scope) + (get_num_retrieved_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0)
+    num_attended_tokens = get_num_attended_tokens(t.kv_scope) + (
+        get_num_attended_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0
+    )
+    main_retrieved_tokens = get_num_retrieved_tokens(t.kv_scope)
+    extra_retrieved_tokens = get_num_retrieved_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0
 
     compute_flop = 2 * p.h_q * num_attended_tokens * (p.d_qk + p.d_v)
-    kv_token_size = 656 if p.d_qk == 576 else 576   # Assume FP8 KV Cache
+    kv_token_size = 656 if p.d_qk == 576 else (
+        528 if p.fp8_kvcache_layout == quant.FP8KVCacheLayout.V41_FP8Sparse else 576
+    )
+    extra_kv_token_size = (
+        288 if p.extra_fp8_kvcache_layout == quant.FP8KVCacheLayout.V41_FP4Sparse
+        else kv_token_size
+    )
     mem_vol = sum([
         2 * b * p.s_q * p.h_q * p.d_qk, # Q
-        num_retrieved_tokens * kv_token_size,   # K
+        main_retrieved_tokens * kv_token_size,
+        extra_retrieved_tokens * extra_kv_token_size,
         2 * b * p.s_q * p.h_q * p.d_v, # O
     ])
     return FlopsAndMemVolStatisticsForDecode(
