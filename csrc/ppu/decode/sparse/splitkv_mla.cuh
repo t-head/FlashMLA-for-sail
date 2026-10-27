@@ -1045,6 +1045,8 @@ void run_flash_sparse_decode_fwd(Flash_fwd_params &params, hggcStream_t stream) 
 #endif
     CHECK_CUDA_KERNEL_LAUNCH();
 
+    if (params.oaccum_ptr == nullptr) return;
+
     // Non-WG combine dispatch is fitted independently for FP8-KV and BF16-KV.
     // We exhaustively searched integer (batch, grid_size) AND rules on FP8 and
     // BF16 non-WG cases on M890. 
@@ -1153,7 +1155,7 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
         // The legacy M64 kernel uses the same 64-token metadata quantum.
         const int64_t kv_tokens = int64_t(params.topk) + std::max(params.extra_topk, 0);
         const int min_kv_per_part = params.seqlen_q > params.ngroups ? 512 : 256;
-        const bool m128_has_enough_work =
+        const bool m128_has_enough_work = params.oaccum_ptr == nullptr ||
             int64_t(params.b) * kv_tokens > int64_t(params.num_sm_parts) * min_kv_per_part;
         const bool wi_enable_m128 = kCanWI
             && m128_has_enough_work

@@ -27,6 +27,8 @@ class FlashMLASchedMeta:
         extra_page_block_size: Optional[int]
         extra_topk: Optional[int]
 
+        enable_batch_invariant: bool
+
     have_initialized: bool = False
 
     config: Optional[Config] = None
@@ -93,6 +95,7 @@ def flash_mla_with_kvcache(
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    enable_batch_invariant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -117,6 +120,7 @@ def flash_mla_with_kvcache(
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. This is used to support MODEL1. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
         out: Optional pre-allocated output tensor with shape (batch_size, seq_len_q, num_heads_q, head_dim_v), same dtype as q, and contiguous. If provided, the result will be written into this buffer to avoid allocation. For dense attention, only num_heads_k == 1 (MLA) is supported.
+        enable_batch_invariant: Disable sparse split-KV so results do not depend on batch partitioning.
 
     For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
         head_dim should be 576 while head_dim_v should be 512.
@@ -167,6 +171,7 @@ def flash_mla_with_kvcache(
             topk,
             extra_k_page_block_size,
             extra_topk,
+            enable_batch_invariant,
         )
         # Metadata will be generated lazily in C++ on first call
 
@@ -185,6 +190,8 @@ def flash_mla_with_kvcache(
         assert sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg
         assert sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg
         assert sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg
+        if sched_meta.config.enable_batch_invariant != enable_batch_invariant:
+            raise ValueError("sched_meta.config.enable_batch_invariant must match." + helper_msg)
 
     # Dispatch to appropriate C++ function based on whether indices are provided
     if topk is not None:
@@ -203,10 +210,12 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache,
             extra_topk_length,
             softmax_scale,
-            out
+            out,
+            enable_batch_invariant
         )
     else:
         # Dense decode path
+        assert not enable_batch_invariant, "enable_batch_invariant is only supported for sparse attention."
         out, softmax_lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.dense_decode_fwd(
             q,
             k_cache,

@@ -426,6 +426,8 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_params pa
 
 template<typename ElementT>
 void run_flash_mla_combine_kernel(Flash_fwd_mla_params &params, hggcStream_t stream, bool lse_in_log2) {
+    if (params.oaccum_ptr == nullptr) return;
+
     // lse_in_log2 tells which log domain softmax_lseaccum_ptr holds: the warp-group
     // decode epilogue writes log2, the splitkv epilogue writes natural log.
     params.lse_to_log2 = lse_in_log2 ? 1.0f : (float)M_LOG2E;

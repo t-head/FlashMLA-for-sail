@@ -620,7 +620,9 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
         // const int warp_id_m = (tidx / 32) % Kernel_traits::AtomLayoutQ;
         const int row_lse_base = warp_id % Kernel_traits::AtomLayoutQ * MMA_ATOM_M + (tidx % 32) / 4;
         const int warp_stride = MMA_ATOM_M * Kernel_traits::AtomLayoutQ;
-        if (warp_id < Kernel_traits::kNWarps0) {
+        if (warp_id < Kernel_traits::kNWarps0 &&
+            (!IsSparse || params.oaccum_ptr != nullptr ||
+             (warp_id < Kernel_traits::AtomLayoutQ && tidx % 4 == 0))) {
             #pragma unroll
             for (int mi = 0; mi < size(lse); ++mi) {
                 const int row = row_lse_base + (mi / MMA_ATOM_K_M) * warp_stride + (mi % MMA_ATOM_K_M) *8;

@@ -29,7 +29,8 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &extra_indices,       // batch_size x seqlen_q_ori x extra_topk
     const std::optional<at::Tensor> &extra_topk_length,   // batch_size
     const float softmax_scale,
-    const std::optional<at::Tensor> &out_                 // batch_size x seqlen_q_ori x num_heads_ori x head_size_v
+    const std::optional<at::Tensor> &out_,                // batch_size x seqlen_q_ori x num_heads_ori x head_size_v
+    const bool enable_batch_invariant
 ) {
     bool is_fp8 = (kv.dtype() == torch::kFloat8_e4m3fn ||
                    kv.dtype() == torch::kInt8 ||
@@ -86,6 +87,11 @@ sparse_attn_decode_interface(
                 num_sm_parts = wg_parts;
             }
         }
+
+        const auto *dprops = at::cuda::getCurrentDeviceProperties();
+        const int logical_sm_count = std::string(dprops->name).find("810E") != std::string::npos ? 20 : dprops->multiProcessorCount;
+        const int q_aware_parts = std::max(logical_sm_count / std::max(int(sizes[1]), 1), 1);
+        num_sm_parts = enable_batch_invariant ? 1 : std::min(num_sm_parts, q_aware_parts);
 
         auto options = q.options().dtype(torch::kInt32);
         auto tile_scheduler_metadata_t = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
@@ -298,20 +304,24 @@ sparse_attn_decode_interface(
     CHECK_CONTIGUOUS(tile_scheduler_metadata.value());
     params.tile_scheduler_metadata_ptr = tile_scheduler_metadata->data_ptr<int>();
     params.num_sm_parts = tile_scheduler_metadata->size(0);
+    TORCH_CHECK(!enable_batch_invariant || params.num_sm_parts == 1,
+                "batch-invariant metadata must contain exactly one SM part");
     TORCH_CHECK(num_splits->dtype() == torch::kInt32, "num_splits must have dtype int32");
     CHECK_DEVICE(num_splits.value());
     CHECK_CONTIGUOUS(num_splits.value());
     params.num_splits_ptr = num_splits->data_ptr<int>();
 
     // splitkv
-    //at::Tensor softmax_lse_accum, out_accum;
+    at::Tensor softmax_lse_accum, out_accum;
     //std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
     //    params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
     //    head_size, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
-    at::Tensor softmax_lse_accum = torch::empty({batch_size + params.num_sm_parts, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor out_accum = torch::empty({batch_size + params.num_sm_parts, num_heads, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
-    params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
-    params.oaccum_ptr = out_accum.data_ptr();
+    if (!enable_batch_invariant) {
+        softmax_lse_accum = torch::empty({batch_size + params.num_sm_parts, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+        out_accum = torch::empty({batch_size + params.num_sm_parts, num_heads, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
+        params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+        params.oaccum_ptr = out_accum.data_ptr();
+    }
 
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
     // TORCH_CHECK(head_size == 576);
