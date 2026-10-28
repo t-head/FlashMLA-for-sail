@@ -317,10 +317,12 @@ def test_flash_mla(p: TestParam) -> Result:
 
         splitkv_kernel_name = "flash_sparse_decode_fwd_kernel"
         combine_kernel_name = "flash_fwd_splitkv_mla_combine_kernel"
-        if p.fp8_kvcache_layout == quant.FP8KVCacheLayout.V41_FP8Sparse and any(
-            "flash_mla_combine_kernel" in name for name in result.get_kernel_names()
-        ):
-            combine_kernel_name = "flash_mla_combine_kernel"
+        if p.fp8_kvcache_layout == quant.FP8KVCacheLayout.V41_FP8Sparse:
+            kernel_names = result.get_kernel_names()
+            if any("flash_sparse_decode_wg_kernel" in kernel for kernel in kernel_names):
+                splitkv_kernel_name = "flash_sparse_decode_wg_kernel"
+            if any("flash_fwd_mla_combine_kernel" in name for name in kernel_names):
+                combine_kernel_name = "flash_fwd_mla_combine_kernel"
 
         # Get individual kernel time usages
         kernel_time_usages_us: Dict[str, Optional[float]] = {}
@@ -342,8 +344,14 @@ def test_flash_mla(p: TestParam) -> Result:
             e2e_time_usage_us = 1e6
         else:
             assert have_kernel(splitkv_kernel_name)
-            if have_kernel(combine_kernel_name):
-                e2e_time_usage_us = result.get_e2e_time(splitkv_kernel_name, combine_kernel_name) * 1e6
+            first_kernel_name = splitkv_kernel_name
+            if p.fp8_kvcache_layout == quant.FP8KVCacheLayout.V41_FP8Sparse and any(
+                "get_mla_metadata_kernel" in kernel for kernel in result.get_kernel_names()
+            ):
+                first_kernel_name = "get_mla_metadata_kernel"
+            last_kernel_name = combine_kernel_name if have_kernel(combine_kernel_name) else splitkv_kernel_name
+            if first_kernel_name != last_kernel_name:
+                e2e_time_usage_us = result.get_e2e_time(first_kernel_name, last_kernel_name) * 1e6
             else:
                 e2e_time_usage_us = kernel_time_usages_us[splitkv_kernel_name]
         assert e2e_time_usage_us is not None

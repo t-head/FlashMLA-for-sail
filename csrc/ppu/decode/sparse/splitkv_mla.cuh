@@ -1149,6 +1149,14 @@ template<typename T, bool IsFP8, int Headdim, int Headdim_V, bool IsV41FP8, bool
 void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t stream) {
     static_assert(!IsV41FP8 || (IsFP8 && Headdim == 512));
     static_assert(!IsExtraFP4 || (IsV41FP8 && IsFP8 && Headdim == 512));
+    if constexpr (IsV41FP8) {
+        if (flashmla::dsa::sparse_decode_hs64_v41_supported(params, IsExtraFP4) &&
+            is_sm89_or_newer()) {
+            flashmla::dsa::hs64::run_flash_sparse_decode_wg_kernel_hs64(
+                params, stream, true, IsExtraFP4);
+            return;
+        }
+    }
     constexpr int TOPK_BLOCK_SIZE = 64;    // kBlockN
     // constexpr int NUM_THREADS = 128*4; // 16*32
     // static constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits)
@@ -1159,24 +1167,25 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
         constexpr bool USE_MMA_M8 = 0;
         constexpr bool KeepQ = true;
         constexpr static int kBlockN = 64;
-        // Warp-interleave compile-time gate: enabled for sparse-FP8 paths.
-        // WI v2 supports Headdim=576/512, extra_topk, but requires:
+        // Select warp-interleave automatically for supported V4.1 FP8 and
+        // FP4 extra-KV inputs, using architecture and shape guards like BF16.
+        // Generic T2 WI supports Headdim=576/512 and extra_topk, but requires:
         //   - page_block_size > 0 and a power of two (kPagePow2 gate below)
-        //   - seqlen_q == ngroups (s_q_ori==1, single m_block only)
-        // BlockM=128 path: ngroups >= 128
-        // BlockM=64 path:  64 <= ngroups < 128 (cross-cut layout)
+        //   - each MTP query has complete head tiles, so a tile uses one index row
+        // BlockM=128 path: ngroups >= 128 (MTP additionally needs ngroups % 128 == 0)
+        // BlockM=64 path:  64 <= ngroups < 128 (MTP additionally needs ngroups == 64)
         // Other configurations fall back to non-WI splitkv path.
-        const bool kCanWI = false; //is_sm89_or_newer();
+        const bool kCanWI = IsV41FP8 && is_sm89_or_newer();
         // blockM=128 path (original 8,1 atom layout)
         const bool wi_enable_m128 = kCanWI
             && (params.ngroups >= 128)
-            && (params.seqlen_q == params.ngroups)
+            && (params.seqlen_q == params.ngroups || params.ngroups % 128 == 0)
             && (params.page_block_size > 0);
         // blockM=64 path (cross-cut 4,2 atom layout, for h_q=64)
         const bool wi_enable_m64 = kCanWI
             && (params.ngroups >= 64)
             && (params.ngroups < 128)
-            && (params.seqlen_q == params.ngroups)
+            && (params.seqlen_q == params.ngroups || params.ngroups % 64 == 0)
             && (params.page_block_size > 0);
         SEQLENG_SWITCH_ALIGN(params.seqlen_q, [&] {
             IS_PAGE_POWER2(params.page_block_size, params.extra_page_block_size, [&] {
@@ -1185,12 +1194,15 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params& params, hggcStream_t strea
                 constexpr int kNwarps = 16;
                 constexpr int AtomLayoutP = kBlockM == 64 ? 2 : 1; // to save regs(sum/max in softmax)
                 if (wi_enable_m128 && kPagePow2) {
-                    run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 128>(params, stream);
+                    // The WG entry selects the paired V4.1 pipeline for complete
+                    // head tiles and retains the legacy partial-head fallback.
+                    run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 128,
+                        IsV41FP8, IsExtraFP4>(params, stream);
                 } else if (wi_enable_m64 && kPagePow2) {
-                    run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 64>(params, stream);
+                    run_flash_sparse_decode_wg_kernel<T, 89, IsFP8, 64,
+                        IsV41FP8, IsExtraFP4>(params, stream);
                 } else {
-                    // WI v2 rejected (ngroups < 64):
-                    // fall back to non-WI sparse decode (splitkv compute path).
+                    // Use splitkv when the WI path is unavailable.
                     run_flash_sparse_decode_fwd<Flash_fwd_kernel_traits<
                         Headdim, kBlockM, kBlockN, kNwarps, KeepQ/*Is_Q_in_regs*/, USE_MMA_M8/*Share_Q_K_smem*/,
                         T, Headdim_V, 1/*CrossCut*/, USE_MMA_M8/*USE_MMA_M8*/, AtomLayoutQ, AtomLayoutP,

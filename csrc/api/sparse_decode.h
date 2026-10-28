@@ -204,8 +204,21 @@ sparse_attn_decode_interface(
     const int seqlen_q = seqlen_q_ori * ngroups;
     const int num_heads = num_heads_k;
 
-    q = q.view({batch_size, seqlen_q_ori, num_heads_k, ngroups, head_size}).transpose(2, 3)
-            .reshape({batch_size, seqlen_q, num_heads, head_size});
+    const bool use_v41_wg = is_v41_fp8 &&
+        flashmla::dsa::v41::sparse_decode_wg_v41_supported(
+        is_sm89_or_newer(), ngroups, page_block_size,
+        extra_kv.has_value() ? static_cast<int>(extra_kv->size(1)) : 0);
+    if (use_v41_wg) {
+        // Keep query/head strides: flattening a strided MTP Q can require a copy.
+        if (!flashmla::dsa::v41::sparse_decode_wg_v41_q_alignment_supported(
+                q.data_ptr(), q.stride(0), q.stride(1), q.stride(2), head_size)) {
+            // clone also repairs an unaligned offset on an otherwise contiguous view.
+            q = q.clone(at::MemoryFormat::Contiguous);
+        }
+    } else {
+        q = q.view({batch_size, seqlen_q_ori, num_heads_k, ngroups, head_size}).transpose(2, 3)
+                .reshape({batch_size, seqlen_q, num_heads, head_size});
+    }
 
     auto opts = q.options();
     at::Tensor out;
@@ -339,6 +352,35 @@ sparse_attn_decode_interface(
     CHECK_DEVICE(num_splits.value());
     CHECK_CONTIGUOUS(num_splits.value());
     params.num_splits_ptr = num_splits->data_ptr<int>();
+
+    at::Tensor hs64_metadata, hs64_num_splits;
+    if (is_v41_fp8 &&
+        flashmla::dsa::sparse_decode_hs64_v41_supported(params, is_extra_fp4) &&
+        is_sm89_or_newer()) {
+        if (params.b <= 4 && params.q_orig <= params.num_sm_parts) {
+            params.num_sm_parts /= params.q_orig;
+        }
+        // Keep cached FP8 metadata at 64 tokens; HS64 consumes a private 128-token schedule.
+        const auto metadata_options = q.options().dtype(torch::kInt32);
+        hs64_metadata = torch::empty(
+            {params.num_sm_parts, TileSchedulerMetaDataSize}, metadata_options);
+        hs64_num_splits = torch::empty({params.b + 1}, metadata_options);
+        Mla_metadata_params hs64_meta_params = {};
+        hs64_meta_params.seqlens_k_ptr = nullptr;
+        hs64_meta_params.tile_scheduler_metadata_ptr = hs64_metadata.data_ptr<int>();
+        hs64_meta_params.num_splits_ptr = hs64_num_splits.data_ptr<int>();
+        hs64_meta_params.batch_size = params.b;
+        hs64_meta_params.block_size_n = 128;
+        hs64_meta_params.fixed_overhead_num_blocks = 5;
+        hs64_meta_params.num_sm_parts = params.num_sm_parts;
+        hs64_meta_params.topk = params.topk;
+        hs64_meta_params.extra_topk = params.extra_topk >= 0 ? params.extra_topk : 0;
+        hs64_meta_params.topk_length = params.topk_len_ptr;
+        hs64_meta_params.extra_topk_length = params.extra_topk_len_ptr;
+        get_mla_metadata_func(hs64_meta_params, stream);
+        params.tile_scheduler_metadata_ptr = hs64_metadata.data_ptr<int>();
+        params.num_splits_ptr = hs64_num_splits.data_ptr<int>();
+    }
 
     // splitkv
     at::Tensor softmax_lse_accum, out_accum;

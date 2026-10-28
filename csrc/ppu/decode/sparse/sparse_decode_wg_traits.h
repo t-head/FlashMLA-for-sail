@@ -7,6 +7,10 @@
 
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
+#include <cutlass/array.h>
+#include <type_traits>
+
+#include "params.h"
 #include <cutlass/numeric_types.h>
 #include <cutlass/barrier.h>
 
@@ -108,15 +112,23 @@ struct Copy_Traits<SparsePairedTsmUnit16<Element, BlockH, Swap, Trans, OddTile>>
 // dequantized in-thread (see load_and_dequant_sparse_K).
 // All other typedefs are inherited 1:1 from splitkv.
 // =============================================================================
-template<typename InputT_, int HeadDimK = 576, bool IsFP8_ = true, int BlockM_ = 128>
+template<typename InputT_, int HeadDimK = 576, bool IsFP8_ = true, int BlockM_ = 128,
+         bool IsV41FP8_ = false, bool IsExtraFP4_ = false>
 struct Traits_v2 : public Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE_VERSION >= 10500)> {
     using Base = Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE_VERSION >= 10500)>;
+
     using InputT = typename Base::InputT;
 
     // Whether the KV cache stores FP8 (with dequant) or BF16 (direct read).
     static constexpr bool IsFP8 = IsFP8_;
+    static constexpr bool kV41PairedPipeline = false;
     // Original metadata images process each parent's batch interval contiguously.
     static constexpr int kMetadataStripeFactor = 1;
+    static constexpr bool kV41FP8 = IsV41FP8_;
+    static constexpr bool kExtraFP4 = IsExtraFP4_;
+    static_assert(!kV41FP8 || (IsFP8 && HeadDimK == 512));
+    static_assert(!kExtraFP4 || kV41FP8);
+
 
     // Shadow Base::kHeadDim with template parameter
     static constexpr int kHeadDim = HeadDimK;
@@ -238,6 +250,10 @@ struct Traits_v2 : public Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE
     //       offset_in_block = page_block_size * 576 + off_in_page * 8;
     //       8 bytes per token = 7 used e8m0 scales (one per 64 nope dims) + 1 pad.
     //     PyTorch shape stride is bytes_per_token = 584 (= 576 + 8) per token.
+    //
+    //   * V4.1 (HeadDimK == 512):  each token has 512 FP8 E4M3 bytes followed
+    //     by 16 UE8M0 scale bytes (528 bytes/token). Extra KV may instead have
+    //     256 packed FP4 bytes followed by 32 E4M3 scales (288 bytes/token).
     // -----------------------------------------------------------------------
     static constexpr bool kModel1Layout         = (HeadDimK == 512);
 
@@ -252,14 +268,14 @@ struct Traits_v2 : public Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE
     //   kBytesPerToken = HeadDimK * 2 (all BF16).
     // -----------------------------------------------------------------------
     static constexpr int kFp8NopeBytesPerToken  = IsFP8
-        ? (kModel1Layout ? 448 : 512)
+        ? (kV41FP8 ? 512 : (kModel1Layout ? 448 : 512))
         : 0;  // BF16 path: no FP8 nope segment
     static constexpr int kFp8ScaleBytesPerToken = IsFP8
-        ? (kModel1Layout ? 8 : 16)
+        ? (kModel1Layout && !kV41FP8 ? 8 : 16)
         : 0;  // BF16 path: no scales
-    static constexpr int kRopeElems             = 64;                          // 64 BF16 rope elems in both layouts
-    static constexpr int kBf16RopeBytesPerToken = IsFP8 ? (kRopeElems * 2) : 0; // BF16 path: rope is part of contiguous token
-    static constexpr bool kHasRope              = IsFP8;  // BF16 path: no separate rope segment
+    static constexpr int kRopeElems             = 64;  // Legacy FP8 layouts only
+    static constexpr int kBf16RopeBytesPerToken = IsFP8 && !kV41FP8 ? (kRopeElems * 2) : 0;
+    static constexpr bool kHasRope              = IsFP8 && !kV41FP8;
     // Whether there is an EXTRA tile 8 beyond the first 8 tiles in the QK GEMM.
     // HeadDimK=576 (both FP8 V3.2 and BF16): tiles 0-7 cover dims [0,512), tile 8
     // covers dims [512,576) — needed for full dot-product. MODEL1 (512): only 8
@@ -268,12 +284,12 @@ struct Traits_v2 : public Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE
     // Per-token contiguous-payload stride.
     // BF16 path: HeadDimK * sizeof(BF16) = HeadDimK * 2 bytes per token.
     static constexpr int kBytesPerToken = IsFP8
-        ? (kModel1Layout
-            ? (kFp8NopeBytesPerToken + kRopeElems * 2)                                      // 576 (MODEL1 FP8)
-            : (kFp8NopeBytesPerToken + kFp8ScaleBytesPerToken + kRopeElems * 2))            // 656 (V3.2 FP8)
-        : (HeadDimK * 2);                                                                   // 1152 (BF16, 576*2)
+        ? (kV41FP8 ? 528 : (kModel1Layout
+            ? (kFp8NopeBytesPerToken + kRopeElems * 2)                                     // 576 (MODEL1 FP8)
+            : (kFp8NopeBytesPerToken + kFp8ScaleBytesPerToken + kRopeElems * 2)))          // 656 (V3.2 FP8)
+        : (HeadDimK * 2);                                                                  // 1152 (BF16, 576*2)
     // Byte offset of BF16 rope inside the per-token payload (FP8 paths only).
-    static constexpr int kRopeOffsetBytes = IsFP8
+    static constexpr int kRopeOffsetBytes = IsFP8 && !kV41FP8
         ? (kModel1Layout
             ? kFp8NopeBytesPerToken                                                          // 448 (rope right after nope)
             : (kFp8NopeBytesPerToken + kFp8ScaleBytesPerToken))                              // 528 (after nope + per-token scales)
@@ -281,7 +297,7 @@ struct Traits_v2 : public Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE
     // Number of nope elements per FP8 scale (one e8m0/fp32 entry covers a
     // contiguous tile of nope dims).  V3.2: 128 dims/scale (4 fp32 scales);
     // MODEL1: 64 dims/scale (7 e8m0 scales + 1 pad byte).
-    static constexpr int kScaleTileSize = IsFP8 ? (kModel1Layout ? 64 : 128) : 1;  // BF16: unused, avoid div-by-zero
+    static constexpr int kScaleTileSize = IsFP8 ? (kV41FP8 ? 32 : (kModel1Layout ? 64 : 128)) : 1;
     static constexpr int kNumScaleTiles = IsFP8 ? (kFp8NopeBytesPerToken / kScaleTileSize) : 0;
 
     // Shadow SmemLayoutQ to use the correct HeadDimK and kBlockM
@@ -423,11 +439,14 @@ struct Hs64BaseTraits {
                         Layout<Shape < _1, _1>>{}));  // Val layout, 4 vals per store
 };
 
-// The private HS64 instance is BF16/M64-only. Other data types and block sizes
-// remain on the existing generic kernels.
-template<int HeadDimK, bool GuardIndices = true, int Arch = 89>
+// HS64 uses BF16 MMA operands. The V4.1 instance converts FP8/FP4 cache
+// values into BF16 in the load pipeline; other geometries keep their kernels.
+template<int HeadDimK, bool GuardIndices = true, int Arch = 89,
+         bool IsV41FP8 = false, bool IsExtraFP4 = false>
 struct Hs64Traits : public Hs64BaseTraits<Arch> {
     static_assert(HeadDimK == 512 || HeadDimK == 576);
+    static_assert(!IsV41FP8 || HeadDimK == 512);
+    static_assert(!IsExtraFP4 || IsV41FP8);
 
     using Base = Hs64BaseTraits<Arch>;
     using InputT = typename Base::InputT;
@@ -438,12 +457,16 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
     static constexpr bool kGroupPrefillQueries = false;
     static constexpr bool kMultiPrefillHeadTiles = false;
     static constexpr bool kParkQ5Fragment = false;
+    static constexpr bool kV41FP8 = IsV41FP8;
+    static constexpr bool kExtraFP4 = IsExtraFP4;
+
     static constexpr int kHeadDim = HeadDimK;
     static constexpr int kBlockM = 64;
     static constexpr int BLOCK_SIZE_M = kBlockM;
 
     // Match dense PPU1.5's paired-cube storage; SM80 keeps its native layout.
-    static constexpr bool kUsePairedCubes = Arch == 89;
+    // Quantized loaders retain their validated unpaired BF16 staging layout.
+    static constexpr bool kUsePairedCubes = Arch == 89 && !IsV41FP8;
 
     // The (4,2) cross-cut splits kBlockN columns across two N-warps, so their
     // per-row softmax max/sum must be merged (see wg*_bunch_0).
@@ -607,7 +630,7 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
     static constexpr bool kCacheFirstHighQTile = true;
     static constexpr int kCachedFirstHighQTile = kCacheFirstHighQTile ? 4 : 0;
     static constexpr bool kCacheD576MiddleQTiles = kHasExtraKTile;
-    static constexpr int kBytesPerToken = HeadDimK * sizeof(InputT);
+    static constexpr int kBytesPerToken = IsV41FP8 ? 528 : HeadDimK * sizeof(InputT);
 
     // Shadow SmemLayoutQ to use the correct HeadDimK and kBlockM
     using SmemLayoutQ = decltype(tile_to_shape(
@@ -753,3 +776,199 @@ struct Hs64PrefillTraits : public Hs64Traits<HeadDimK, false, Arch> {
 };
 
 }  // namespace flashmla::dsa::hs64
+
+namespace flashmla::dsa::v41 {
+
+using namespace cute;
+
+struct SparseDecodeV41CacheParams {
+    void *__restrict__ kv;
+    int quant_page_size;
+    int64_t quant_block_stride;
+};
+static_assert(std::is_standard_layout_v<SparseDecodeV41CacheParams>);
+static_assert(std::is_trivially_copyable_v<SparseDecodeV41CacheParams>);
+
+struct SparseDecodeV41TileParams {
+    int s_q, s_kv, h_q, d_qk, topk;
+    float sm_scale_div_log2;
+    void *q, *kv;
+    int *indices;
+    float *attn_sink;
+    int64_t stride_q_s_q, stride_q_h_q;
+    void *out, *lse;
+    int quant_page_size;
+    int64_t quant_block_stride;
+
+    void *extra_kv;
+    int *extra_indices;
+    int extra_s_kv, extra_page_size;
+    int64_t extra_block_stride;
+    int main_length, extra_length, main_storage_topk, extra_storage_topk;
+    int main_padded_length, start_block, end_block;
+    bool partial_output;
+};
+
+struct SparseDecodeV41Scheduler;
+struct V41RowAddress64;
+struct V41RowAddress32;
+
+struct SparseDecodeV41CacheAdapter {
+    template<typename T>
+    static __forceinline__ __device__ V41RowAddress32 prepare_scope_row32(
+        const typename T::Params &, int token_idx, bool valid, int loaded_block);
+
+    template<int S, int E, typename T>
+    static __forceinline__ __device__ auto register_load_scope_row32(
+        const typename T::Params &, int tidx, int token_idx, bool valid,
+        int loaded_block, const V41RowAddress32 &row);
+
+    template<int S, int E, typename T, bool FRONT_DRAIN, typename RawK>
+    static __forceinline__ __device__ void load_scope_row32(
+        const typename T::Params &, RawK &, int tidx, int token_idx,
+        bool valid, int loaded_block, const V41RowAddress32 &row);
+
+    template<typename T>
+    static __forceinline__ __device__ typename T::InputT *prepare_page_base64(
+        const typename T::Params &, int token_idx, bool valid, int loaded_block);
+
+    template<int S, int E, typename T>
+    static __forceinline__ __device__ auto register_load_page64(
+        const typename T::Params &, int tidx, int token_idx, bool valid,
+        int loaded_block, const typename T::InputT *page_base);
+
+    template<int S, int E, typename T, bool FRONT_DRAIN, typename RawK>
+    static __forceinline__ __device__ void load_page64(
+        const typename T::Params &, RawK &, int tidx, int token_idx,
+        bool valid, int loaded_block, const typename T::InputT *page_base);
+
+    template<int S, int E, typename T>
+    static __forceinline__ __device__ auto register_load(
+        const typename T::Params &, int tidx, int token_idx, bool valid, int block_idx);
+
+    template<int S, int E, typename T, bool FRONT_DRAIN, typename RawK, typename Packet>
+    static __forceinline__ __device__ void register_finish(
+        const typename T::Params &, RawK &, int tidx, int token_idx,
+        bool valid, const Packet &packet);
+
+    template<int S, int E, typename T, bool FRONT_DRAIN, typename RawK>
+    static __forceinline__ __device__ void load(
+        const typename T::Params &, RawK &, int tidx, int token_idx,
+        bool valid, int block_idx, bool async_preissued=false);
+
+    template<int S, int E, typename T>
+    static __forceinline__ __device__ void async_issue(
+        const typename T::Params &, int tidx, int token_idx, bool valid, int block_idx);
+};
+
+// Fixed BF16/D512/SM89 layout from the validated paired tile. Keep the
+// AIU copy atoms, shared-memory member order, and full output tile unchanged.
+struct SparseDecodeV41BaseTraits : Traits_v2<cutlass::bfloat16_t, 512, true> {
+    // Reuse the existing WI geometry, MMA and P/O layouts. V4.1 changes the
+    // paired Q/K copy descriptors, K staging view and shared-memory ownership.
+    using PairedCopyTraits = Traits<cutlass::bfloat16_t, true>;
+    static constexpr int HEAD_DIM = 512;
+    static constexpr int Arch = 89;
+    static constexpr int Arch_value = Arch;
+    static constexpr int NUM_TILES = kHeadDim / 64;
+    static constexpr bool kUsePairedCubes = true;
+    static constexpr int kQRowsPerLoad = 8;
+    static constexpr bool kCacheLastQ = false;
+
+    using SmemCopyOpQ = typename PairedCopyTraits::SmemCopyOpQ;
+    using SmemCopyOpK = typename PairedCopyTraits::SmemCopyOpK;
+    using SmemCopyOpVt = typename PairedCopyTraits::SmemCopyOpVt;
+    using SmemCopyAtomQ = typename PairedCopyTraits::SmemCopyAtomQ;
+    using SmemCopyAtomK = typename PairedCopyTraits::SmemCopyAtomK;
+    using SmemCopyAtomVt = typename PairedCopyTraits::SmemCopyAtomVt;
+    static constexpr int bits_per_aiu_Q = PairedCopyTraits::bits_per_aiu_Q;
+    using Gmem_copy_struct_Q = typename PairedCopyTraits::Gmem_copy_struct_Q;
+    using GmemTiledCopyQ = typename PairedCopyTraits::GmemTiledCopyQ;
+
+    using SmemLayoutAtomQ = SmemLayoutAtom;
+    using SmemLayoutAtomK = SmemLayoutAtom;
+#if ACOMPUTE_VERSION == 10000
+    using SmemLayoutAtomKSim = decltype(tile_to_shape(
+        composition(Swizzle<1, 3, 3>{}, Layout<Shape<_8, _16>, Stride<_16, _1>>{}),
+        Shape<Int<kBlockN>, Int<kBlockKSmem>>{}));
+#else
+    using SmemLayoutAtomKSim = decltype(composition(
+        Swizzle<kSwizzle, 3, 3>{},
+        Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
+#endif
+    using SmemLayoutKSim = decltype(tile_to_shape(
+        SmemLayoutAtomKSim{},
+        Shape<Int<kBlockN>, Int<kHeadDim>, Int<NUM_K_BUFS>>{}));
+    using SmemLayoutV_ = decltype(tile_to_shape(
+        SmemLayoutAtomK{}, Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
+    using SmemLayoutV = decltype(composition(
+        SmemLayoutV_{},
+        make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
+
+    struct SharedMemoryPlanBase {
+        cute::array_aligned<InputT, cosize_v<SmemLayoutQ>> smem_sQ;
+        cute::array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK;
+        cute::array_aligned<float, kBlockM> smem_sM;
+        cute::array_aligned<float, 2*kBlockM> sL_reduction_wksp;
+        cute::array_aligned<float, kBlockM> smem_sScale0;
+        cute::array_aligned<float, kBlockM> smem_sScale1;
+        // Keep barrier offsets ahead of validity storage: every iteration
+        // accesses these members on the critical load/compute path.
+        __mbarrier_t barrier_Q;
+        __mbarrier_t barriers_K0[kHeadDim/256];
+        __mbarrier_t barriers_K1[kHeadDim/256];
+        // Per-token validity flags for the invalid-token mask in softmax; the
+        // topk_length right border is folded into each flag at the write points
+        // (absolute topk position < seqlen_k), so the flag is the single masking
+        // criterion and no separate border mask exists.
+        // 4 buffer slots: WG0 owns slots 0/1, WG1 owns slots 2/3.
+        cute::array_aligned<int, 4*kBlockN> smem_valid_indices;
+    };
+
+    struct SharedMemoryPlanPaired : SharedMemoryPlanBase {
+        // Paired D512 keeps all Q tiles in shared memory; P must not overwrite Q7.
+        cute::array_aligned<InputT, 2 * kBlockM * kBlockN> smem_sP;
+    };
+    using SharedMemoryPlan = std::conditional_t<kUsePairedCubes && HEAD_DIM == 512,
+        SharedMemoryPlanPaired, SharedMemoryPlanBase>;
+
+    using SharedMemoryOutPut = typename PairedCopyTraits::SharedMemoryOutPut;
+
+    static constexpr size_t kSmemBudgetBytes = 256 * 1024;  // 262144
+    static_assert(sizeof(SharedMemoryPlan) <= kSmemBudgetBytes,
+                  "SharedMemoryPlan exceeds the 256 KiB PPU SMEM budget");
+    static_assert(sizeof(SharedMemoryOutPut) <= kSmemBudgetBytes,
+                  "SharedMemoryOutPut exceeds the 256 KiB PPU SMEM budget");
+
+};
+
+struct SparseDecodeV41Traits : SparseDecodeV41BaseTraits {
+    // Select the V4.1 paired pipeline without enabling the legacy QK/PV variants.
+    static constexpr bool kV41PairedPipeline = true;
+    static constexpr int kAtomLayoutM = 8;
+    static constexpr int kMmaThreads = 256;
+    static constexpr bool kIsCrossCut = false;
+    static constexpr bool kUsePv4x2 = false;
+    static constexpr int kPvAtomLayoutM = 8;
+    using TiledMmaPV = TiledMma;
+    using SmemCopyAtomPV = SmemCopyAtomP;
+    static constexpr bool kHasExtraRopeTile = false;
+    static constexpr int HEAD_DIM = 512;
+    static constexpr int Arch = 89;
+    static constexpr bool kCacheOffset32 = false;
+    static constexpr bool kDecodeNativeFP4Steady = false;
+    static constexpr bool kDecodeFixedExtraFP8Steady = false;
+    static constexpr bool kDecodeFixedExtraIndex = false;
+    static constexpr bool kDecodeFP8ScopeRow32 = false;
+    static constexpr bool kDecodeFP8WG1EarlyPacket = false;
+    static constexpr bool kDecodeFP4WG1RemotePVBeforeFinish = false;
+    static constexpr bool kDecodeFP4WG1FirstFinishAfterScale1 = false;
+    static constexpr bool kDecodeFP4WG0Scale0SchedBound = false;
+    static constexpr bool kDecodeFP8WG1SupplyAfterScale1 = false;
+    static constexpr bool kDecodeFP8WG0FinishAfterP0 = false;
+    static constexpr bool kQuantCache = true;
+    static constexpr bool kAllValidNoLengths = false;
+    static constexpr bool kFP4Cache = false;
+};
+
+} // namespace flashmla::dsa::v41
