@@ -8,8 +8,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-// Forward-declare hggcStream_t so function signatures match between .cu and .cpp
-typedef struct HGstream_st* hggcStream_t;
 #include <cutlass/fast_math.h>
 #include <cutlass/numeric_types.h>
 #include <algorithm>

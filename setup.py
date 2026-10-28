@@ -87,6 +87,7 @@ ext_modules.append(
     CUDAExtension(
         name="flash_mla_cuda",
         sources=get_sources(),
+        libraries=['hggc'],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
             "nvcc": append_hgcc_threads(
@@ -99,6 +100,7 @@ ext_modules.append(
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
                     "--use_fast_math",
+                    "--resource-usage",
                     "-mllvm",
                     "-ppu-max-vreg-count=256",
                     "-mllvm",
