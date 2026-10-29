@@ -1440,6 +1440,9 @@ __forceinline__ __device__ void wg1_subroutine(
     Tensor sV0R = get_half_V<T, 1>(cur_sK0);
     Tensor sV1R = get_half_V<T, 1>(cur_sK1);
 
+    // Wait for rP1 and warpgroup 0, run bunch 1, notify warpgroup 0
+    NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
+
     // Wait for rO1 += rP1b @ sV1R, launch TMA for the next V1R
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST)
     {
@@ -1453,8 +1456,6 @@ __forceinline__ __device__ void wg1_subroutine(
             launch_kv_tiles_copy<4, 9>(tiled_copy, tKgK, tKsK1, params, &barriers_K1[1], wg_idx);
         }
     }
-    // Wait for rP1 and warpgroup 0, run bunch 1, notify warpgroup 0
-    NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
 
 #if ACOMPUTE_VERSION == 10000
     Tensor rP1b = wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(sScale1, rO1, sM, rL, rRightBorderForQSeq, sScale0, rP1, params.scale_softmax_log2, start_token_idx+T::kBlockN, idx_in_warpgroup);
