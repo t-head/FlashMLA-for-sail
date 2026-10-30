@@ -7,6 +7,7 @@
 #ifdef FLASHMLA_C_ENABLE_DECODE_SPARSE
 
 #include "common.h"
+#include "sparse_quantized.h"
 #include "params.h"
 #include "kerutils/common/static_switch.h"
 #include "decode/sparse/sparse_decode_wg.h"
@@ -33,6 +34,16 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &out_,                // batch_size x seqlen_q_ori x num_heads_ori x head_size_v
     const bool enable_batch_invariant
 ) {
+    // Packed caches include scale/RoPE storage beyond D. Only the flat,
+    // dimension-matched encoding dispatches to the quantized compute backend.
+    if (kv.scalar_type() == torch::kFloat8_e4m3fn && q.dim() == 4 && kv.dim() == 4 &&
+        kv.size(3) == q.size(3)) {
+        auto result = flashmla::quantized_attention::paged_attention(q, kv, head_size_v,
+            indices, softmax_scale, attn_sink, topk_length, extra_kv, extra_indices,
+            extra_topk_length, out_, enable_batch_invariant);
+        return {result[0], result[1], tile_scheduler_metadata, num_splits};
+    }
+
     bool is_fp8 = (kv.dtype() == torch::kFloat8_e4m3fn ||
                    kv.dtype() == torch::kInt8 ||
                    kv.dtype() == torch::kUInt8);

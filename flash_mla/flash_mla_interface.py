@@ -4,6 +4,7 @@ import dataclasses
 import torch
 
 import flash_mla_cuda
+from flash_mla_cuda import QuantizedAttentionConfig
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
@@ -100,6 +101,9 @@ def flash_mla_with_kvcache(
     """
     Arguments:
         q: (batch_size, seq_len_q, num_heads_q, head_dim).
+            Native FP8 uses seq_len_q for request-level KV reuse. Flattened
+            (batch_size * seq_len_q, 1, num_heads_q, head_dim) inputs are supported
+            as independent queries.
         k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
                 Different modes (including fp8/bf16, sparsity, and model version (i.e. V3.2 or MODEL1)) has different KV cache layouts. See comments below for details.
                 The KV cache must be contiguously valid for sparse attention on sm100. Here "contiguously valid" means that every byte, from the very beginning of the KV cache, till the last byte in the KV cache, is valid memory address to visit (i.e. won't IMA). In other words, the KV cache could be a slice of a larger array, but cannot be a list of disjoint memory blocks.
@@ -120,8 +124,13 @@ def flash_mla_with_kvcache(
         attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. This is used to support MODEL1. Their format requirements match the primary inputs, except V4.1 FP8 primary KV may pair with V4.1 FP4 extra KV.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
-        out: Optional pre-allocated output tensor with shape (batch_size, seq_len_q, num_heads_q, head_dim_v), same dtype as q, and contiguous. If provided, the result will be written into this buffer to avoid allocation. For dense attention, only num_heads_k == 1 (MLA) is supported.
+        out: Optional contiguous output with shape
+            (batch_size, seq_len_q, num_heads_q, head_dim_v). Native FP8 requires
+            BF16 output with a 16-byte-aligned base address; other paths use q's
+            dtype. If provided, results are written into this buffer to avoid
+            allocation. Dense attention supports only num_heads_k == 1 (MLA).
         enable_batch_invariant: Disable sparse split-KV so results do not depend on batch partitioning.
+            Not supported for native FP8 attention.
 
     For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
         head_dim should be 576 while head_dim_v should be 512.
@@ -277,3 +286,142 @@ def flash_mla_sparse_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length, out
     )
     return results
+
+
+def flash_mla_sparse_quantized_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    quantization: Optional[QuantizedAttentionConfig] = None,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    compute_aux: bool = True,
+    trusted_full_topk: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sparse quantized attention prefill with backend selection in C++.
+
+    The current E4M3 backend uses native Q8/KV8/P8 matrix operations with FP32
+    accumulation. ``quantization`` describes storage, compute format and scales;
+    unsupported configurations are rejected in C++.
+
+    Args:
+        q: [s_q, h_q, d_qk], bfloat16, float8_e4m3fn, or uint8 E4M3 bytes.
+            h_q is a positive multiple of 8;
+            d_qk must be 512 or 576. BF16 Q is converted to e4m3 while loading
+            the kernel's shared-memory Q tile, avoiding a materialized FP8 tensor.
+            BF16 Q may have strided token/head axes with dense, 16-byte-aligned rows.
+            FP8 Q must be contiguous. Head tile selection is internal.
+        kv: [s_kv, 1, d_qk], bfloat16, float8_e4m3fn, or uint8 E4M3 bytes.
+            BF16 KV is converted once
+            to a temporary E4M3 tensor using saturating round-to-nearest conversion,
+            without changing the persistent cache. BF16 rows may be strided with
+            dense, 4-byte-aligned channels. FP8 KV must be contiguous with a
+            16-byte-aligned base address.
+        indices: [s_q, h_kv, topk], int32. topk must be a positive multiple of 64 and
+            <= 2176. Invalid indices (< 0 or >= s_kv) are masked exactly, so the tensor
+            may be padded with -1; there is no need to append zero KV rows.
+        sm_scale: float, the softmax scale.
+        quantization: optional QuantizedAttentionConfig. Storage, compute format,
+            probability format and Q/KV scales are specified separately. The current
+            backend supports E4M3 computation with scalar q_scale/kv_scale fields
+            (default 1.0). Tensor scales and q_scale_block_shape/kv_scale_block_shape
+            reserve space for future backends; unsupported formats or scale layouts
+            raise an error before launch.
+        d_v: The dimension of value vectors. Can only be 512.
+        attn_sink: optional [h_q] float32 attention sink in natural-log space.
+        topk_length: optional [s_q] int32 valid prefix length for each indices row.
+            Entries after this length are masked even if their index value is valid.
+            For BF16 KV, omitted lengths are derived from the last valid column,
+            retaining valid entries after holes or an unpooled sparse tail.
+        out: optional preallocated contiguous [s_q, h_q, 512] bfloat16 output,
+            with a 16-byte-aligned base address.
+        compute_aux: whether to materialize max_logits and lse. Set False when the
+            caller only consumes output; returned aux tensors then have shape [0].
+        trusted_full_topk: certifies that every index before ``topk_length`` is in
+            ``[0, s_kv)`` and every later slot is padding. This removes validity
+            scans and masks from complete active tiles; only the final partial tile
+            is slot-masked. The default is False and preserves support for arbitrary
+            invalid indices anywhere in the active prefix, including length-full
+            rows.
+
+    Returns:
+        (output, max_logits, lse)
+        - output: [s_q, h_q, d_v], bfloat16.
+        - max_logits: [s_q, h_q], float. The ceil-quantised running max used internally,
+            i.e. an upper bound on the true max rather than the max itself.
+            Shape [0] when compute_aux=False.
+        - lse: [s_q, h_q], float, base-2 log-sum-exp of quantized QK scores,
+            computed in FP32 before attention-sink scaling. Shape [0] when compute_aux=False.
+    """
+    return flash_mla_cuda.sparse_quantized_fwd(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        quantization,
+        d_v,
+        attn_sink,
+        topk_length,
+        out,
+        compute_aux,
+        trusted_full_topk,
+    )
+
+
+def flash_mla_sparse_quantized_decode_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    quantization: Optional[QuantizedAttentionConfig] = None,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sparse quantized attention decode with backend selection in C++.
+
+    Same math as ``flash_mla_sparse_quantized_fwd``. FlashMLA selects head tiles,
+    aligned key splits and pipeline stages from the input shape and device.
+    Unsplit queries write final output directly; split queries merge their
+    partial outputs internally. Q, K, P and V use native E4M3 tensor operations.
+
+    Args:
+        quantization: optional QuantizedAttentionConfig, as in prefill.
+        q: [n_tok, h_q, d_qk] BF16, float8_e4m3fn or uint8 E4M3 bytes.
+            h_q is a positive multiple of 8; d_qk is 512 or 576.
+            For decode n_tok is the batch size and the
+            h_q rows are the q heads, which share one topk list.
+        kv: [s_kv, 1, d_qk] float8_e4m3fn or uint8 E4M3 bytes,
+            with a 16-byte-aligned base address.
+            A paged cache flattens to this, and decode
+            indices are already absolute slot ids.
+        indices: [n_tok, 1, topk] int32; topk a positive multiple of 64 and <= 2048.
+            Invalid entries may be -1, but they are *not* cheaper than valid ones, so
+            padding is not a way to vary per-token work.
+        attn_sink: optional [h_q] float32, natural-log space, excluded from LSE.
+        topk_length: optional [n_tok] int32 valid prefix bounds.
+        out: optional contiguous [n_tok,h_q,512] BF16 output with a
+            16-byte-aligned base address.
+            BF16 Q is quantized once in shared memory, with no global Q8 buffer.
+
+    Returns:
+        (output, lse):
+        - output: [n_tok, h_q, d_v] bfloat16.
+        - lse: [n_tok, h_q] float32, 2-based, and -inf when a row has no valid index.
+    """
+    return flash_mla_cuda.sparse_quantized_decode_fwd(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        quantization,
+        d_v,
+        attn_sink,
+        topk_length,
+        out,
+    )
