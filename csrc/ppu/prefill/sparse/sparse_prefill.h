@@ -36,8 +36,19 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
     // retain the standard prefill kernel for short sparse rows.
     const bool use_hs64 = params.h_q % 128 == 64 && params.h_kv == 1 &&
         params.topk >= 512;
-    const bool warp_interleave = ((params.s_q % 128 == 0) || (params.s_q > 256)) &&
-        params.h_q == 128 && params.s_kv >= params.topk;
+    // Query device properties only for the eligible short-query WI domain.
+    bool short_query_wi = std::is_same_v<T, cutlass::bfloat16_t> &&
+        params.d_qk == 512 && params.d_v == 512 &&
+        params.h_q == 128 && params.h_kv == 1 &&
+        (params.topk == 1152 || params.topk == 8320) && params.topk_length != nullptr &&
+        params.s_q < 256 && params.s_kv >= params.topk;
+    if (short_query_wi) {
+        const auto *props = at::cuda::getCurrentDeviceProperties();
+        short_query_wi = props->major == 8 && props->minor == 9 &&
+            params.s_q >= 6 * props->multiProcessorCount;
+    }
+    const bool warp_interleave = (((params.s_q % 128 == 0) || (params.s_q > 256)) &&
+        params.h_q == 128 && params.s_kv >= params.topk) || short_query_wi;
 
     if constexpr (std::is_same_v<T, cutlass::bfloat16_t>) {
         if (use_hs64) {
