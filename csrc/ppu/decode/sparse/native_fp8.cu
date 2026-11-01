@@ -123,7 +123,8 @@ void run_native_fp8_attention_decode(const flashmla::sparse_native_fp8::Attentio
         int64_t(params.queries) * (params.heads / 64) > params.compute_units;
     const bool compact_fallback =
         (params.width <= 128 &&
-         (params.heads <= 16 || (params.heads == 64 && params.queries >= 64))) ||
+         (params.heads == 8 || params.heads == 16 ||
+          (params.heads == 64 && params.queries >= 64))) ||
         (params.width >= 512 &&
          ((params.queries >= 96 &&
            (params.heads == 16 || (params.heads == 8 && params.width == 2048))) ||
@@ -232,7 +233,11 @@ void run_native_fp8_attention_verify(const flashmla::sparse_native_fp8::Attentio
         return;
     }
 
-    native_verify_union_kernel<<<params.batch, 256, 0, params.stream>>>(
+    // Wider classifiers help small partial-head request grids. Large grids
+    // already expose enough independent requests and retain the smaller CTA.
+    const bool wide_classifier = params.dim == 576 && params.heads != 8 &&
+        params.heads != 16 && params.batch < 4 * params.compute_units;
+    native_verify_union_kernel<<<params.batch, wide_classifier ? 512 : 256, 0, params.stream>>>(
         params.idx, params.lengths, params.united, params.masks, params.errors, params.qpr,
         params.width, params.kvrows);
     run_native_fp8_verify_ws(params);

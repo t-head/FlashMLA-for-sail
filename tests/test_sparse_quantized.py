@@ -28,6 +28,95 @@ def quantized_attention(kind, q, kv, indices, *, sm_scale=None, **kwargs):
     return call(q, kv, indices, scale, **kwargs)
 
 
+@pytest.mark.parametrize(
+    "heads,batch,width",
+    [(16, b, w) for b in (3, 8, 17, 32) for w in (512, 640, 704, 768)]
+    + [(64, b, w) for b in (1, 3, 8, 17, 32) for w in (128, 192, 640, 704)],
+)
+def test_short_decode_partitions(heads, batch, width):
+    """Split tails, empty partitions and graph updates preserve both API contracts."""
+    torch.manual_seed(934 + batch + width)
+    q = torch.randn(batch, heads, 512, device="cuda").to(torch.float8_e4m3fn)
+    kv = torch.randn(2112, 1, 512, device="cuda").to(torch.float8_e4m3fn)
+    ids = torch.randint(len(kv), (batch, 1, width), device="cuda", dtype=torch.int32)
+    ids[:, :, 13::29] = -1
+    ids[:, :, 19::31] = torch.iinfo(torch.int32).max
+    lengths = torch.tensor(([0, 65, width, width - 1] * batch)[:batch],
+                           device="cuda", dtype=torch.int32)
+    # With one request, the first and last row coincide. Exercise a live list
+    # before the graph update below turns that same row into an empty list.
+    if batch == 1:
+        lengths.fill_(width)
+    sink = torch.randn(heads, device="cuda")
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    config = flash_mla.QuantizedAttentionConfig(q_scale=0.25, kv_scale=2.0)
+
+    def flat():
+        return quantized_attention("decode", q, kv, ids, quantization=config,
+                                   attn_sink=sink, topk_length=lengths, out=out)
+
+    check(flat(), reference(q, kv, ids, 0.25, 2.0, lengths, sink))
+    graph, result = capture(flat)
+    ids[:, :, -65:] = 7
+    lengths[0] = width
+    lengths[-1] = 0
+    graph.replay()
+    check(result, reference(q, kv, ids, 0.25, 2.0, lengths, sink))
+
+    meta = flash_mla.get_mla_metadata()[0]
+
+    def paged():
+        return flash_mla.flash_mla_with_kvcache(
+            q=q.unsqueeze(1), k_cache=kv.reshape(-1, 64, 1, 512),
+            block_table=None, cache_seqlens=None, head_dim_v=512,
+            tile_scheduler_metadata=meta, indices=ids, is_fp8_kvcache=True,
+            attn_sink=sink, topk_length=lengths, out=out.unsqueeze(1),
+        )
+
+    check(paged(), reference(q, kv, ids, lengths=lengths, sink=sink), natural_lse=True)
+    graph, result = capture(paged)
+    q.copy_(-torch.ones_like(q.float()))
+    kv.copy_(torch.ones_like(kv.float()))
+    ids.fill_(-1)
+    ids[1:, 0, 0] = 7
+    lengths.fill_(width)
+    graph.replay()
+    check(result, reference(q, kv, ids, lengths=lengths, sink=sink), natural_lse=True)
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_short_h16_decode_scattered_pool(paged):
+    """Wide gathers preserve masks and output/LSE contracts for large KV pools."""
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    batch, dim, width = 2 * properties.multi_processor_count, 512, 640
+    rows = ((batch + 1) * properties.L2_cache_size // dim + 63) // 64 * 64
+    torch.manual_seed(814)
+    q = torch.randn(batch, 16, dim, device="cuda").to(torch.float8_e4m3fn)
+    kv = torch.empty(rows, 1, dim, device="cuda", dtype=q.dtype)
+    # Finite E4M3 values without a second full-size floating-point allocation.
+    kv.view(torch.uint8).random_(40, 72)
+    ids = torch.randint(rows, (batch, 1, width), device="cuda", dtype=torch.int32)
+    ids[:, :, 17::37] = -1
+    lengths = torch.full((batch,), width - 1, device="cuda", dtype=torch.int32)
+    lengths[::3] = 0
+    sink = torch.randn(16, device="cuda")
+    if paged:
+        result = flash_mla.flash_mla_with_kvcache(
+            q=q.unsqueeze(1), k_cache=kv.reshape(-1, 64, 1, dim),
+            block_table=None, cache_seqlens=None, head_dim_v=dim,
+            tile_scheduler_metadata=flash_mla.get_mla_metadata()[0], indices=ids,
+            is_fp8_kvcache=True, attn_sink=sink, topk_length=lengths,
+        )
+        expected = reference(q, kv, ids, lengths=lengths, sink=sink)
+    else:
+        result = quantized_attention(
+            "decode", q, kv, ids, attn_sink=sink, topk_length=lengths,
+            quantization=flash_mla.QuantizedAttentionConfig(q_scale=0.25, kv_scale=2.0),
+        )
+        expected = reference(q, kv, ids, 0.25, 2.0, lengths, sink)
+    check(result, expected, natural_lse=paged)
+
+
 def inputs(heads=64, dim=576, bf16=False):
     torch.manual_seed(771)
     dtype = torch.bfloat16 if bf16 else torch.float8_e4m3fn
@@ -101,6 +190,57 @@ def capture(call):
     return graph, result
 
 
+@pytest.mark.parametrize("heads", [1, 6, 12, 24, 31, 33, 48, 63, 65, 96])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("kind", ["prefill", "decode", "paged"])
+@pytest.mark.parametrize("bf16_query", [False, True])
+def test_partial_head_tiles(heads, dim, kind, bf16_query):
+    """Real head counts preserve masks, output bounds and graph replay."""
+    torch.manual_seed(481 + heads)
+    q = (torch.randn(5, heads, dim, device="cuda") * 0.3).to(
+        torch.bfloat16 if bf16_query else torch.float8_e4m3fn
+    )
+    if bf16_query and kind == "prefill":
+        # The reused WS loader must also honor the prefill API's strided Q.
+        q = q.transpose(0, 1).contiguous().transpose(0, 1)
+    kv = (torch.randn(2176, 1, dim, device="cuda") * 0.3).to(torch.float8_e4m3fn)
+    sink = torch.randn(heads, device="cuda")
+    # Guard both ends of the caller-owned output against an unmasked head tail.
+    storage = torch.full((5 * heads * 512 + 128,), 8.5, device="cuda", dtype=torch.bfloat16)
+    output = storage[64:-64].view(5, heads, 512)
+    # The decode bitmap shares storage above index 2047. Prefill's wider
+    # 2176-key contract must retain a path with a separate index region.
+    for width in ([128, 640, 2048, 2176] if kind == "prefill" else [128, 2048]):
+        ids = torch.randint(len(kv), (5, 1, width), device="cuda", dtype=torch.int32)
+        ids[:, :, 13::29] = -1
+        ids[:, :, 19::31] = torch.iinfo(torch.int32).max
+        lengths = torch.tensor([0, 1, 65, width, width - 1], device="cuda", dtype=torch.int32)
+
+        def call():
+            if kind == "paged":
+                return flash_mla.flash_mla_with_kvcache(
+                    q=q[:, None], k_cache=kv.view(-1, 64, 1, dim),
+                    block_table=None, cache_seqlens=None, head_dim_v=512,
+                    tile_scheduler_metadata=flash_mla.get_mla_metadata()[0],
+                    indices=ids, is_fp8_kvcache=True, attn_sink=sink,
+                    topk_length=lengths, out=output[:, None],
+                    softmax_scale=dim**-0.5,
+                )
+            return quantized_attention(kind, q, kv, ids, attn_sink=sink,
+                                       topk_length=lengths, out=output)
+
+        expected = reference(q, kv, ids, lengths=lengths, sink=sink)
+        check(call(), expected, natural_lse=kind == "paged")
+        graph, result = capture(call)
+        lengths[0] = width
+        lengths[-1] = 0
+        ids[:, :, -65:] = 7
+        graph.replay()
+        check(result, reference(q, kv, ids, lengths=lengths, sink=sink),
+              natural_lse=kind == "paged")
+        assert (storage[:64] == 8.5).all() and (storage[-64:] == 8.5).all()
+
+
 @pytest.mark.parametrize("heads", [16, 64])
 @pytest.mark.parametrize("dim", [512, 576])
 def test_decode_masks_scales_graph(heads, dim):
@@ -160,6 +300,59 @@ def test_prefill_lengths_sink_preallocated(heads, dim, bf16):
         out=out,
     )
     assert result[0].data_ptr() == out.data_ptr()
+    check(result, reference(q, kv, ids, 0.25, 2.0, lengths, sink))
+
+
+@pytest.mark.parametrize(
+    "queries,width", [(3, 64), (17, 128), (64, 640), (257, 640), (257, 2048)]
+)
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("heads", [16, 64])
+def test_prefill_bf16_q_staging(queries, width, strided, heads):
+    """Direct Q staging and the strided fallback retain masks and graph updates."""
+    torch.manual_seed(9800 + queries + width)
+    q = torch.randn(queries, heads, 512, device="cuda", dtype=torch.bfloat16)
+    if strided:
+        q = q.transpose(0, 1).contiguous().transpose(0, 1)
+    kv = torch.randn(777, 1, 512, device="cuda").to(torch.float8_e4m3fn)
+    ids = torch.randint(len(kv), (queries, 1, width), device="cuda", dtype=torch.int32)
+    ids[:, :, 3::31] = -1
+    ids[:, :, 9::47] = torch.iinfo(torch.int32).max
+    lengths = torch.full((queries,), width - 3, device="cuda", dtype=torch.int32)
+    lengths[0], lengths[1] = 0, 1
+    sink = torch.randn(heads, device="cuda")
+    sink[0], sink[-1] = -math.inf, math.inf
+    out = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)
+    config = flash_mla.QuantizedAttentionConfig(q_scale=0.25, kv_scale=2.0)
+
+    def call(value=q, compute_aux=True):
+        return quantized_attention(
+            "prefill", value, kv, ids, quantization=config, attn_sink=sink,
+            topk_length=lengths, out=out, compute_aux=compute_aux,
+        )
+
+    result = call()
+    assert result[0].data_ptr() == out.data_ptr()
+    check(result, reference(q, kv, ids, 0.25, 2.0, lengths, sink))
+    expected = result[0].clone()
+    noaux = call(compute_aux=False)
+    assert noaux[1].numel() == noaux[2].numel() == 0
+    torch.testing.assert_close(noaux[0], expected, rtol=0, atol=0)
+    q8_result = call(q.to(torch.float8_e4m3fn).contiguous())
+    check(q8_result, reference(q, kv, ids, 0.25, 2.0, lengths, sink))
+    if heads == 16 or not strided:
+        # Direct staging uses the same arithmetic as explicit Q8 input.
+        # Strided H64 retains the generic kernel, with its own accumulation
+        # order; validate both kernels against the oracle above.
+        q8 = q8_result[0]
+        difference = (expected.float() - q8.float()).norm() / q8.float().norm().clamp_min(1e-12)
+        assert difference < 1e-3
+
+    graph, result = capture(call)
+    q.copy_(torch.randn_like(q))
+    ids[:, :, 1:5] = 11
+    lengths[0], lengths[-1] = width, 0
+    graph.replay()
     check(result, reference(q, kv, ids, 0.25, 2.0, lengths, sink))
 
 
@@ -1363,3 +1556,113 @@ def test_h16_prefill_unaligned_index_storage_graph(offset):
     graph.replay()
     assert torch.isfinite(result[0]).all() and (result[0] == 0).all()
     assert torch.isneginf(result[-1]).all()
+
+
+@pytest.mark.parametrize(
+    "heads,queries",
+    [(heads, queries) for heads in (1, 6, 12, 24, 48, 96) for queries in range(2, 10)]
+    + [(1, 32), (12, 32), (24, 32), (48, 32), (7, 7), (15, 16),
+       (33, 3), (47, 2), (49, 9)],
+)
+@pytest.mark.parametrize("batch_waves", [2, 4])
+def test_partial_head_verify_masks_and_fallback(heads, queries, batch_waves):
+    """Query masks may split an eight-row MMA fragment; graph input stays dynamic."""
+    torch.manual_seed(13031 + heads + queries)
+    # Cover both classifier CTA sizes and the fold/fallback routing boundary.
+    compute_units = torch.cuda.get_device_properties(
+        torch.cuda.current_device()).multi_processor_count
+    batch = batch_waves * compute_units + 1
+    dim, width, rows = 576, 2048, 4096
+    q = (torch.randn(batch, queries, heads, dim, device="cuda") * 0.3).to(torch.float8_e4m3fn)
+    kv = (torch.randn(rows // 64, 64, 1, dim, device="cuda") * 0.3).to(q.dtype)
+    ids = torch.arange(width, device="cuda", dtype=torch.int32).expand(batch, queries, width).clone()
+    lengths = torch.full((batch, queries), width, device="cuda", dtype=torch.int32)
+    lengths[:, 0] = 65
+    lengths[::3, 1] = 0
+    ids[:, :, 17::37] = -1
+    ids[:, :, 21::41] = torch.iinfo(torch.int32).max
+    for token in range(queries):
+        ids[:, token, width - queries + token + 1:] = -1
+    sink = torch.linspace(-2, 2, heads, device="cuda")
+    count = batch * queries * heads * 512
+    storage = torch.full((count + 128,), 17, device="cuda", dtype=torch.bfloat16)
+    out = storage[64:-64].view(batch, queries, heads, 512)
+    scale = 192**-0.5
+    metadata = flash_mla.get_mla_metadata()[0]
+
+    def call():
+        return flash_mla.flash_mla_with_kvcache(q, kv, None, None, 512, metadata,
+            softmax_scale=scale, indices=ids, attn_sink=sink, topk_length=lengths, out=out)
+
+    graph, result = capture(call)
+    for history in ("shared", "matching_prefix", "independent"):
+        if history == "matching_prefix":
+            # Keep the comparison query live at the late mismatch. A difference
+            # beyond its valid length would still permit a shared-index union.
+            lengths[1::2, 0] = width
+            ids[1::2, 1:, 1500] = 3001
+        elif history == "independent":
+            ids[1::2, 1:, 0] = 3002
+        graph.replay()
+        torch.cuda.synchronize()
+        assert result[0].data_ptr() == out.data_ptr()
+        assert torch.isfinite(result[0]).all()
+        assert (storage[:64] == 17).all() and (storage[-64:] == 17).all()
+        check((result[0][:2], result[1][:2]),
+              reference(q[:2].flatten(0, 1), kv, ids[:2],
+                        lengths=lengths[:2].flatten(), sink=sink, scale=scale), natural_lse=True)
+    lengths.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert (result[0] == 0).all() and torch.isposinf(result[1]).all()
+
+
+@pytest.mark.parametrize("heads", [1, 6, 12, 24, 48, 96])
+@pytest.mark.parametrize("kind", ["prefill", "decode"])
+def test_partial_head_resident_pipeline_graph(heads, kind):
+    """Resident partial-head schedules preserve tail masks across graph replays."""
+    torch.manual_seed(11371 + heads)
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    queries, dim, width = 3 * properties.multi_processor_count, 576, 2048
+    q = (torch.randn(queries, heads, dim, device="cuda") * 0.3).to(torch.float8_e4m3fn)
+    kv = (torch.randn(4096, 1, dim, device="cuda") * 0.3).to(q.dtype)
+    ids = torch.randint(len(kv), (queries, 1, width), device="cuda", dtype=torch.int32)
+    ids[:, :, 13::29] = -1
+    ids[:, :, 19::31] = torch.iinfo(torch.int32).max
+    boundaries = [0, 1, 63, 64, 65, 127, 128, width - 1, width]
+    lengths = torch.tensor((boundaries * queries)[:queries], device="cuda", dtype=torch.int32)
+    sink = torch.randn(heads, device="cuda")
+    storage = torch.full((queries * heads * 512 + 128,), 17, device="cuda", dtype=torch.bfloat16)
+    out = storage[64:-64].view(queries, heads, 512)
+    config = flash_mla.QuantizedAttentionConfig(q_scale=0.25, kv_scale=2.0)
+
+    def call():
+        return quantized_attention(kind, q, kv, ids, quantization=config,
+                                   attn_sink=sink, topk_length=lengths, out=out)
+
+    graph, result = capture(call)
+    sample = list(range(len(boundaries))) + [queries // 2, queries - 1]
+    for changed in (False, True):
+        if changed:
+            lengths[0] = width
+            lengths[-1] = 0
+            ids[:, :, -65:] = 7
+        graph.replay()
+        expected = reference(q.view(torch.uint8)[sample].view(q.dtype), kv, ids[sample],
+                             0.25, 2.0, lengths[sample], sink)
+        check((result[0][sample], result[-1][sample]), expected)
+        assert result[0].data_ptr() == out.data_ptr()
+        assert torch.isfinite(result[0]).all()
+        assert (storage[:64] == 17).all() and (storage[-64:] == 17).all()
+    # Zero-filled invalid keys must never dominate a strongly negative valid logit.
+    q.copy_(-torch.ones_like(q.float()))
+    kv.copy_(torch.ones_like(kv.float()))
+    sink.fill_(-1000)
+    ids.fill_(-1)
+    ids[1:, 0, 0] = 7
+    lengths.fill_(width)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert (result[0][0] == 0).all()
+    torch.testing.assert_close(result[0][1:], torch.full_like(result[0][1:], 2), rtol=0.04, atol=0)
+    assert (storage[:64] == 17).all() and (storage[-64:] == 17).all()

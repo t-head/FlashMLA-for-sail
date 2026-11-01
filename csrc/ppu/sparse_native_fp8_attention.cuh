@@ -67,6 +67,7 @@ struct MergeParams {
 
 void run_sparse_prefill_fp8_fwd(const flashmla::sparse_native_fp8::AttentionParams &params);
 void run_native_fp8_attention_decode(const flashmla::sparse_native_fp8::AttentionParams &params);
+bool try_sparse_fp8_short_decode(const flashmla::sparse_native_fp8::AttentionParams &params);
 void run_native_fp8_attention_extra(const flashmla::sparse_native_fp8::AttentionParams &params);
 void run_native_fp8_attention_verify(const flashmla::sparse_native_fp8::AttentionParams &params);
 void run_native_fp8_attention_window(const flashmla::sparse_native_fp8::AttentionParams &params);
@@ -136,6 +137,21 @@ __device__ __forceinline__ uint16_t pack_e4m3_pair(float2 value) {
 // changing this sequence also changes code generation in decode kernels.
 __device__ __forceinline__ uint16_t pack_e4m3_pair(__ppu_bfloat162_raw value) {
     return __hg_fp8x2_e4m3(__ppu_bfloat162(value)).__x;
+}
+
+// Convert one aligned BF16 Q vector directly into the shared E4M3 tile.
+// Use the same scalar-pair rounding as the compatibility prefill kernel.
+__device__ __forceinline__ cute::uint128_t load_bf16_as_fp8_16(const void *source) {
+    const auto *vectors = static_cast<const cute::uint128_t *>(source);
+    const cute::uint128_t low = vectors[0], high = vectors[1];
+    cute::uint128_t packed;
+    auto *pairs = reinterpret_cast<__hg_fp8x2_storage_t *>(&packed);
+    CUTE_UNROLL
+    for (int j = 0; j < 4; ++j) {
+        pairs[j] = pack_e4m3_pair(reinterpret_cast<const __ppu_bfloat162_raw *>(&low)[j]);
+        pairs[j + 4] = pack_e4m3_pair(reinterpret_cast<const __ppu_bfloat162_raw *>(&high)[j]);
+    }
+    return packed;
 }
 
 }  // namespace flashmla::sparse_native_fp8
@@ -377,7 +393,7 @@ struct Fp8SparsePrefillTraits : ScoreRows {
 
 template <int BM, int DQK, bool TRUSTED_FULL_TOPK,
     int DenseThreads = 512,
-    int Prefix = 0, bool GuardRequests = false, int LogicalHeads = BM, int BlockN = 64, bool Dual = false, int GatherLanes = 8, bool SharedRequests = false, bool GuardGatherReuse = false>
+    int Prefix = 0, bool GuardRequests = false, int LogicalHeads = BM, int BlockN = 64, bool Dual = false, int GatherLanes = 8, bool SharedRequests = false, bool GuardGatherReuse = false, bool QBF16 = false>
 __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::Threads,
     2) void flash_fwd_sparse_fp8_std_kernel(const void *__restrict__ gQRaw,
     const E4M3 *__restrict__ gKV, const int *__restrict__ gIdx, cutlass::bfloat16_t *__restrict__ gO,
@@ -440,7 +456,8 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
             return;
     }
     const long q_head_offset = ((long)q_token * h_q + head_group * BM) * DQK;
-    const E4M3 *gQ8 = reinterpret_cast<const E4M3 *>(gQRaw) + q_head_offset;
+    using Query = std::conditional_t<QBF16, cutlass::bfloat16_t, E4M3>;
+    const Query *gQ = static_cast<const Query *>(gQRaw) + q_head_offset;
     const int extra_width = Dual ? n_tiles * BN - primary_width : 0;
     gIdx += (long)q_token * (Dual ? primary_width : n_tiles * BN);
     if constexpr (Dual) extra_ids += (long)q_token * extra_width;
@@ -495,12 +512,17 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
     // Stage Q once, retain a short fragment prefix, and stream the remainder
     // through the QK loop to keep register use within two CTAs per CU.
     {
-        Tensor gQt = make_tensor(make_gmem_ptr(gQ8), Shape<Int<BM>, Int<DQK>>{}, GenRowMajor{});
+        Tensor gQt = make_tensor(make_gmem_ptr(gQ), Shape<Int<BM>, Int<DQK>>{}, GenRowMajor{});
         for (int i = tid; i < BM * (DQK / 16); i += NTHR) {
             int r = i / (DQK / 16), g = i % (DQK / 16);
-            *reinterpret_cast<cute::uint128_t *>(&sQt(r, g * 16)) =
-                r < LogicalHeads ? *reinterpret_cast<const cute::uint128_t *>(&gQt(r, g * 16))
-                                 : cute::uint128_t{};
+            cute::uint128_t packed{};
+            if (r < LogicalHeads) {
+                if constexpr (QBF16)
+                    packed = flashmla::sparse_native_fp8::load_bf16_as_fp8_16(&gQt(r, g * 16));
+                else
+                    packed = *reinterpret_cast<const cute::uint128_t *>(&gQt(r, g * 16));
+            }
+            *reinterpret_cast<cute::uint128_t *>(&sQt(r, g * 16)) = packed;
         }
 
     }
@@ -786,11 +808,11 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
 // ---------------------------------------------------------------------------
 
 template <int D, int Threads, bool Trusted, int Prefix = 0, int GatherLanes = 8,
-          bool GuardGatherReuse = false>
+          bool GuardGatherReuse = false, bool QBF16 = false>
 void launch(const flashmla::sparse_native_fp8::AttentionParams &params) {
     constexpr int Shared = 3 * 64 * D + 64 * 64 + 2176 * 4 + 11 * 64 * 4 + 256;
     auto kernel = flash_fwd_sparse_fp8_std_kernel<64, D, Trusted, Threads, Prefix, false, 64, 64,
-                                                  false, GatherLanes, false, GuardGatherReuse>;
+                                                  false, GatherLanes, false, GuardGatherReuse, QBF16>;
     hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, Shared);
     kernel<<<dim3(int64_t(params.queries) * (params.heads / 64)), Threads, Shared, params.stream>>>(
         params.q, static_cast<const E4M3 *>(params.kv), params.idx,
@@ -800,7 +822,12 @@ void launch(const flashmla::sparse_native_fp8::AttentionParams &params) {
 }
 template <int Threads, int Prefix = 0, int GatherLanes = 8, bool GuardGatherReuse = false>
 void dispatch(const flashmla::sparse_native_fp8::AttentionParams &params) {
-    if (params.dim == 512) {
+    if (params.dim == 512 && params.qbf) {
+        if (params.trusted_full_topk)
+            launch<512, Threads, true, Prefix, GatherLanes, false, true>(params);
+        else
+            launch<512, Threads, false, Prefix, GatherLanes, false, true>(params);
+    } else if (params.dim == 512) {
         if (params.trusted_full_topk)
             launch<512, Threads, true, Prefix, GatherLanes>(params);
         else
@@ -937,9 +964,8 @@ struct DecodePolicy {
 
 template <typename Policy, bool PairedV = false, bool ConsumerPrefetch = false>
 struct Pipeline {
-    static_assert(!ConsumerPrefetch ||
-                      (PairedV && Policy::FullHeadTile && !Policy::DrainReleases),
-                  "Consumer prefetch requires the paired-V prefill schedule");
+    static_assert(!ConsumerPrefetch || PairedV,
+                  "Consumer prefetch requires paired V fragments");
     static constexpr bool AsyncInputStaging = ConsumerPrefetch;
     static constexpr int IndexPadding = Policy::IndexPadding + (AsyncInputStaging ? 2 : 0);
 
@@ -952,19 +978,19 @@ struct Pipeline {
     // Consumer-only rendezvous before overwriting KV; producer_sync uses 12.
     static constexpr int ConsumerGatherReady = 13;
 
-    // The H16 prefill schedule lets PV issue the next KV gather. Keep QK,
-    // online softmax, P quantization and the final normalization shared with
-    // the existing producer-prefetch schedule.
+    // Let PV issue the next KV gather after retaining V in registers. QK,
+    // online softmax, P quantization and final normalization are shared with
+    // the producer-prefetch schedule, including partial D576 head tiles.
     template <int D, int Stages, int BM, int GatherLanes>
-    static __device__ __forceinline__ void gather_prefill_tile(
+    static __device__ __forceinline__ void gather_kv_tile(
         State s, const F8 *kv, int kvrows, int tile, int thread) {
-        static_assert(BM == 16 && D == 512 && Stages == 2 && GatherLanes > 0);
+        static_assert(BM == 16 && (D == 512 || D == 576) && Stages == 2 && GatherLanes > 0);
         constexpr int Group = (BM / 16) * 4 * 32;
         static_assert(GatherLanes % 4 == 0 && Group % GatherLanes == 0,
                       "Gather lanes must cover complete 64-byte swizzle atoms");
         constexpr int Rows = Group / GatherLanes, Repeats = N / Rows;
         constexpr int Width = GatherLanes * 16;
-        static_assert(N % Rows == 0 && D % Width == 0,
+        static_assert(N % Rows == 0 && D % 64 == 0,
                       "Gather groups must cover every tile row and column");
         auto layout = make_tensor(make_smem_ptr(s.k), LK<D>{});
         const int row = thread / GatherLanes, col = (thread % GatherLanes) * 16;
@@ -977,10 +1003,12 @@ struct Pipeline {
                                    reinterpret_cast<unsigned char *>(s.k));
             F8 *dst = s.k + (tile % Stages) * N * D + offset;
             CUTE_UNROLL
-            for (int j = 0; j < D / Width; ++j)
-                PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>::copy(
-                    *reinterpret_cast<const uint128_t *>(src + j * Width),
-                    *reinterpret_cast<uint128_t *>(dst + j * Width * N), valid);
+            for (int j = 0; j < (D + Width - 1) / Width; ++j) {
+                if (col + j * Width < D)
+                    PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>::copy(
+                        *reinterpret_cast<const uint128_t *>(src + j * Width),
+                        *reinterpret_cast<uint128_t *>(dst + j * Width * N), valid);
+            }
         }
     }
 
@@ -1012,16 +1040,18 @@ struct Pipeline {
     // the consumer releases shared slots after loading P/V into registers, so
     // the producer can advance while PV runs.
     template <int D, int Stages, int BM, bool ReuseQ, int Prefix = 0, bool Dual = false,
-        bool Fold = false, int GatherLanes = 0>
+        bool Fold = false, int GatherLanes = 0, bool SharedMasks = false>
     static __device__ __forceinline__ void produce(State s, const F8 *kv, int length, int kvrows, float scale,
         const F8 *extra = nullptr, int primary_rows = 0, const unsigned *masks = nullptr,
-        int mask_stride = 0, int logical_heads = 0, int head_offset = 0, int total_heads = 0) {
+        int mask_stride = 0, int logical_heads = 0, int head_offset = 0, int total_heads = 0,
+        int first_mask_query = 0) {
         constexpr int M = BM, G = (BM / 16) * 4 * 32, Threads = 2 * G;
         const int gt = role_lane<BM>(), lane = gt % 32, warp = COOP_UNIF(gt / 32);
         const int wm = warp % (M / 16), wn = warp / (M / 16), r0 = wm * 16 + lane / 4, r1 = r0 + 8;
-        const int mask_shift = logical_heads == 8 ? 3 : 4;
-        const int mask_row0 = (head_offset + r0) >> mask_shift,
-                  mask_row1 = (head_offset + r1) >> mask_shift;
+        // Folded rows may cross a query boundary inside an eight-row fragment
+        // (e.g. 12 heads). Each row keeps its own query mask in that case.
+        const int mask_row0 = Fold ? (head_offset + r0) / logical_heads - first_mask_query : 0,
+                  mask_row1 = Fold ? (head_offset + r1) / logical_heads - first_mask_query : 0;
         const int tiles = max(1, (length + N - 1) / N);
         MQ<BM> mq;
         auto tq = mq.get_slice(gt);
@@ -1082,7 +1112,7 @@ struct Pipeline {
             COOP_LDM(reinterpret_cast<uint32_t *>(&rq(0, 0, k)),
                 qt + (k >> 1) * M * 4 + (k & 1) * 2, 1, 32);
         if constexpr (Prefix) {
-            static_assert(BM == 32 && (Prefix == 12 || Prefix == 8),
+            static_assert(BM == 32 && (Prefix == 14 || Prefix == 12 || Prefix == 8),
                 "512-aligned compact tail fits two stage3 CTAs only for this prefix");
             auto fullq = make_tensor(make_smem_ptr(s.q), LQ<D, BM>{});
             auto tailq = make_tensor(make_smem_ptr(tail), LQ<D - Prefix * 32, BM>{});
@@ -1100,7 +1130,7 @@ struct Pipeline {
             // Both roles may overwrite Q's shared storage only after every
             // producer has retained its complete Q fragment in registers.
             __ppu_barrier_sync(QueryReleased, Threads, 15u);
-            gather_prefill_tile<D, Stages, BM, GatherLanes>(s, kv, kvrows, 0, gt);
+            gather_kv_tile<D, Stages, BM, GatherLanes>(s, kv, kvrows, 0, gt);
             cp_async_fence();
             cp_async_wait<0>();
             __ppu_barrier_sync(InitialKvReady, Threads, 15u);
@@ -1180,12 +1210,19 @@ struct Pipeline {
                 unsigned valid0, valid1;
                 if constexpr (Fold) {
                     const int word = t * 2 + (wn >> 1);
-                    valid0 = COOP_UNIF(head_offset + r0 < total_heads
-                                           ? __ldg(masks + mask_row0 * mask_stride + word)
-                                           : 0u);
-                    valid1 = COOP_UNIF(head_offset + r1 < total_heads
-                                           ? __ldg(masks + mask_row1 * mask_stride + word)
-                                           : 0u);
+                    const auto mask_at = [&](int row) {
+                        const unsigned *address = masks + row * mask_stride + word;
+                        if constexpr (SharedMasks)
+                            return *address;
+                        else
+                            return __ldg(address);
+                    };
+                    valid0 = head_offset + r0 < total_heads ? mask_at(mask_row0) : 0u;
+                    valid1 = head_offset + r1 < total_heads ? mask_at(mask_row1) : 0u;
+                    if (logical_heads % 8 == 0) {
+                        valid0 = COOP_UNIF(valid0);
+                        valid1 = COOP_UNIF(valid1);
+                    }
                 } else
                     valid0 = valid1 = unsigned(COOP_UNIF(unsigned(s.idx[2048 + t * 2 + (wn >> 1)])));
                 if (valid0 != 0xffffffffu || valid1 != 0xffffffffu) {
@@ -1281,8 +1318,9 @@ struct Pipeline {
                 }
             }
         }
-        // Preserve each schedule's release-barrier lifecycle at the end of the loop.
-        if constexpr (Policy::DrainReleases) {
+        // Consumer-prefetch publishes KV through PrefetchedKvReady instead of
+        // VReleased. Drain only barriers actually used by this schedule.
+        if constexpr (Policy::DrainReleases && !ConsumerPrefetch) {
             constexpr int Pending = (Stages == 3) ? 2 : 1;
             for (int t = max(0, tiles - Pending); t < tiles; ++t)
                 __ppu_barrier_sync(VReleased + (t & 1), Threads, 15u);
@@ -1334,7 +1372,7 @@ struct Pipeline {
             // Slot 1 is disjoint from the Q/slot 0 alias. Start its copy while
             // the producer loads Q into registers, then publish both KV slots.
             if (tiles > 1) {
-                gather_prefill_tile<D, Stages, BM, GatherLanes>(s, kv, kvrows, 1, gt);
+                gather_kv_tile<D, Stages, BM, GatherLanes>(s, kv, kvrows, 1, gt);
                 cp_async_fence();
             }
             __ppu_barrier_sync(QueryReleased, Threads, 15u);
@@ -1345,8 +1383,8 @@ struct Pipeline {
         for (int t = 0; t < tiles; t++) {
             const int slot = t & 1;
             __ppu_barrier_sync(PReady + slot, Threads, 15u);
-            // H16 prefill always rescales after the first (zero) accumulator;
-            // other schedules skip rescaling when the running maximum is unchanged.
+            // Consumer-prefetch rescales after the first (zero) accumulator;
+            // producer-prefetch retains its existing maximum-change policy.
             const bool rescale = ConsumerPrefetch ? t > 0
                 : (Policy::FullHeadTile && BM == 16) || COOP_UNIF(s.flag[slot]);
             if (rescale) {
@@ -1413,7 +1451,7 @@ struct Pipeline {
                             // consumer warps must finish their V reads before
                             // any warp overwrites the shared slot.
                             __ppu_barrier_sync(ConsumerGatherReady, G, 15u);
-                            gather_prefill_tile<D, Stages, BM, GatherLanes>(s, kv, kvrows, t + 2, gt);
+                            gather_kv_tile<D, Stages, BM, GatherLanes>(s, kv, kvrows, t + 2, gt);
                             cp_async_fence();
                         }
                     }

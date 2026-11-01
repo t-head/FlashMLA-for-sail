@@ -121,8 +121,8 @@ inline InputShape check_inputs(const at::Tensor &q, const at::Tensor &kv, const 
     quantized_attention::detail::check_inputs(q, kv, indices);
     const int n = q.size(0), h = q.size(1), d = q.size(2), rows = kv.size(0), w = indices.size(2);
     TORCH_CHECK(
-        h > 0 && h % 8 == 0 && (d == 512 || d == 576),
-        "quantized attention: heads must be a positive multiple of 8 and D must be 512 or 576");
+        h > 0 && (d == 512 || d == 576),
+        "quantized attention: heads must be positive and D must be 512 or 576");
     TORCH_CHECK(rows > 0 && kv.size(1) == 1 && kv.size(2) == d && indices.size(0) == n &&
                     indices.size(1) == 1,
                 "quantized attention: incompatible Q/KV/indices shape");
@@ -292,14 +292,35 @@ inline void execute_decode(AttentionParams params, const at::Tensor &out, const 
     using namespace sparse_native_fp8;
     if (!params.queries)
         return;
-    params.splits = choose_splits(params.queries, params.heads, params.width + params.extra_width,
-                                  params.compute_units);
+    // Measured crossover for the full-Q H16 kernels. Long lists retain the
+    // general decode policy; noncontiguous and BF16 Q retain their loader.
+    // Single-tile decode retains its established accumulation order and error bound.
+    constexpr int MaxShortH16Tiles = 12;
+    const bool short_h16 = !params.extra && params.dim == ValueDim && params.heads == 16 &&
+        !params.qbf && params.qst == params.heads * params.dim && params.qsh == params.dim &&
+        params.width > 2 * TileKeys && params.width <= MaxShortH16Tiles * TileKeys;
+    // At low grid occupancy, split short lists into independent N128 tiles
+    // and distribute the four H16 head groups across CUs. Larger H64 grids
+    // reuse the existing full-Q prefill WS pipeline without a key merge.
+    const bool short_h64 = !params.extra && params.dim == ValueDim && params.heads == 64 &&
+        !params.qbf && params.lse_queries == 0 &&
+        params.qst == params.heads * params.dim && params.qsh == params.dim &&
+        params.width <= MaxShortH16Tiles * TileKeys && params.queries <= params.compute_units;
+    params.splits = short_h64
+        ? (int64_t(params.queries) * 8 <= params.compute_units
+            ? (params.width + 2 * TileKeys - 1) / (2 * TileKeys) : 1)
+        : short_h16
+        ? choose_short_h16_splits(params.queries, params.width, params.compute_units)
+        : choose_splits(params.queries, params.heads, params.width + params.extra_width,
+                        params.compute_units);
     params.two_stage =
         prefer_two_stages(params.queries, params.splits, params.heads, params.compute_units);
     SplitWorkspace workspace(out, lse, params.splits, maxima);
     params.part = workspace.output.data_ptr();
     params.plse = workspace.lse.data_ptr<float>();
     params.partial_maxima = maxima.defined() ? workspace.maxima.data_ptr<float>() : nullptr;
+    if ((short_h16 || short_h64) && try_sparse_fp8_short_decode(params))
+        return;
     if (params.extra)
         run_native_fp8_attention_extra(params);
     else
@@ -314,7 +335,7 @@ inline void execute_verify(Request &request, int64_t queries_per_request, bool s
                     n % queries_per_request == 0,
                 "native verify: invalid queries/request");
     TORCH_CHECK(!params.qbf, "native verify: requires E4M3 Q");
-    TORCH_CHECK((d == 512 || (d == 576 && !shifted)) && (h == 8 || h == 16),
+    TORCH_CHECK((d == 512 && (h == 8 || h == 16)) || (d == 576 && !shifted),
                 "native verify: unsupported heads/dim");
     TORCH_CHECK(shifted || !params.extra, "native verify: extra pool requires window union");
     params.qpr = queries_per_request;
@@ -413,6 +434,26 @@ namespace flashmla::quantized_attention {
 inline bool use_verify_union(int batch, int queries, int heads, int width, int compute_units,
                              int64_t cache_bytes, int dim, int64_t kv_rows) {
     using namespace flashmla::sparse_native_fp8;
+    if (dim == 576 && heads != 8 && heads != 16) {
+        constexpr int FoldedTile = 32;
+        if (queries < 2 || queries > MaxVerifyQueries || width != MaxTopk ||
+            heads >= 2 * FoldedTile || heads % FoldedTile == 0)
+            return false;
+        const int folded_heads = queries * heads;
+        const int folded_rows = ((folded_heads + FoldedTile - 1) / FoldedTile) * FoldedTile;
+        if (heads <= 16) {
+            // Folding must not add padded MMA rows. Two resident waves amortize
+            // classification when independent TopK lists need the fallback.
+            const int waves = queries == 2 ? 4 : 2;
+            return batch >= waves * compute_units && folded_rows <= queries * 16;
+        }
+        // Wider partial head groups need at least 20% fewer CTAs to pay for
+        // classification and per-query masks across both history patterns.
+        // Count every ordinary head tile, including a half-filled second tile.
+        const int ordinary_rows = ((heads + FoldedTile - 1) / FoldedTile) * FoldedTile;
+        const int waves = heads > FoldedTile ? 2 : 4;
+        return batch >= waves * compute_units && 5 * folded_rows <= 4 * queries * ordinary_rows;
+    }
     if (!(queries >= 2 && queries <= MaxVerifyQueries && width == MaxTopk &&
           (heads == 8 || heads == 16) && batch >= compute_units))
         return false;

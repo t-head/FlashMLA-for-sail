@@ -35,6 +35,19 @@ inline int choose_splits(int queries, int heads, int width, int compute_units) {
     return splits;
 }
 
+// Full-Q H16 pipelines amortize short sparse lists without the older decode
+// schedule's partial-Q loads. Small grids still need independent key partitions:
+// use one N128 tile at very low occupancy, then four N64 pipeline partitions.
+inline int choose_short_h16_splits(int queries, int width, int compute_units) {
+    constexpr int MinSplitTiles = 8;
+    constexpr int PipelineSplits = 4;
+    if (width < MinSplitTiles * TileKeys || int64_t(queries) * 2 > compute_units)
+        return 1;
+    if (int64_t(queries) * 8 <= compute_units)
+        return (width + 2 * TileKeys - 1) / (2 * TileKeys);
+    return PipelineSplits;
+}
+
 // Small head tiles fit three double-buffered or two triple-buffered CTAs per
 // M890P CU. Compare complete waves using their measured relative tile costs.
 inline bool prefer_two_stages(int queries, int splits, int heads, int compute_units) {

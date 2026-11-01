@@ -1,7 +1,7 @@
 // Standard CTA sparse attention selection, shared with the decode dispatcher.
 #include "ppu/sparse_native_fp8_attention.cuh"
 
-// H16/D512 prefill whose complete sparse list fits one 128-key tile.
+// H16/D512 attention whose list or decode partition fits one 128-key tile.
 namespace flashmla_fp8_prefill_single_tile {
 using namespace cute;
 using namespace flashmla::sparse_native_fp8::ws;
@@ -12,10 +12,14 @@ static_assert(Heads * Dim == Keys * 64, "Q staging must fit the final 64-column 
 static_assert(2 * Warps * Heads * sizeof(float) + Heads * Keys <= SharedBytes);
 static_assert(Heads * Dim * sizeof(cutlass::bfloat16_t) <= SharedBytes);
 
+template <bool Split = false, bool QBF16 = false, int TotalHeads = Heads>
 __global__ __launch_bounds__(Threads, 1) void single_tile_kernel(
-    const F8 *__restrict__ q, const F8 *__restrict__ kv, const int *__restrict__ indices,
+    const void *__restrict__ q_data, const F8 *__restrict__ kv, const int *__restrict__ indices,
     cutlass::bfloat16_t *__restrict__ out, float *maxima, float *lse, const int *lengths,
-    const float *sink, int width, int kvrows, float scale, float output_scale) {
+    const float *sink, int width, int kvrows, float scale, float output_scale,
+    int splits) {
+    using Query = std::conditional_t<QBF16, cutlass::bfloat16_t, F8>;
+    const Query *q = static_cast<const Query *>(q_data);
     using KVLayout = decltype(tile_to_shape(Atom{}, Shape<Int<Keys>, Int<Dim>>{}));
     using PLayout = decltype(tile_to_shape(Atom{}, Shape<Int<Heads>, Int<Keys>>{}));
     using QK = TiledMMA<MMA_Atom<PPU0015_16x16x32_F32E4M3E4M3F32_TN>,
@@ -24,11 +28,16 @@ __global__ __launch_bounds__(Threads, 1) void single_tile_kernel(
         Layout<Shape<_1, Int<Warps>, _1>>,
         Tile<Int<Heads>, Layout<Shape<_16, Int<Warps>, _2>, Stride<_1, _32, _16>>, _32>>;
     const int tid = threadIdx.x, lane = tid % 32, warp = COOP_UNIF(tid / 32);
-    const int row0 = lane / 4, row1 = row0 + 8, query = blockIdx.x;
-    q += int64_t(query) * Heads * Dim;
-    indices += int64_t(query) * width;
-    out += int64_t(query) * Heads * Dim;
-    const int length = COOP_UNIF(lengths ? max(0, min(width, lengths[query])) : width);
+    const int row0 = lane / 4, row1 = row0 + 8, output_query = blockIdx.x;
+    const int query = Split ? output_query / splits : output_query;
+    const int part = Split ? output_query % splits : 0;
+    const int head = TotalHeads == Heads ? 0 : int(blockIdx.y) * Heads;
+    q += (int64_t(query) * TotalHeads + head) * Dim;
+    if (sink) sink += head;
+    indices += int64_t(query) * width + part * Keys;
+    out += (int64_t(output_query) * TotalHeads + head) * Dim;
+    const int total_length = lengths ? max(0, min(width, lengths[query])) : width;
+    const int length = COOP_UNIF(Split ? max(0, min(Keys, total_length - part * Keys)) : total_length);
     extern __shared__ char bytes[];
     F8 *storage = reinterpret_cast<F8 *>(bytes);
     auto sk = make_tensor(make_smem_ptr(storage), KVLayout{});
@@ -54,10 +63,14 @@ __global__ __launch_bounds__(Threads, 1) void single_tile_kernel(
         constexpr int SharedQueryOffset = (Keys - Heads) * Dim;
         F8 *query_storage = storage + SharedQueryOffset;
         auto sq = make_tensor(make_smem_ptr(query_storage), LQ<Dim, Heads>{});
-        for (int i = tid; i < Heads * Dim / 16; i += Threads)
-            PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>::copy(
-                *reinterpret_cast<const uint128_t *>(q + i * 16),
-                *reinterpret_cast<uint128_t *>(&sq(i / (Dim / 16), i % (Dim / 16) * 16)), true);
+        for (int i = tid; i < Heads * Dim / 16; i += Threads) {
+            auto *dst = reinterpret_cast<uint128_t *>(&sq(i / (Dim / 16), i % (Dim / 16) * 16));
+            if constexpr (QBF16)
+                *dst = flashmla::sparse_native_fp8::load_bf16_as_fp8_16(q + i * 16);
+            else
+                PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>::copy(
+                    *reinterpret_cast<const uint128_t *>(q + i * 16), *dst, true);
+        }
         cp_async_fence();
         auto gather_columns = [&](int first, int last) {
             CUTE_UNROLL
@@ -189,12 +202,14 @@ __global__ __launch_bounds__(Threads, 1) void single_tile_kernel(
     }
     if (warp == 0 && (lane & 3) == 0) {
         if (maxima) {
-            maxima[query * Heads + row0] = maximum[0];
-            maxima[query * Heads + row1] = maximum[1];
+            maxima[int64_t(output_query) * TotalHeads + head + row0] = maximum[0];
+            maxima[int64_t(output_query) * TotalHeads + head + row1] = maximum[1];
         }
         if (lse) {
-            lse[query * Heads + row0] = sums[0] > 0 ? maximum[0] + log2f(sums[0] / 448.f) : -INFINITY;
-            lse[query * Heads + row1] = sums[1] > 0 ? maximum[1] + log2f(sums[1] / 448.f) : -INFINITY;
+            const float l0 = sums[0] > 0 ? maximum[0] + log2f(sums[0] / 448.f) : -INFINITY;
+            const float l1 = sums[1] > 0 ? maximum[1] + log2f(sums[1] / 448.f) : -INFINITY;
+            lse[int64_t(output_query) * TotalHeads + head + row0] = l0;
+            lse[int64_t(output_query) * TotalHeads + head + row1] = l1;
         }
     }
     if (sink) {
@@ -236,24 +251,66 @@ __global__ __launch_bounds__(Threads, 1) void single_tile_kernel(
             *reinterpret_cast<const uint128_t *>(&shared_output(i / (Dim / 8), i % (Dim / 8) * 8));
 }
 
+template <int TotalHeads = Heads>
 bool try_launch(const flashmla::sparse_native_fp8::AttentionParams &params,
     const flashmla::sparse_native_fp8::DeviceProperties &device) {
-    // This kernel writes flat statistics; paged H16 decode has its own path.
-    if (params.dim != Dim || params.width > Keys || params.lse_queries != 0 ||
+    if (params.dim != Dim || params.lse_queries != 0 ||
+        params.splits != (params.width + Keys - 1) / Keys ||
         device.max_threads < Threads || device.shared_bytes < size_t(SharedBytes))
         return false;
-    hggcFuncSetAttribute(single_tile_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, SharedBytes);
-    single_tile_kernel<<<params.queries, Threads, SharedBytes, params.stream>>>(
-        static_cast<const F8 *>(params.q), static_cast<const F8 *>(params.kv), params.idx,
+    auto kernel = params.qbf
+        ? (params.splits > 1 ? single_tile_kernel<true, true, TotalHeads> : single_tile_kernel<false, true, TotalHeads>)
+        : (params.splits > 1 ? single_tile_kernel<true, false, TotalHeads> : single_tile_kernel<false, false, TotalHeads>);
+    hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, SharedBytes);
+    kernel<<<dim3(int64_t(params.queries) * params.splits, TotalHeads / Heads),
+             Threads, SharedBytes, params.stream>>>(
+        params.q, static_cast<const F8 *>(params.kv), params.idx,
         static_cast<cutlass::bfloat16_t *>(params.out), params.maxima, params.lse, params.lengths,
-        params.sink, params.width, params.kvrows, params.scale, params.os);
+        params.sink, params.width, params.kvrows, params.scale, params.os,
+        params.splits);
     return true;
 }
 } // namespace flashmla_fp8_prefill_single_tile
 
+bool try_sparse_prefill_fp8_ws(const flashmla::sparse_native_fp8::AttentionParams &params,
+                               bool wide_gather);
+
+// Reuse the prefill arithmetic and loaders through the backend launch contract.
+// A split produces flat partial statistics; merge alone applies sink and paged LSE.
+bool try_sparse_fp8_short_decode(const flashmla::sparse_native_fp8::AttentionParams &params) {
+    const auto *device = flashmla::sparse_native_fp8::device_properties();
+    if (!device)
+        return false;
+    auto view = params;
+    if (params.splits > 1) {
+        view.out = params.part;
+        view.lse = params.plse;
+        view.maxima = params.partial_maxima;
+        view.sink = nullptr;
+        view.lse_queries = 0;
+    }
+    // Backing bytes per query approximate sparse-gather locality, including
+    // reuse across verification queries. Wide gathers repay their extra row
+    // passes only after the grid and the per-query pool are large enough.
+    const int cache_footprints = params.queries < 2LL * params.compute_units ? 3 : 1;
+    const bool wide_gather = params.queries >= params.compute_units && params.cache_bytes > 0 &&
+        int64_t(params.kvrows) * params.dim >
+            int64_t(params.queries) * params.cache_bytes * cache_footprints;
+    const bool single = params.heads == 64
+        ? (int64_t(params.queries) * 4 <= params.compute_units * 2 &&
+           flashmla_fp8_prefill_single_tile::try_launch<64>(view, *device))
+        : flashmla_fp8_prefill_single_tile::try_launch(view, *device);
+    if (!single && !try_sparse_prefill_fp8_ws(view, wide_gather))
+        return false;
+    if (params.splits > 1)
+        run_native_fp8_attention_merge(flashmla::sparse_native_fp8::MergeParams(params));
+    return true;
+}
+
 bool try_sparse_fp8_std(const flashmla::sparse_native_fp8::AttentionParams &params) {
     if (params.queries <= 0 || (params.width / 64) <= 0 || (params.width / 64) > 34 ||
-        (params.dim != 512 && params.dim != 576) || params.qbf ||
+        (params.dim != 512 && params.dim != 576) ||
+        (params.qbf && params.dim != 512) ||
         params.qst != params.heads * params.dim || params.qsh != params.dim ||
         (params.heads != 16 && params.heads % 64 != 0))
         return false;

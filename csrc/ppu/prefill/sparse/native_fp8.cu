@@ -486,6 +486,7 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM>::Threads,
 // ---------------------------------------------------------------------------
 bool try_sparse_fp8_std(const flashmla::sparse_native_fp8::AttentionParams &params);
 bool try_sparse_prefill_fp8_ws(const flashmla::sparse_native_fp8::AttentionParams &params);
+void run_native_fp8_attention_ws(const flashmla::sparse_native_fp8::AttentionParams &params);
 // Host launcher: head count, Q layout and sparse width select a tile.
 // Both variants share the same public binding, stream and output contract.
 // ---------------------------------------------------------------------------
@@ -553,10 +554,32 @@ dispatch_sparse_prefill_fp8_fwd(const flashmla::sparse_native_fp8::AttentionPara
 void run_sparse_prefill_fp8_fwd(const flashmla::sparse_native_fp8::AttentionParams &params) {
     if (params.queries == 0)
         return;
-    if ((params.heads == 16 || params.heads % 64 == 0) && !params.qbf &&
+    if ((params.heads == 16 || params.heads % 64 == 0) &&
+        (!params.qbf || (params.dim == 512 &&
+                         (reinterpret_cast<uintptr_t>(params.q) & 15u) == 0)) &&
         params.qst == params.heads * params.dim && params.qsh == params.dim) {
         if (try_sparse_fp8_std(params) || try_sparse_prefill_fp8_ws(params))
             return;
+    }
+    // Partial head groups cannot use the full-head prefill kernels. Reuse
+    // the tail-masked WS pipeline for long lists instead of reloading Q for
+    // every key tile in the generic loop.
+    // A nearly full 64-head tile retains more KV reuse in the generic loop.
+    // With several head groups, short lists also need a sufficiently large
+    // query grid to amortize the WS startup and repeated gathers.
+    const int head_tail = params.heads % 64;
+    const bool amortize_pipeline = params.heads <= 32 ||
+        int64_t(params.queries) >= 2LL * params.compute_units ||
+        params.width == flashmla::sparse_native_fp8::MaxTopk;
+    if (params.dim == 576 && params.heads != 16 && head_tail > 0 && head_tail <= 32 &&
+        amortize_pipeline && params.width >= 8 * flashmla::sparse_native_fp8::TileKeys &&
+        params.width <= flashmla::sparse_native_fp8::MaxTopk) {
+        auto pipeline = params;
+        pipeline.two_stage = flashmla::sparse_native_fp8::prefer_two_stages(
+            params.queries, 1, params.heads, params.compute_units);
+        pipeline.cache_resident = int64_t(params.kvrows) * params.dim <= params.cache_bytes;
+        run_native_fp8_attention_ws(pipeline);
+        return;
     }
     // Complete 64-head groups reuse each gathered KV tile across
     // all heads, including sparse lists with a partially filled final tile.

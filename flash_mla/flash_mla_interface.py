@@ -310,7 +310,7 @@ def flash_mla_sparse_quantized_fwd(
 
     Args:
         q: [s_q, h_q, d_qk], bfloat16, float8_e4m3fn, or uint8 E4M3 bytes.
-            h_q is a positive multiple of 8;
+            h_q must be positive; partial head tiles are masked internally.
             d_qk must be 512 or 576. BF16 Q is converted to e4m3 while loading
             the kernel's shared-memory Q tile, avoiding a materialized FP8 tensor.
             BF16 Q may have strided token/head axes with dense, 16-byte-aligned rows.
@@ -393,7 +393,8 @@ def flash_mla_sparse_quantized_decode_fwd(
     Args:
         quantization: optional QuantizedAttentionConfig, as in prefill.
         q: [n_tok, h_q, d_qk] BF16, float8_e4m3fn or uint8 E4M3 bytes.
-            h_q is a positive multiple of 8; d_qk is 512 or 576.
+            h_q must be positive; d_qk is 512 or 576. Partial head tiles are
+            masked internally, so no head padding is required from the caller.
             For decode n_tok is the batch size and the
             h_q rows are the q heads, which share one topk list.
         kv: [s_kv, 1, d_qk] float8_e4m3fn or uint8 E4M3 bytes,
