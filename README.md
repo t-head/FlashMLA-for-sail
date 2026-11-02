@@ -54,6 +54,7 @@ The PPU version includes targeted optimizations around data movement, shared sto
 ## Installation
 
 ```bash
+python -m pip install setuptools setuptools-scm
 python setup.py install
 ```
 
