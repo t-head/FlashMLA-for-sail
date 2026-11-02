@@ -159,6 +159,22 @@ inline constexpr bool kHs64PrefillGroupedQueries =
     T::kIsCrossCut && T::kUseQkWeave && T::kUseEvenHighBank;
 inline constexpr int kHs64PrefillQueriesPerCta = 3;
 
+// Isolated C30 type: only the new six-to-seven-wave H64 D512 band opts in.
+// Retain the old trait names and three-query mapping for every other route.
+template<int HeadDim, int Arch>
+struct Hs64PrefillFourQueryTraits
+    : public Hs64PrefillTraits<HeadDim, Arch, true, false> {
+    static_assert(HeadDim == 512 && Arch == 89);
+};
+
+template<typename T>
+inline constexpr bool kHs64PrefillFourQueryGroups = false;
+
+template<int HeadDim, int Arch>
+inline constexpr bool kHs64PrefillFourQueryGroups<
+    Hs64PrefillFourQueryTraits<HeadDim, Arch>> = true;
+
+
 // WG1 owns both odd-K copy groups on SM89 D512 prefill and full-tile decode,
 // and on D576. WG0 publishes completion of its old odd-low PV readers first.
 template <typename T>
@@ -5033,6 +5049,14 @@ __forceinline__ __device__ void hs64_attention(
     if constexpr (T::kIsPrefill) {
         if constexpr (kHs64PrefillGroupedQueries<T>) {
             if constexpr (!T::kMultiPrefillHeadTiles) {
+                if constexpr (kHs64PrefillFourQueryGroups<T>) {
+                    // Independent contiguous rows: three or four per CTA.
+                    const int four_query_ctas = params.b - 3 * static_cast<int>(gridDim.x);
+                    begin_idx = 3 * static_cast<int>(blockIdx.x) +
+                        min(static_cast<int>(blockIdx.x), four_query_ctas);
+                    end_idx = begin_idx + 2 +
+                        (static_cast<int>(blockIdx.x) < four_query_ctas);
+                } else {
                 // The launch rounds toward full CU waves and bounds the grid
                 // so each CTA owns two or three contiguous queries.
                 const int three_query_ctas = params.b -
@@ -5041,6 +5065,7 @@ __forceinline__ __device__ void hs64_attention(
                     min(static_cast<int>(blockIdx.x), three_query_ctas);
                 end_idx = begin_idx + kHs64PrefillQueriesPerCta - 2 +
                     (static_cast<int>(blockIdx.x) < three_query_ctas);
+                }
             } else {
                 begin_idx = static_cast<int>(blockIdx.x) * kHs64PrefillQueriesPerCta;
                 end_idx = min(begin_idx + kHs64PrefillQueriesPerCta - 1,
@@ -6246,8 +6271,41 @@ static void launch_sparse_prefill_hs64(SparsePrefillParams &params) {
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
+// Isolated three/four-query instance; existing launchers retain their types.
+template<int HeadDim, int Arch>
+static void launch_sparse_prefill_hs64_four_queries(SparsePrefillParams &params) {
+    using T = Hs64PrefillFourQueryTraits<HeadDim, Arch>;
+    static_assert(kHs64PrefillGroupedQueries<T> && !T::kMultiPrefillHeadTiles);
+    auto kernel = &flash_sparse_prefill_fwd_hs64<T>;
+    constexpr size_t smem_size =
+        std::max(sizeof(typename T::SharedMemoryPlan),
+                 sizeof(typename T::SharedMemoryOutPut));
+    hggcFuncSetAttribute(
+        kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    const int sm_count = get_num_sm(get_current_device());
+    const int64_t four_query_grid = (static_cast<int64_t>(params.s_q) + 3) / 4;
+    const int grid_q = static_cast<int>(std::min(
+        ((four_query_grid + sm_count - 1) / sm_count) * sm_count,
+        static_cast<int64_t>(params.s_q) / 3));
+    kernel<<<dim3(grid_q, 1), T::NUM_THREADS, smem_size, params.stream>>>(params);
+    CHECK_CUDA_KERNEL_LAUNCH();
+}
+
 template<int HeadDim, int Arch>
 void run_flash_sparse_prefill_fwd_hs64(SparsePrefillParams &params) {
+    if constexpr (Arch == 89 && HeadDim == 512) {
+        if (params.h_q == 64 && params.h_kv == 1 && params.d_v == 512 &&
+            params.topk >= 512 && params.topk_length != nullptr && params.s_q < 1024) {
+            const auto [major, minor] = get_compute_capability(get_current_device());
+            const int sm_count = get_num_sm(get_current_device());
+            // Only this six-to-seven-wave band changes the original dispatch.
+            if (major == 8 && minor == 9 && params.s_q >= 6 * sm_count &&
+                params.s_q < 7 * sm_count) {
+                launch_sparse_prefill_hs64_four_queries<HeadDim, Arch>(params);
+                return;
+            }
+        }
+    }
     // Small packed query batches lose parallelism when three queries share a
     // CTA. Keep one query per CTA there and retain epilogue overlap on long Q.
     const bool group_queries = Arch == 89 && params.s_q >= 1024 &&
