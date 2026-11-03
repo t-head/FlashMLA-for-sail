@@ -11,7 +11,8 @@ This repository contains the following implementations:
 *These kernels power DeepSeek Sparse Attention (DSA), as introduced in [this paper](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp)*
 
 - Token-level sparse attention for the prefill stage, with BF16 KV cache
-- Token-level sparse attention for the decoding stage,with BF16 / FP8 KV cache
+- Token-level sparse attention for the decoding stage,with BF16 / FP8 / FP4 KV cache
+- Token-level sparse attention with native FP8
 
 **Dense Attention Kernels**
 
