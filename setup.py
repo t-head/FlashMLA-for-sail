@@ -1,7 +1,8 @@
 import os
-from pathlib import Path
-from datetime import datetime
+import re
+import shutil
 import subprocess
+from pathlib import Path
 
 from setuptools import setup, find_packages
 
@@ -143,28 +144,60 @@ ext_modules.append(
 )
 
 
-try:
-    _now = datetime.now()
-    rev = '+' + _now.strftime("%Y-%m-%d-%H-%M-%S")
-except Exception as _:
-    rev = '+dev'
+FLASHMLA_VERSION = '2.1.0'  # FlashMLA version
+RELEASE_VERSION = 'v1.0.0'  # Release version
 
 
-def custom_local_scheme(version):
-    return '+dev%03d.%s' % (version.distance, version.node[:7])
+def get_ppu_sdk_version():
+    # The PPU suffix follows the native SDK release, not the API version
+    # advertised by a compatible compiler. Query the compiler of the selected
+    # SDK, and fall back to the one on PATH.
+    sdk_root = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/local/PPU_SDK'
+    compiler = os.path.join(sdk_root, 'bin', 'hgcc')
+    if not os.path.isfile(compiler):
+        compiler = shutil.which('hgcc')
+    if not compiler:
+        return (0, 0, 0)
+    try:
+        output = subprocess.check_output([compiler, '--version'], stderr=subprocess.STDOUT).decode('utf-8')
+        match = re.search(r'Release version (\d+)\.(\d+)\.(\d+)', output)
+        if match:
+            return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except Exception:
+        pass
+    return (0, 0, 0)
 
 
-def custom_version_scheme(version):
-    return '2.1.0'
+def get_package_version(ppu_sdk_version):
+    try:
+        from setuptools_scm import Configuration
+        from setuptools_scm.git import parse
+    except ImportError as error:
+        raise RuntimeError('Missing build dependency: install setuptools-scm first') from error
 
+    release_tag = f'{FLASHMLA_VERSION}+{RELEASE_VERSION}'
+    # Match only this release tag; uncommitted changes never affect the version.
+    scm = parse(this_dir, Configuration(), describe_command=[
+        'git', 'describe', '--tags', '--long', '--match', release_tag,
+    ])
+    if scm is None or scm.node is None:
+        raise RuntimeError('Git commit information unavailable; build from a Git repository with commit history')
+    if ppu_sdk_version == (0, 0, 0):
+        raise RuntimeError('PPU SDK version unavailable; check hgcc --version for the selected SDK')
+
+    ppu_version = '.'.join(map(str, ppu_sdk_version))
+    local_version = f'{RELEASE_VERSION}.ppu{ppu_version}'
+    if scm.distance in (None, 0):
+        return f'{FLASHMLA_VERSION}+{local_version}'
+    return f'{FLASHMLA_VERSION}.dev{scm.distance}+{local_version}.{scm.node[:9]}'
+
+
+package_version = get_package_version(get_ppu_sdk_version())
 
 setup(
     name="flash_mla",
-    use_scm_version={
-        "local_scheme": custom_local_scheme,
-        "version_scheme": custom_version_scheme,
-    },
-    setup_requires=["setuptools-scm==9.2.2"],
+    version=package_version,
+    setup_requires=["setuptools-scm"],
     packages=find_packages(include=['flash_mla']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
