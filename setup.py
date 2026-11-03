@@ -23,11 +23,7 @@ def get_sources():
     sources = [
         "csrc/api/api.cpp",
         "csrc/ppu/prefill/sparse/native_fp8.cu",
-        "csrc/ppu/prefill/sparse/native_fp8_prefill_ws.cu",
-        "csrc/ppu/prefill/sparse/native_fp8_prefill_std.cu",
         "csrc/ppu/decode/sparse/native_fp8.cu",
-        "csrc/ppu/decode/sparse/native_fp8_decode_ws.cu",
-        "csrc/ppu/decode/sparse/native_fp8_decode_std.cu",
         "csrc/ppu/decode/dense/instantiations/hdim576_512_bf16.cu",
         "csrc/ppu/decode/dense/instantiations/hdim576_512_fp8.cu",
         "csrc/ppu/decode/dense/instantiations/splitkv_mla_bf16.cu",

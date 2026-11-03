@@ -1,7 +1,6 @@
 #pragma once
 #include "ppu/sparse_native_fp8_attention.cuh"
 #include "common.h"
-#include "sparse_native_fp8_config.h"
 #include <cmath>
 #include <limits>
 #include <variant>
