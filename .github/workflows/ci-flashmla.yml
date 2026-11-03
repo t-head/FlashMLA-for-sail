@@ -36,14 +36,12 @@ jobs:
   # Stage 3: human approval gate
   human-review:
     name: Human Review Gate
-    # TODO: change to ai-code-review
-    needs: precheck
+    needs: ai-code-review
     uses: t-head/.github/.github/workflows/human-review.yml@main
     secrets: inherit
 
   flashmla-ut-tests-ppu:
     name: FlashMLA UT Tests PPU
-    # TODO: change to human-review
-    needs: precheck
+    needs: human-review
     uses: ./.github/workflows/flashmla-ut-test-ppu.yml
     secrets: inherit
