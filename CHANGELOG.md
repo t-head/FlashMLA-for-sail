@@ -1,5 +1,11 @@
 # FlashMLA 2.1.0 for PPU CHANGELOG
 
+## [2.1.0+v1.0.0] - 2026-11
+
+- Added FP8/FP4 sparse decode support for DeepSeek V4.1 models.
+- Added native FP8 sparse prefill and decode support.
+- Improved sparse prefill and decode performance in some scenarios.
+
 ## [2.1.0] - 2026-08
 
 Align with upstream FlashMLA API. Removed `compat.h` and the following C++ entry points: `fwd_kvcache_mla`, `get_mla_metadata`. Python `flash_mla_with_kvcache()` now dispatches directly to the already-existing `dense_decode_fwd` / `sparse_decode_fwd` C++ functions; metadata generation moved from Python into the C++ kernels.
