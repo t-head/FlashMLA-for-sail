@@ -99,6 +99,24 @@ struct Copy_Traits<HS64_TSM_K_UNIT16>
 
 namespace flashmla::dsa::hs64 {
 
+// Packed V4.1 decode owns a complete (request, query) per task. Other H64
+// instances keep their existing split scheduler or grouped prefill schedule.
+enum class Hs64Worklist { Single, Batch, Flat };
+template<int MainCapacity, Hs64Worklist Worklist>
+struct Hs64PackedDecode : Hs64Traits<512, true, 89, true, true> {};
+
+template<typename T> inline constexpr int kPackedMain = 0;
+template<int MainCapacity, Hs64Worklist W>
+inline constexpr int kPackedMain<Hs64PackedDecode<MainCapacity, W>> = MainCapacity;
+template<typename T> inline constexpr Hs64Worklist kWorklist = Hs64Worklist::Single;
+template<int MainCapacity, Hs64Worklist W>
+inline constexpr Hs64Worklist kWorklist<Hs64PackedDecode<MainCapacity, W>> = W;
+
+template<typename T> struct Hs64PackedExtraStep : T {};
+template<typename T> inline constexpr int kPackedMain<Hs64PackedExtraStep<T>> = kPackedMain<T>;
+template<typename T> inline constexpr bool kPackedExtraStep = false;
+template<typename T> inline constexpr bool kPackedExtraStep<Hs64PackedExtraStep<T>> = true;
+
 using namespace cute;
 
 // SM80 simulated AIU storage rotates the four rows of each 16-column slab.
@@ -674,6 +692,37 @@ __forceinline__ __device__ void hs64_wait_local_k1_high() {
         256, static_cast<cutlass::arch::ReservedNamedBarriers>(15));
 }
 
+// A 129..144-token main row ends in the first 16 columns of block 2.
+// With two N warps and two N repeats, these are N-warp 0, repeat 0.
+template<typename T>
+__forceinline__ __device__ bool hs64_narrow_main_tail(int block, int main_end, int length) {
+    return kPackedMain<T> == 256 && block == 2 && main_end == 4 && length > 128 && length <= 144;
+}
+
+template<typename T, typename Mma, typename CopyK, typename ThreadK,
+         typename SourceK, typename LoadQ, typename Scores>
+__forceinline__ __device__ void hs64_qk_first_n16(
+    Mma &mma, CopyK &copy_k, ThreadK &thread_k, SourceK &source_k,
+    LoadQ load_q, Scores &scores, int lane)
+{
+    static_assert(T::kAtomLayoutM == 4 && T::kAtomLayoutN == 2 && T::kBlockN == 64);
+    if (lane >= 128) return;
+    auto thread_mma = mma.get_slice(lane);
+    auto k_seed = make_tensor(make_rmem_ptr((typename T::InputT*)nullptr),
+                              Shape<Int<T::kBlockN>, _64>{});
+    auto k = thread_mma.partition_fragment_B(k_seed);
+    auto k_dst = thread_k.retile_D(k);
+    CUTE_STATIC_ASSERT_V(size<1>(k) == _2{});
+    CUTE_STATIC_ASSERT_V(size<2>(scores) == _2{});
+    for_each(make_int_sequence<4>{}, [&](auto tile) {
+        decltype(auto) q = load_q(tile);
+        cute::copy(copy_k, source_k(_, _0{}, _, tile), k_dst(_, _0{}, _));
+        for_each(make_int_sequence<4>{}, [&](auto slice) {
+            cute::gemm(mma, q(_, _0{}, slice), k(_, _0{}, slice), scores(_, _0{}, _0{}));
+        });
+    });
+}
+
 template <
     typename T,    // Traits
     int PHASE_IDX, // See comments in the code
@@ -699,7 +748,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     __mbarrier_t *barriers,
     Hs64MbarPhase<T> &cur_phase,
     int idx_in_warpgroup,
-    BeforeQk before_qk)
+    BeforeQk before_qk, bool narrow_main_tail = false)
 {
     typename T::TiledMma tiled_mma;
     const int cute_idx = idx_in_warpgroup % T::kMmaThreads;
@@ -809,6 +858,19 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         }
 
     auto qkt_gemm_low = [&]() {
+        if constexpr (kPackedMain<T> == 256 && PHASE_IDX == 5) {
+            if (narrow_main_tail) {
+                auto load_q = [&](auto tile) {
+                    auto q = thr_mma.partition_fragment_A(sQ_tiled(_, _, tile));
+                    auto dst = smem_thr_copy_Q.retile_D(q);
+                    cute::copy(smem_tiled_copy_Q, thr_mma_sQ_tiled(_, _, _, tile), dst);
+                    return q;
+                };
+                hs64_qk_first_n16<T>(tiled_mma, smem_tiled_copy_K, smem_thr_copy_K,
+                    thr_mma_sKV0_tiled, load_q, rP, idx_in_warpgroup);
+                return;
+            }
+        }
         if constexpr (T::kArch == 80) {
             qkt_gemm_low_tiles_sm80<T>(tiled_mma,
                 smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -982,7 +1044,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_high4_tail(
     Tensor<EngineQ7, LayoutQ7> &rQ7,
     Hs64MbarPhase<T> &cur_phase,
     int idx_in_warpgroup,
-    BeforeQk before_qk)
+    BeforeQk before_qk, bool narrow_main_tail = false)
 {
     static_assert(T::kUseEvenHighBank);
     typename T::TiledMma tiled_mma;
@@ -1046,6 +1108,21 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_high4_tail(
     }
 
     before_qk();
+
+    if constexpr (kPackedMain<T> == 256) {
+        if (narrow_main_tail) {
+            auto load_q = [&](auto tile) -> decltype(auto) {
+                if constexpr (decltype(tile)::value == 0) return (rQ4);
+                else if constexpr (decltype(tile)::value == 1) return (rQ5_transient);
+                else if constexpr (decltype(tile)::value == 2) return (rQ6);
+                else return (rQ7);
+            };
+            hs64_qk_first_n16<T>(tiled_mma, smem_tiled_copy_K, smem_thr_copy_K,
+                thr_mma_sK_high_tiled, load_q, rP, idx_in_warpgroup);
+            if constexpr (ADVANCE_PHASE) cur_phase ^= 1u;
+            return;
+        }
+    }
 
     qkt_gemm_one_tile_rQ(
         tiled_mma, smem_tiled_copy_K, smem_thr_copy_K,
@@ -1145,7 +1222,7 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
     Tensor<Engine2, Layout2> &rO,       // ((2, 2, 32), 1, 1)
     int idx_in_warpgroup,
     int warp_idx,
-    AfterFirstP after_first_p = {})
+    AfterFirstP after_first_p = {}, bool narrow_main_tail = false)
 {
     typename T::TiledMmaPV tiled_mma;
     // P is the A operand (M x K only): fold the N-warp out with % kAtomLayoutM.
@@ -1231,6 +1308,13 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
                 cute::copy(smem_tiled_copy_P, tSsP(_, _, k), cP1(_, _, _0{}));
             }
         };
+        if constexpr (kPackedMain<T> == 256 && !PRIME_FIRST_P) {
+            if (narrow_main_tail) {
+                load0(_0{});
+                cute::gemm(tiled_mma, rP0(_, _, _0{}), rV0(_, _, _0{}), rO);
+                return;
+            }
+        }
         if constexpr (PRIME_FIRST_P) {
             static_assert(T::kHasExtraKTile);
             CUTE_STATIC_ASSERT_V(size<1>(cP0) == Int<2>{});
@@ -1244,6 +1328,32 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
                 tSsP(_, _1{}, _0{}), cP0(_, _1{}, _0{}));
         } else {
             load0(_0{});
+        }
+        if constexpr (kPackedMain<T> != 0) {
+            // V columns have separate output accumulators. Issue the next
+            // V fragment between independent PV products in the current K slice.
+            auto multiply_columns = [&](auto step, auto& current_p, auto& current_v,
+                                        auto& next_p, auto& next_v) {
+                constexpr int k = decltype(step)::value;
+                if constexpr (k + 1 < kReductionSlices) {
+                    cute::copy(smem_tiled_copy_P, tSsP(_, _, Int<k + 1>{}), next_p(_, _, _0{}));
+                }
+                for_each(make_int_sequence<decltype(size<1>(current_v))::value>{}, [&](auto n) {
+                    if constexpr (k + 1 < kReductionSlices) {
+                        cute::copy(smem_tiled_copy_Vt, tSsVt(_, n, Int<k + 1>{}), next_v(_, n, _0{}));
+                    }
+                    for_each(make_int_sequence<decltype(size<1>(current_p))::value>{}, [&](auto m) {
+                        cute::gemm(tiled_mma, current_p(_, m, _0{}), current_v(_, n, _0{}), rO(_, m, n));
+                    });
+                });
+            };
+            for_each(make_int_sequence<kReductionSlices>{}, [&](auto k) {
+                if constexpr (decltype(k)::value % 2 == 0)
+                    multiply_columns(k, rP0, rV0, cP1, cV1);
+                else
+                    multiply_columns(k, rP1, rV1, cP0, cV0);
+            });
+            return;
         }
         for_each(make_int_sequence<kReductionSlices>{}, [&](auto k) {
             constexpr int ki = decltype(k)::value;
@@ -2597,7 +2707,7 @@ __forceinline__ __device__ void store_o(
             cute::copy(r2s_tiled_copy, r2s_thr_copy_rOb, r2s_thr_copy_sMyOutputBuf);
         }
 
-        if constexpr (IS_NO_SPLIT && kHs64PrefillGroupedQueries<T>) {
+        if constexpr (IS_NO_SPLIT && (kHs64PrefillGroupedQueries<T> || kWorklist<T> != Hs64Worklist::Single)) {
             // Publish sO while the next query's independent Q copy is in flight.
             __ppu_barrier_sync(0, T::NUM_THREADS, 15u);
         } else {
@@ -2703,8 +2813,9 @@ __forceinline__ __device__ void compute_K_addr_bf16(
     const int t_idx = (token_id < tile_valid) ? pre_token_idx[0] : -1;
     // Prefill indices are token IDs and may include positive out-of-range
     // sentinels. Each KV token is mapped to a one-token page by the host.
-    const bool meta_valid = (t_idx >= 0) &&
-        (!T::kIsPrefill || t_idx < params.num_blocks);
+    const bool meta_valid = t_idx >= 0 && (!T::kIsPrefill || t_idx < params.num_blocks) &&
+        (kPackedMain<T> == 0 || t_idx / (USE_EXTRA ? 64 : (kPackedMain<T> == 256 ? 256 : 128)) <
+                                 (USE_EXTRA ? params.extra_num_blocks : params.num_blocks));
     if constexpr (S == 0) {
         // Each physical token is represented by four lanes. Interleaving makes
         // pass0's consecutive tokens land at ballot bits 0/8/16/24 and pass1's
@@ -2738,6 +2849,9 @@ __forceinline__ __device__ void compute_K_addr_bf16(
         const unsigned int row_atom = static_cast<unsigned int>(
             static_cast<size_t>(t_idx) * k_stride_elems / T::kGmemElemsPerLoad);
         meta_atom = row_atom | (0u - static_cast<unsigned int>(!meta_valid));
+    } else if constexpr (kPackedMain<T> != 0) {
+        if (meta_valid)
+            meta_atom = static_cast<unsigned>(t_idx) * (kBytesPerToken / kAddressUnitBytes);
     } else if (meta_valid) {
         if constexpr (T::kIsPrefill) {
             // One-token pages: preserve the real padded row stride without
@@ -3527,6 +3641,30 @@ __forceinline__ __device__ void hs64_finish_v41_fp8_even_high(
     __pipeline_commit();
 }
 
+// Cache only the next odd FP4 high half in registers until bar3 releases its destination.
+struct Hs64OddHighPacket {
+    uint64_t packed[4];
+    uint8_t scales[4];
+};
+
+template<typename T>
+__device__ __forceinline__ Hs64OddHighPacket hs64_read_odd_high(
+    int tid, typename T::InputT* (&ptr)[T::kGmemPasses], bool (&valid)[T::kGmemPasses]) {
+    static_assert(kPackedExtraStep<T> && T::kGmemPasses == 2);
+    Hs64OddHighPacket packet{};
+    const int pass = (tid >> 2) & 1;
+    const int wide = tid & 3;
+    if (valid[pass]) {
+        const uint8_t *row = reinterpret_cast<const uint8_t*>(ptr[pass]) - (tid & 7) * 4;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            packet.packed[k] = __ldca(reinterpret_cast<const uint64_t*>(row + (4 + k) * 32 + wide * 8));
+            packet.scales[k] = __ldca(row + 256 + (4 + k) * 4 + wide);
+        }
+    }
+    return packet;
+}
+
 // Phase 2: Issue cp.async from token_ptr and prefetch the next token index.
 // PREFETCH_USE_EXTRA selects the next block's index base.
 template<int S, int E, bool PREFETCH_USE_EXTRA, typename T, bool DO_PREFETCH = true,
@@ -3549,7 +3687,8 @@ __forceinline__ __device__ void issue_K_load_bf16(
     int next_block_idx,
     int end_block_idx,
     int extra_seqlen_k,
-    TensorHigh *even_high = nullptr
+    TensorHigh *even_high = nullptr,
+    const Hs64OddHighPacket *packet = nullptr
 ) {
     static_assert(!(EVEN_HIGH_ONLY && EVEN_LOW_ONLY));
     static_assert((!EVEN_HIGH_ONLY && !EVEN_LOW_ONLY) || MERGE_EVEN_HIGH);
@@ -3557,8 +3696,8 @@ __forceinline__ __device__ void issue_K_load_bf16(
     constexpr int kBlockN = T::kBlockN;
 
     if constexpr (T::kV41FP8) {
-        const bool use_extra = (ori_block_max >= 0) &&
-                               (block_idx_kv >= ori_block_max);
+        const bool use_extra = kPackedExtraStep<T> ||
+            (ori_block_max >= 0 && block_idx_kv >= ori_block_max);
         static_assert(T::kGmemPasses == 2 && T::kGmemThrPerTok == 8);
         const int old_lane = tidx & 7;
         const int wide_lane = tidx & 3;
@@ -3576,9 +3715,21 @@ __forceinline__ __device__ void issue_K_load_bf16(
             const uint8_t *data = row + wide_lane * (old_bytes * 2);
             if constexpr (T::kExtraFP4) {
                 if (use_extra) {
-                    hs64_store_v41_fp4_preloaded<S, E, MERGE_EVEN_HIGH>(
-                        sK_buf, even_high, token, lane, data, scale, valid);
-                } else {
+                    if constexpr (kPackedExtraStep<T> && S == 4 && E == 8 && !MERGE_EVEN_HIGH) {
+                        if (packet != nullptr) {
+                            #pragma unroll
+                            for (int tile = 4; tile < 8; ++tile)
+                                hs64_store_v41_fp4_tile(sK_buf, token, lane, tile, tile,
+                                    packet->packed[tile - 4], packet->scales[tile - 4], valid);
+                        } else {
+                            hs64_store_v41_fp4_preloaded<S, E, MERGE_EVEN_HIGH>(
+                                sK_buf, even_high, token, lane, data, scale, valid);
+                        }
+                    } else {
+                        hs64_store_v41_fp4_preloaded<S, E, MERGE_EVEN_HIGH>(
+                            sK_buf, even_high, token, lane, data, scale, valid);
+                    }
+                } else if (!hs64_narrow_main_tail<T>(block_idx_kv, ori_block_max, seqlen_k) || token < 16) {
                     #pragma unroll
                     for (int tile = S; tile < E; ++tile) {
                         hs64_store_v41_fp8_tile(sK_buf, token, lane, tile, tile,
@@ -4162,7 +4313,9 @@ __forceinline__ __device__ void wg0_subroutine(
                 reinterpret_cast<uint8_t*>(cute::raw_pointer_cast(scale_scratch)),
                 idx_in_warpgroup, use_extra, precomp_ptr0, precomp_valid0, pre_token_idx);
         }
-        warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0L, rO0, idx_in_warpgroup, wg_idx);
+        warpgroup_cooperative_pv_gemm_remoteP<T>(
+            sP0, sV0L, rO0, idx_in_warpgroup, wg_idx, Hs64NoPvPrimedWork{},
+            hs64_narrow_main_tail<T>(block_idx, ori_block_max, seqlen_k));
     } else {
         warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV0L, rO0, idx_in_warpgroup, wg_idx);
     }
@@ -4464,7 +4617,10 @@ __forceinline__ __device__ void wg0_subroutine(
                     pre_token_idx_b, nxt_block1 + 2, end_block_idx);
             }
             // K0-low readiness was published by the preceding WG0 bar6.
-            warpgroup_cooperative_qkt_gemm<T, 5>(sQ, next_sK0_low, next_sK0_low, rP0, rQ8, rQ6, rQ4, rQlow0, barriers_K0, cur_phase_K0, idx_in_warpgroup);
+            warpgroup_cooperative_qkt_gemm<T, 5>(
+                sQ, next_sK0_low, next_sK0_low, rP0, rQ8, rQ6, rQ4, rQlow0,
+                barriers_K0, cur_phase_K0, idx_in_warpgroup, []() {},
+                hs64_narrow_main_tail<T>(nxt_block0, ori_block_max, seqlen_k));
         } else {
             warpgroup_cooperative_qkt_gemm<T, 0>(sQ, cur_sK0, cur_sK0, rP0, rQ8, rQ6, rQ4, rQlow0, barriers_K0, cur_phase_K0, idx_in_warpgroup);
         }
@@ -4513,7 +4669,8 @@ __forceinline__ __device__ void wg0_subroutine(
                 warpgroup_cooperative_qkt_gemm_high4_tail<T, true>(
                     sQ, next_sK0_high4, cur_sK0, rP0,
                     rQ4, rQ5, rQ6, rQ8,
-                    cur_phase_K0, idx_in_warpgroup, wait_k0_high);
+                    cur_phase_K0, idx_in_warpgroup, wait_k0_high,
+                    hs64_narrow_main_tail<T>(nxt_block0, ori_block_max, seqlen_k));
             }
             even_high_in_scratch ^= 1u;
             if constexpr (kSplitEvenHighCopy) {
@@ -4703,6 +4860,15 @@ __forceinline__ __device__ void wg1_subroutine(
             T::NUM_THREADS, static_cast<cutlass::arch::ReservedNamedBarriers>(2));  // M128 non-blocking producer
     }
 
+    Hs64OddHighPacket packet{};
+    if constexpr (kPackedExtraStep<T>) {
+        packet = hs64_read_odd_high<T>(idx_in_warpgroup, precomp_ptr0, precomp_valid0);
+        asm volatile("" :: "l"(packet.packed[0]), "l"(packet.packed[1]),
+            "l"(packet.packed[2]), "l"(packet.packed[3]), "r"(unsigned(packet.scales[0])),
+            "r"(unsigned(packet.scales[1])), "r"(unsigned(packet.scales[2])),
+            "r"(unsigned(packet.scales[3])) : "memory");
+    }
+
     // Issue rO1 += rP1b @ sV1R
     if constexpr (T::kUsePv2x4 && !T::kV41FP8) {
         if constexpr (T::kParkQ5Fragment) {
@@ -4738,7 +4904,8 @@ __forceinline__ __device__ void wg1_subroutine(
             params, cur_sK0, batch_idx, nxt_block1, seqlen_k,
             &barriers_K1[1], idx_in_warpgroup, ori_block_max,
             precomp_ptr0, precomp_valid0, pre_token_idx,
-            nxt_block1 + 2, end_block_idx, extra_seqlen_k);
+            nxt_block1 + 2, end_block_idx, extra_seqlen_k,
+            static_cast<std::remove_reference_t<decltype(cur_sK0)>*>(nullptr), &packet);
     }
 
     // Physical buffer ownership (wg1 arguments are swapped):
@@ -4770,7 +4937,8 @@ __forceinline__ __device__ void wg1_subroutine(
                 issue_high_after_first_p);
         } else {
             warpgroup_cooperative_pv_gemm_remoteP<T>(
-                sP0, current_sV1R, rO1, idx_in_warpgroup, wg_idx);
+                sP0, current_sV1R, rO1, idx_in_warpgroup, wg_idx, Hs64NoPvPrimedWork{},
+                hs64_narrow_main_tail<T>(block_idx, ori_block_max, seqlen_k));
         }
     } else {
         // D512 keeps the original fixed buf0 high-half source.
@@ -5012,7 +5180,7 @@ __forceinline__ __device__ void hs64_attention(
     Tensor smem_valid_indices = make_tensor(make_smem_ptr(plan.smem_valid_indices.data()),
         Shape<_4, Int<T::kValidWords>>{}, Stride<Int<T::kValidWords>, _1>{});
     constexpr bool kStageOutputInRetiredK =
-        kHs64PrefillGroupedQueries<T> && !ALLOW_EXTRA;
+        (kHs64PrefillGroupedQueries<T> && !ALLOW_EXTRA) || kWorklist<T> != Hs64Worklist::Single;
     static_assert(!kStageOutputInRetiredK ||
         (offsetof(SharedMemoryPlan, smem_sK) ==
              cosize_v<typename T::SmemLayoutQ> * sizeof(InputT) &&
@@ -5075,6 +5243,10 @@ __forceinline__ __device__ void hs64_attention(
             begin_idx = end_idx = blockIdx.x;
         }
         begin_seqlen = end_seqlen = 0;
+    } else if constexpr (kPackedMain<T> != 0) {
+        begin_idx = int(blockIdx.z);
+        end_idx = kWorklist<T> == Hs64Worklist::Single ? begin_idx : params.b - 1;
+        begin_seqlen = end_seqlen = 0;
     } else {
         tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr + partition_idx * TileSchedulerMetaDataSize;
         // Keep this load ordered with the programmatic launch dependency.
@@ -5088,7 +5260,7 @@ __forceinline__ __device__ void hs64_attention(
     if (begin_idx >= params.b)
         return;
     int begin_n_split_idx = 0;
-    if constexpr (!T::kIsPrefill)
+    if constexpr (!T::kIsPrefill && kPackedMain<T> == 0)
         begin_n_split_idx = *(tile_scheduler_metadata_ptr + 4);
 
     // Copy the first Q
@@ -5098,14 +5270,17 @@ __forceinline__ __device__ void hs64_attention(
         params.topk == 2048 && params.topk_len_ptr == nullptr &&
         params.extra_topk < 0;
 
+    const int batch_step = kWorklist<T> == Hs64Worklist::Single ? 1 : int(gridDim.z);
 #pragma unroll 1
 #pragma clang loop licm(disable)
-    for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
+    for (int batch_idx = begin_idx; batch_idx <= end_idx; batch_idx += batch_step) {
+        const int next_batch_idx = batch_idx + batch_step;
+        const int length_row = kWorklist<T> == Hs64Worklist::Flat ? batch_idx / params.q_orig : batch_idx;
         constexpr int kBlockN = T::kBlockN;
         const int n_split_idx = batch_idx == begin_idx ? begin_n_split_idx : 0;
         int seqlen_k;
         if (params.topk_len_ptr) {
-            seqlen_k = __ldg(params.topk_len_ptr + batch_idx);
+            seqlen_k = __ldg(params.topk_len_ptr + length_row);
         } else {
             seqlen_k = params.topk;
         }
@@ -5137,6 +5312,8 @@ __forceinline__ __device__ void hs64_attention(
                 seqlen_k = trim_scratch[0];
             }
         }
+        if constexpr (kPackedMain<T> != 0)
+            seqlen_k = min(max(seqlen_k, 0), kPackedMain<T>);
         int seqlen_kpad = max(seqlen_k, 1);
         // Always round main cache up to kBlockN*2 (128) so that:
         //   - the main/extra cache boundary is on an even block, keeping
@@ -5144,16 +5321,21 @@ __forceinline__ __device__ void hs64_attention(
         //   - it matches the metadata kernel's block_size_n=128 tiling, so
         //     is_no_split (start==0 && end==total/kBlockN) stays accurate
         //     without an extra __ldg on num_splits_ptr.
-        seqlen_kpad = cute::round_up(seqlen_kpad, kBlockN * 2);
+        if constexpr (kPackedMain<T> == 128)
+            seqlen_kpad = 128;
+        else
+            seqlen_kpad = cute::round_up(seqlen_kpad, kBlockN * 2);
         int extra_seqlen_k = 0;
         int ori_block_max = -1;
         if constexpr (ALLOW_EXTRA) {
             if (params.extra_topk >= 0) {
                 if (params.extra_topk_len_ptr) {
-                    extra_seqlen_k = __ldg(params.extra_topk_len_ptr + batch_idx);
+                    extra_seqlen_k = __ldg(params.extra_topk_len_ptr + length_row);
                 } else {
                     extra_seqlen_k = params.extra_topk;
                 }
+                if constexpr (kPackedMain<T> != 0)
+                    extra_seqlen_k = min(max(extra_seqlen_k, 0), 512);
                 ori_block_max = cute::ceil_div(seqlen_kpad, kBlockN);
             }
         }
@@ -5162,8 +5344,9 @@ __forceinline__ __device__ void hs64_attention(
         int end_block_idx = batch_idx == end_idx
             ? cute::round_up(end_seqlen, kBlockN * 2) / kBlockN
             : total_k / kBlockN;
-        if constexpr (T::kIsPrefill) end_block_idx = total_k / kBlockN;
-        const bool is_no_split = T::kIsPrefill ||
+        if constexpr (T::kIsPrefill || kPackedMain<T> != 0)
+            end_block_idx = total_k / kBlockN;
+        const bool is_no_split = T::kIsPrefill || kPackedMain<T> != 0 ||
             (start_block_idx == 0 && end_block_idx == (total_k / kBlockN));
 
 
@@ -5524,8 +5707,8 @@ __forceinline__ __device__ void hs64_attention(
             // normal iteration has produced and consumed a real next-even high.
             uint32_t even_high_in_scratch = 0;
 
-            #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA)    \
-                wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA>(                \
+            #define LAUNCH_WG0_SUBROUTINE(Step, IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA)    \
+                wg0_subroutine<Step, IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA>(                \
                 sQ, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, rQ6, rQ4, rQ5, rQmid6, rQlow0, \
                 rP0, rO, rL,                                     \
                 barriers_K0, barriers_K1, cur_phase_K0, even_high_in_scratch, params, \
@@ -5537,10 +5720,22 @@ __forceinline__ __device__ void hs64_attention(
                 precomp_ptr0, precomp_ptr1, precomp_valid0, precomp_valid1, smem_cross_n_reduction);          \
 
             int block_idx = start_block_idx;
-            if constexpr (!ALLOW_EXTRA) {
+            if constexpr (kPackedMain<T> != 0) {
+                // +2/+3 is still FP8 only for the first pair of a long main row.
+                if constexpr (kPackedMain<T> == 256) {
+                    if (ori_block_max == 4 && block_idx < end_block_idx - 2) {
+                        LAUNCH_WG0_SUBROUTINE(T, false, false, true);
+                        block_idx += 2;
+                    }
+                }
                 #pragma unroll 1
                 for (; block_idx < end_block_idx - 2; block_idx += 2) {
-                    LAUNCH_WG0_SUBROUTINE(false, false, false);
+                    LAUNCH_WG0_SUBROUTINE(Hs64PackedExtraStep<T>, false, false, true);
+                }
+            } else if constexpr (!ALLOW_EXTRA) {
+                #pragma unroll 1
+                for (; block_idx < end_block_idx - 2; block_idx += 2) {
+                    LAUNCH_WG0_SUBROUTINE(T, false, false, false);
                 }
             } else {
                 // 3-phase loop: NEXT_EXTRA controls prefetch/compute cache.
@@ -5550,15 +5745,15 @@ __forceinline__ __device__ void hs64_attention(
                     end_block_idx - 2);
                 #pragma unroll 1
                 for (; block_idx < p1_end; block_idx += 2) {
-                    LAUNCH_WG0_SUBROUTINE(false, false, false);
+                    LAUNCH_WG0_SUBROUTINE(T, false, false, false);
                 }
                 #pragma unroll 1
                 for (; block_idx < end_block_idx - 2; block_idx += 2) {
-                    LAUNCH_WG0_SUBROUTINE(false, false, true);
+                    LAUNCH_WG0_SUBROUTINE(T, false, false, true);
                 }
             }
             // Phase 3: last 2 blocks (no K load/prefetch/compute_addr)
-            LAUNCH_WG0_SUBROUTINE(false, true, false);
+            LAUNCH_WG0_SUBROUTINE(T, false, true, false);
         } else {
             // Warpgroup 1
             Tensor rP1 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kBlockN>>{});  // MMA, MMA_M, MMA_K
@@ -5628,8 +5823,8 @@ __forceinline__ __device__ void hs64_attention(
                 preloaded_valid_words[1] = smem_valid_indices(first_vi, first_word + 2u);
             }
 
-            #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA)  \
-                wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA>(          \
+            #define LAUNCH_WG1_SUBROUTINE(Step, IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA)  \
+                wg1_subroutine<Step, IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA>(          \
                 sQ, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, rQ6, rQ4, rQ5, rQmid6, rQlow0, \
                 rP1, rO, rL,                                     \
                 barriers_K0, barriers_K1, cur_phase_K1, even_high_in_scratch, params, \
@@ -5641,10 +5836,22 @@ __forceinline__ __device__ void hs64_attention(
                 precomp_ptr0_wg1, precomp_ptr1_wg1, precomp_valid0_wg1, precomp_valid1_wg1, smem_cross_n_reduction, preloaded_valid_words);  \
 
             int block_idx = start_block_idx;
-            if constexpr (!ALLOW_EXTRA) {
+            if constexpr (kPackedMain<T> != 0) {
+                // +2/+3 is still FP8 only for the first pair of a long main row.
+                if constexpr (kPackedMain<T> == 256) {
+                    if (ori_block_max == 4 && block_idx < end_block_idx - 2) {
+                        LAUNCH_WG1_SUBROUTINE(T, false, false, true);
+                        block_idx += 2;
+                    }
+                }
                 #pragma unroll 1
                 for (; block_idx < end_block_idx - 2; block_idx += 2) {
-                    LAUNCH_WG1_SUBROUTINE(false, false, false);
+                    LAUNCH_WG1_SUBROUTINE(Hs64PackedExtraStep<T>, false, false, true);
+                }
+            } else if constexpr (!ALLOW_EXTRA) {
+                #pragma unroll 1
+                for (; block_idx < end_block_idx - 2; block_idx += 2) {
+                    LAUNCH_WG1_SUBROUTINE(T, false, false, false);
                 }
             } else {
                 // 3-phase loop: same phase boundaries as WG0.
@@ -5654,15 +5861,15 @@ __forceinline__ __device__ void hs64_attention(
                     end_block_idx - 2);
                 #pragma unroll 1
                 for (; block_idx < p1_end; block_idx += 2) {
-                    LAUNCH_WG1_SUBROUTINE(false, false, false);
+                    LAUNCH_WG1_SUBROUTINE(T, false, false, false);
                 }
                 #pragma unroll 1
                 for (; block_idx < end_block_idx - 2; block_idx += 2) {
-                    LAUNCH_WG1_SUBROUTINE(false, false, true);
+                    LAUNCH_WG1_SUBROUTINE(T, false, false, true);
                 }
             }
             // Phase 3: last 2 blocks
-            LAUNCH_WG1_SUBROUTINE(false, true, false);
+            LAUNCH_WG1_SUBROUTINE(T, false, true, false);
         }
 
         // Reduce rL across threads within the same warp
@@ -5762,8 +5969,8 @@ __forceinline__ __device__ void hs64_attention(
         // The final K readers have retired. Output no longer aliases sQ,
         // allowing this original next-Q async group to overlap the epilogue.
         if constexpr (kStageOutputInRetiredK) {
-            if (batch_idx < end_idx) {
-                launch_q_copy<T>(params, batch_idx + 1, m_block_idx,
+            if (next_batch_idx <= end_idx) {
+                launch_q_copy<T>(params, next_batch_idx, m_block_idx,
                                  k_head_idx, sQ, tidx, warp_idx, barrier_Q);
             }
         }
@@ -5771,10 +5978,9 @@ __forceinline__ __device__ void hs64_attention(
         // this issue path separate from the Q-copy branch to preserve the
         // independent scheduling window through the output epilogue.
         if constexpr (kStageOutputInRetiredK) {
-            if (next_wg0_high_active && batch_idx < end_idx &&
+            if (next_wg0_high_active && next_batch_idx <= end_idx &&
                 warpgroup_idx == 0) {
                 int next_first_idx[T::kGmemPasses] = {};
-                const int next_batch_idx = batch_idx + 1;
                 constexpr int next_end_block_idx = 2048 / T::kBlockN;
                 prefetch_tok(0, next_first_idx, next_batch_idx);
                 load_K_tiles_bf16<
@@ -5975,12 +6181,12 @@ __forceinline__ __device__ void hs64_attention(
                 }
             }
 
-            if (batch_idx + 1 <= end_idx) {
+            if (next_batch_idx <= end_idx) {
                 if constexpr (!kStageOutputInRetiredK) {
                     // The original path stages output in sQ. Its readers must
                     // finish before the next query overwrites that storage.
                     __syncthreads();
-                    launch_q_copy<T>(params, batch_idx + 1, m_block_idx,
+                    launch_q_copy<T>(params, next_batch_idx, m_block_idx,
                                      k_head_idx, sQ, tidx, warp_idx, barrier_Q);
                 }
             } else {
@@ -6039,7 +6245,7 @@ __forceinline__ __device__ void hs64_attention(
                               sO_addr, params, batch_idx, k_head_idx,
                               m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
 
-            if (batch_idx + 1 <= end_idx) {
+            if (next_batch_idx <= end_idx) {
                 // Keep mbarrier reinit for split path (store_o<T,false> uses sO_addr)
                 if (threadIdx.x == 0) {
                     __mbarrier_init(barrier_Q, T::kQBarrierThreads);
@@ -6051,13 +6257,13 @@ __forceinline__ __device__ void hs64_attention(
                 }
                 __syncthreads();
                 cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
-                launch_q_copy<T>(params, batch_idx + 1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
+                launch_q_copy<T>(params, next_batch_idx, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
             } else {
                 // Allow the next kernel (the combine kernel) to launch
                 // PPU stream serialization orders the following combine launch.
             }
         }
-        if (batch_idx != end_idx)
+        if (next_batch_idx <= end_idx)
             __syncthreads();
     }
 }
@@ -6117,17 +6323,9 @@ flash_sparse_prefill_fwd_hs64(__grid_constant__ const SparsePrefillParams params
     }
 }
 
-// Reuse the no-extra images for full tiles; all other inputs retain guards.
-template<int HeadDim, bool AllowExtra = true, int Arch = 89,
-         bool IsV41FP8 = false, bool IsExtraFP4 = false>
-static void run_flash_sparse_decode_wg_kernel_hs64_hdim(
-    Flash_fwd_params &params,
-    hggcStream_t stream)
-{
-    static_assert(HeadDim == 512 || HeadDim == 576);
-    using T = Hs64Traits<HeadDim, /*GuardIndices=*/AllowExtra,
-                         Arch, IsV41FP8, IsExtraFP4>;
-    static_assert(T::kBlockM == 64 && T::kBlockN == 64 && T::kHeadDim == HeadDim);
+template<typename T, bool AllowExtra>
+static void launch_flash_sparse_decode_wg_hs64(Flash_fwd_params &params, hggcStream_t stream) {
+    static_assert(T::kBlockM == 64 && T::kBlockN == 64);
     static_assert(T::kUsePv2x4,
                   "HS64 instances use the shared PV 2x4 layout");
 
@@ -6139,7 +6337,10 @@ static void run_flash_sparse_decode_wg_kernel_hs64_hdim(
     hggcFuncSetAttribute(
         mla_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
-    const dim3 grid(params.q_orig, params.ngroups / T::kBlockM, params.num_sm_parts);
+    const int grid_rows = kPackedMain<T> == 0 ? params.num_sm_parts :
+        (kWorklist<T> == Hs64Worklist::Single ? params.b : std::min(39, params.b));
+    const dim3 grid(kWorklist<T> == Hs64Worklist::Flat ? 1 : params.q_orig,
+                    params.ngroups / T::kBlockM, grid_rows);
 
     int ctas_per_sm = 0;
     const hggcError occupancy_status =
@@ -6154,7 +6355,7 @@ static void run_flash_sparse_decode_wg_kernel_hs64_hdim(
             tag_printed = true;
             printf("[WG_HS64_TAG] %s blockM=64 d=%d no_extra=%d index_guard=%d\n",
                    T::kV41FP8 ? kHs64V41BuildTag : kHs64BuildTag,
-                   HeadDim, int(!AllowExtra), int(T::kGuardIndices));
+                   T::kHeadDim, int(!AllowExtra), int(T::kGuardIndices));
         }
 
         hggcFuncAttributes attr;
@@ -6173,7 +6374,7 @@ static void run_flash_sparse_decode_wg_kernel_hs64_hdim(
         printf("vreg:%d, stack:%d, sm:%d, occupancy:%0.3f, Arch:%d\n",
                int(attr.numRegs), int(attr.localSizeBytes), sm_count,
                float(grid.x * grid.y * grid.z) /
-                   float(sm_count * ctas_per_sm), Arch);
+                   float(sm_count * ctas_per_sm), T::kArch);
     }
 
     hggcLaunchAttribute kernel_attributes[1];
@@ -6191,7 +6392,16 @@ static void run_flash_sparse_decode_wg_kernel_hs64_hdim(
     hggcLaunchKernelEx(&kernel_config, mla_kernel, params);
     CHECK_CUDA_KERNEL_LAUNCH();
 
-    ::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(params, stream);
+    if constexpr (kPackedMain<T> == 0)
+        ::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(params, stream);
+}
+
+template<int HeadDim, bool AllowExtra = true, int Arch = 89,
+         bool IsV41FP8 = false, bool IsExtraFP4 = false>
+static void run_flash_sparse_decode_wg_kernel_hs64_hdim(Flash_fwd_params &params, hggcStream_t stream) {
+    static_assert(HeadDim == 512 || HeadDim == 576);
+    using T = Hs64Traits<HeadDim, AllowExtra, Arch, IsV41FP8, IsExtraFP4>;
+    launch_flash_sparse_decode_wg_hs64<T, AllowExtra>(params, stream);
 }
 
 template<int Arch>
@@ -6222,28 +6432,6 @@ static void run_flash_sparse_decode_wg_kernel_hs64_arch(
         } else {
             run_flash_sparse_decode_wg_kernel_hs64_hdim<576, true, Arch>(params, stream);
         }
-    }
-}
-
-void run_flash_sparse_decode_wg_kernel_hs64(
-    Flash_fwd_params &params, hggcStream_t stream,
-    bool is_v41_fp8, bool is_extra_fp4) {
-    if (is_v41_fp8) {
-        FLASH_ASSERT(params.d == 512 && params.ngroups == 64 && params.q_orig > 1);
-        if (is_extra_fp4) {
-            run_flash_sparse_decode_wg_kernel_hs64_hdim<512, true, 89, true, true>(
-                params, stream);
-        } else {
-            run_flash_sparse_decode_wg_kernel_hs64_hdim<512, true, 89, true, false>(
-                params, stream);
-        }
-        return;
-    }
-    const auto [major, minor] = get_compute_capability(get_current_device());
-    if (major > 8 || (major == 8 && minor >= 9)) {
-        run_flash_sparse_decode_wg_kernel_hs64_arch<89>(params, stream);
-    } else {
-        run_flash_sparse_decode_wg_kernel_hs64_arch<80>(params, stream);
     }
 }
 
