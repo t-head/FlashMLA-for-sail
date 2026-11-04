@@ -1,5 +1,4 @@
 import os
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -149,9 +148,7 @@ RELEASE_VERSION = 'v1.0.0'  # Release version
 
 
 def get_ppu_sdk_version():
-    # The PPU suffix follows the native SDK release, not the API version
-    # advertised by a compatible compiler. Query the compiler of the selected
-    # SDK, and fall back to the one on PATH.
+    # Query version macros using the selected SDK compiler, falling back to PATH.
     sdk_root = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/local/PPU_SDK'
     compiler = os.path.join(sdk_root, 'bin', 'hgcc')
     if not os.path.isfile(compiler):
@@ -159,10 +156,17 @@ def get_ppu_sdk_version():
     if not compiler:
         return (0, 0, 0)
     try:
-        output = subprocess.check_output([compiler, '--version'], stderr=subprocess.STDOUT).decode('utf-8')
-        match = re.search(r'Release version (\d+)\.(\d+)\.(\d+)', output)
-        if match:
-            return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        output = subprocess.check_output(
+            [compiler, '-E', '-x', 'cu', '/dev/stdin', '-o', '/dev/stdout'],
+            input=(
+                'PPU_VERSION __HGGCCC_VER_MAJOR__ '
+                '__HGGCCC_VER_MINOR__ __HGGCCC_VER_BUILD__\n'
+            ),
+            text=True,
+            timeout=10,
+        )
+        major, minor, build = map(int, output.rsplit('PPU_VERSION', 1)[1].split())
+        return (major, minor, build)
     except Exception:
         pass
     return (0, 0, 0)
