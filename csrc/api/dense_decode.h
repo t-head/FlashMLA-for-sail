@@ -270,6 +270,7 @@ dense_attn_decode_interface(
     at::Tensor out_accum = torch::empty({batch_size + params.num_sm_parts, num_heads, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
     params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
     params.oaccum_ptr = out_accum.data_ptr();
+    params.oaccum_head_stride = out_accum.stride(1);
 
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
 

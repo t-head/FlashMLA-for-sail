@@ -77,6 +77,7 @@ struct Flash_fwd_params {
     int64_t *__restrict__ hllm_block_table;
     void * workspace_ptr;
     size_t max_workspace_size;
+    index_t oaccum_head_stride;
 };
 
 using Flash_fwd_mla_params = Flash_fwd_params;
