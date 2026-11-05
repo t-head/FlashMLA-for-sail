@@ -18,8 +18,7 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params &params, hggcStream_t strea
 void get_mla_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
 
 namespace flashmla::dsa::hs64 {
-void run_v41_packed_page_direct_mtp(Flash_fwd_params &, hggcStream_t);
-void run_v41_packed_page_direct_ragged(Flash_fwd_params &, hggcStream_t);
+void run_v41_packed_page_decode(Flash_fwd_params &, hggcStream_t);
 }
 
 static bool use_v41_packed_h64(const Flash_fwd_params &p) {
@@ -462,10 +461,7 @@ sparse_attn_decode_interface(
     // TORCH_CHECK(head_size == 576);
 
     if (packed_h64) {
-        if (params.topk == 256)
-            flashmla::dsa::hs64::run_v41_packed_page_direct_ragged(params, stream);
-        else
-            flashmla::dsa::hs64::run_v41_packed_page_direct_mtp(params, stream);
+        flashmla::dsa::hs64::run_v41_packed_page_decode(params, stream);
     } else if (is_fp8) {
         if (head_size == 576) {
             run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 576, 512, false>(params, stream);

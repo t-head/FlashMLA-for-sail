@@ -6435,6 +6435,28 @@ static void run_flash_sparse_decode_wg_kernel_hs64_arch(
     }
 }
 
+void run_flash_sparse_decode_wg_kernel_hs64(
+    Flash_fwd_params &params, hggcStream_t stream,
+    bool is_v41_fp8, bool is_extra_fp4) {
+    if (is_v41_fp8) {
+        FLASH_ASSERT(params.d == 512 && params.ngroups == 64 && params.q_orig > 1);
+        if (is_extra_fp4) {
+            run_flash_sparse_decode_wg_kernel_hs64_hdim<512, true, 89, true, true>(
+                params, stream);
+        } else {
+            run_flash_sparse_decode_wg_kernel_hs64_hdim<512, true, 89, true, false>(
+                params, stream);
+        }
+        return;
+    }
+    const auto [major, minor] = get_compute_capability(get_current_device());
+    if (major > 8 || (major == 8 && minor >= 9)) {
+        run_flash_sparse_decode_wg_kernel_hs64_arch<89>(params, stream);
+    } else {
+        run_flash_sparse_decode_wg_kernel_hs64_arch<80>(params, stream);
+    }
+}
+
 template<int HeadDim, int Arch, bool GroupQueries, bool MultiHeadTiles>
 static void launch_sparse_prefill_hs64(SparsePrefillParams &params) {
     using T = Hs64PrefillTraits<HeadDim, Arch, GroupQueries, MultiHeadTiles>;
