@@ -5,6 +5,7 @@
 #include "dense_decode.h"
 #include "sparse_quantized.h"
 #include "sparse_fwd.h"
+#include "fused_norm_rope_attn_rope_cast_fwd.h"
 #ifdef FLASHMLA_C_ENABLE_DECODE_SPARSE
 #include "sparse_decode.h"
 #endif
@@ -47,6 +48,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_decode_fwd", &sparse_attn_decode_interface);
 #endif
     m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface);
+    m.def("fused_norm_rope_attn_rope_cast_fwd", &fused_norm_rope_attn_rope_cast_fwd);
+    m.def("fused_norm_rope_attn_rope_cast_decode", &fused_norm_rope_attn_rope_cast_decode);
+    m.def("permute_q_b_proj", &permute_q_b_proj);
+    m.def("permute_wv_proj", &permute_wv_proj);
 }
 
 #else
@@ -66,6 +71,15 @@ TORCH_LIBRARY(_flashmla_C, m) {
 
     m.def("sparse_prefill_fwd", make_pytorch_shim(&sparse_attn_prefill_interface));
     m.impl("sparse_prefill_fwd", torch::kCUDA, make_pytorch_shim(&sparse_attn_prefill_interface));
+
+    m.def("fused_norm_rope_attn_rope_cast_fwd", make_pytorch_shim(&fused_norm_rope_attn_rope_cast_fwd));
+    m.impl("fused_norm_rope_attn_rope_cast_fwd", torch::kCUDA, make_pytorch_shim(&fused_norm_rope_attn_rope_cast_fwd));
+    m.def("fused_norm_rope_attn_rope_cast_decode", make_pytorch_shim(&fused_norm_rope_attn_rope_cast_decode));
+    m.impl("fused_norm_rope_attn_rope_cast_decode", torch::kCUDA, make_pytorch_shim(&fused_norm_rope_attn_rope_cast_decode));
+    m.def("permute_q_b_proj", make_pytorch_shim(&permute_q_b_proj));
+    m.impl("permute_q_b_proj", torch::kCUDA, make_pytorch_shim(&permute_q_b_proj));
+    m.def("permute_wv_proj", make_pytorch_shim(&permute_wv_proj));
+    m.impl("permute_wv_proj", torch::kCUDA, make_pytorch_shim(&permute_wv_proj));
 }
 
 PyMODINIT_FUNC PyInit__flashmla_C() {

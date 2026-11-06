@@ -64,6 +64,26 @@ __forceinline__ __device__ uint4 fp8_words_to_scaled_bf16x8_bits(
     return uint4{out_bits[0], out_bits[1], out_bits[2], out_bits[3]};
 }
 
+template<typename T>
+__forceinline__ __device__ uint4 fp8_words_to_scaled_bf16x8_bits(
+        uint32_t first_word, uint32_t second_word, __nv_bfloat162 scale2) {
+    if constexpr(T::kFusedNativeDecode) {
+        return T::fp8_words_to_scaled_bf16x8_bits(first_word, second_word, scale2);
+    } else {
+        return fp8_words_to_scaled_bf16x8_bits(
+            first_word, second_word, __bfloat162float(__low2bfloat16(scale2)));
+    }
+}
+
+template<typename T>
+__forceinline__ __device__ uint4 quant_cache_fp4_word_to_bf16x2_bits(uint32_t word) {
+    if constexpr(T::kFusedNativeDecode) {
+        return T::fp4_word_to_bf16x2_bits(word);
+    } else {
+        return flash::fp4_word_to_bf16x2_bits(word);
+    }
+}
+
 struct V41RowAddress32 {
     uint32_t row_payload_offset;
     uint32_t scale_delta;
@@ -172,7 +192,7 @@ __forceinline__ __device__ void quant_cache_fp4_async_finish(RawK &raw_sK,int ti
             const uint32_t words[2]={packed.x,packed.y};
             #pragma unroll
             for(int half=0;half<2;++half) {
-                const uint4 word_bits=flash::fp4_word_to_bf16x2_bits(words[half]);
+                const uint4 word_bits=quant_cache_fp4_word_to_bf16x2_bits<T>(words[half]);
                 const uint32_t decoded[4]={word_bits.x,word_bits.y,word_bits.z,word_bits.w};
                 uint32_t out_bits[4]{};
                 #pragma unroll
@@ -245,9 +265,8 @@ __forceinline__ __device__ void quant_cache_load_fp8(
                 const uint32_t words[4]={packed.x,packed.y,packed.z,packed.w};
                 #pragma unroll
                 for(int half=0;half<2;++half) {
-                    const uint4 out_bits = fp8_words_to_scaled_bf16x8_bits(
-                        words[half * 2], words[half * 2 + 1],
-                        __bfloat162float(__low2bfloat16(scale2)));
+                    const uint4 out_bits = fp8_words_to_scaled_bf16x8_bits<T>(
+                        words[half * 2], words[half * 2 + 1], scale2);
                     const int pos=(half==0?first_chunk:second_chunk)+group*4096;
                     *reinterpret_cast<uint4*>(dst+pos)=out_bits;
                 }
@@ -293,9 +312,8 @@ __forceinline__ __device__ void quant_cache_load_fp8(
                 const uint32_t words[4]={packed.x,packed.y,packed.z,packed.w};
                 #pragma unroll
                 for(int half=0;half<2;++half) {
-                    const uint4 out_bits = fp8_words_to_scaled_bf16x8_bits(
-                        words[half * 2], words[half * 2 + 1],
-                        __bfloat162float(__low2bfloat16(scale2)));
+                    const uint4 out_bits = fp8_words_to_scaled_bf16x8_bits<T>(
+                        words[half * 2], words[half * 2 + 1], scale2);
                     const int pos=(half==0?first_chunk:second_chunk)+group*4096;
                     *reinterpret_cast<uint4*>(dst+pos)=out_bits;
                 }
@@ -444,7 +462,7 @@ __forceinline__ __device__ void quant_cache_fp4_register_finish(RawK &raw_sK,int
             const uint32_t words[2]={packed.x,packed.y};
             #pragma unroll
             for(int half=0;half<2;++half) {
-                const uint4 word_bits=flash::fp4_word_to_bf16x2_bits(words[half]);
+                const uint4 word_bits=quant_cache_fp4_word_to_bf16x2_bits<T>(words[half]);
                 const uint32_t decoded[4]={word_bits.x,word_bits.y,word_bits.z,word_bits.w};
                 uint32_t out_bits[4]{};
                 #pragma unroll
@@ -493,9 +511,8 @@ __forceinline__ __device__ void quant_cache_fp8_register_finish(
                 const uint32_t words[4]={packed.x,packed.y,packed.z,packed.w};
                 #pragma unroll
                 for(int half=0;half<2;++half) {
-                    const uint4 out_bits = fp8_words_to_scaled_bf16x8_bits(
-                        words[half * 2], words[half * 2 + 1],
-                        __bfloat162float(__low2bfloat16(scale2)));
+                    const uint4 out_bits = fp8_words_to_scaled_bf16x8_bits<T>(
+                        words[half * 2], words[half * 2 + 1], scale2);
                     const int pos=(half==0?first_chunk:second_chunk)+group*4096;
                     *reinterpret_cast<uint4*>(dst+pos)=out_bits;
                 }
@@ -1512,6 +1529,11 @@ __forceinline__ __device__ void wg0_bunch_0(
     CUTLASS_PRAGMA_UNROLL
     for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
         int row_idx = get_AorC_row_idx<T::kAtomLayoutM>(local_row_idx, idx_in_warpgroup);
+        const float row_scale = [&]() {
+            if constexpr(T::kV41PairedPipeline) return T::score_scale(scale_softmax_log2, row_idx);
+            else return scale_softmax_log2;
+        }();
+        const float scale_softmax_log2 = row_scale;
 
         // Mask, and get row-wise max
         float cur_max = MAX_INIT_VAL;
@@ -1581,6 +1603,11 @@ __forceinline__ __device__ auto wg1_bunch_0(
     CUTLASS_PRAGMA_UNROLL
     for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
         int row_idx = get_AorC_row_idx<T::kAtomLayoutM>(local_row_idx, idx_in_warpgroup);
+        const float row_scale = [&]() {
+            if constexpr(T::kV41PairedPipeline) return T::score_scale(scale_softmax_log2, row_idx);
+            else return scale_softmax_log2;
+        }();
+        const float scale_softmax_log2 = row_scale;
 
         float cur_max;
         if (r_cur_max_in) {
@@ -1721,6 +1748,13 @@ __forceinline__ __device__ void wg1_bunch_0_pre(
         }
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
+        const float row_scale = [&]() {
+            if constexpr(T::kV41PairedPipeline) {
+                const int row_idx = get_AorC_row_idx<T::kAtomLayoutM>(local_row_idx, idx_in_warpgroup);
+                return T::score_scale(scale_softmax_log2, row_idx);
+            } else return scale_softmax_log2;
+        }();
+        const float scale_softmax_log2 = row_scale;
         r_cur_max[local_row_idx] = cur_max * scale_softmax_log2;
     }
     }
@@ -3403,11 +3437,20 @@ __forceinline__ __device__ void wg_init_copy_barriers(
     }
 }
 
+template<typename T, bool Paired = T::kV41PairedPipeline>
+struct SparseDecodeWGKernelParams {
+    using Type = Flash_fwd_mla_params;
+};
+template<typename T>
+struct SparseDecodeWGKernelParams<T, true> {
+    using Type = typename T::KernelParams;
+};
+
 // Both cache policies launch the original WG kernel. The paired policy
 // keeps its task scheduler and load pipeline, and shares the tile math above.
 template<typename T>
 __global__ void __launch_bounds__(T::NUM_THREADS, 1, 1)
-flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params params);
+flash_sparse_decode_wg_kernel(__grid_constant__ const typename SparseDecodeWGKernelParams<T>::Type params);
 
 namespace flashmla::dsa::v41 {
 using namespace cute;
@@ -3866,7 +3909,12 @@ sparse_wi_tile_driver(const typename T::Params &params, int m_block_idx) {
 
     bool cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
     // Copy the first Q
-    launch_sparse_decode_v41_q<T>(params, m_block_idx, sQ, tidx, warp_idx, barrier_Q);
+    int fused_q_position = 0;
+    if constexpr(T::kFusedNativeDecode) {
+        fused_q_position = T::template issue_q<T>(params, m_block_idx, sQ, tidx, warp_idx, barrier_Q);
+    } else {
+        launch_sparse_decode_v41_q<T>(params, m_block_idx, sQ, tidx, warp_idx, barrier_Q);
+    }
 
     // Copy K0 and K1
 
@@ -3939,6 +3987,9 @@ sparse_wi_tile_driver(const typename T::Params &params, int m_block_idx) {
         kernel_sleep_ns();
     }
     cur_phase_Q = (cur_phase_Q + 1) & 1;
+    if constexpr(T::kFusedNativeDecode) {
+        T::template finish_q<T>(params, sQ, tidx, fused_q_position);
+    }
 
     static_assert(!T::kCacheLastQ);
     Tensor rQ8 = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
@@ -4141,6 +4192,13 @@ sparse_wi_tile_driver(const typename T::Params &params, int m_block_idx) {
         pre_sink1 = __ldg(params.attn_sink + head_block_idx * T::BLOCK_SIZE_M + my_row + 8);
     }
     wg_reduce_softmax_sums<T>(rL, sL_reduction_wksp, my_row, warpgroup_idx, idx_in_warpgroup);
+    if constexpr(T::kFusedNativeDecode) {
+        if(!params.partial_output) {
+            using FusedConfig = typename T::FusedConfig;
+            FusedConfig::template store_output<T>(params, rO, plan, warpgroup_idx, idx_in_warpgroup);
+            return;
+        }
+    }
 
     // Apply attention sink: adjust rL to account for the sink term in the normalization denominator.
     // rL_adjusted = rL + exp2f(sink_log2 - sM[row])
@@ -4172,8 +4230,13 @@ sparse_wi_tile_driver(const typename T::Params &params, int m_block_idx) {
         if(threadIdx.x<num_valid_seq_q) {
             const int row=threadIdx.x;
             const float cur_L=sL_reduction_wksp[row];
-            static_cast<float*>(params.lse)[m_block_idx*T::kBlockM+row]=
-                (cur_L==0.0f || cur_L!=cur_L)?-INFINITY:log2f(cur_L)+sM(row);
+            if constexpr(T::kFusedNativeDecode) {
+                static_cast<float*>(params.lse)[m_block_idx*T::kBlockM+row]=
+                    (cur_L==0.0f || cur_L!=cur_L)?-INFINITY:(log2f(cur_L)+sM(row))*float(M_LN2);
+            } else {
+                static_cast<float*>(params.lse)[m_block_idx*T::kBlockM+row]=
+                    (cur_L==0.0f || cur_L!=cur_L)?-INFINITY:log2f(cur_L)+sM(row);
+            }
         }
         __syncthreads();
         store_o<T,false>(rO,gOAccum,rL,sO_addr,num_valid_seq_q,warpgroup_idx,idx_in_warpgroup);
@@ -4306,8 +4369,9 @@ struct SparseDecodeV41ScopeTraits : T {
     static constexpr bool kFP4Cache=FP4;
 };
 
+template<typename TileParams>
 __forceinline__ __device__ SparseDecodeV41CacheParams sparse_decode_v41_cache_scope(
-        const SparseDecodeV41TileParams &params,int block_idx) {
+        const TileParams &params,int block_idx) {
     const bool extra=block_idx*32>=params.main_padded_length;
     SparseDecodeV41CacheParams scope{};
     scope.kv=extra?params.extra_kv:params.kv;
@@ -4589,7 +4653,7 @@ __forceinline__ __device__ bool sparse_decode_v41_row_allvalid_scan32(
 
 template<typename T, bool FullLengths = false>
 __forceinline__ __device__ bool sparse_decode_v41_task_allvalid(
-        const Flash_fwd_params &p,const SparseDecodeV41TileParams &task) {
+        const typename T::KernelParams &p,const typename T::Params &task) {
     static_assert(!FullLengths || (T::kLengthGuardAllowed && T::kTaskAllValidGuard));
     constexpr int kWarps=T::NUM_THREADS/32;
     constexpr size_t flags_base=(sizeof(typename T::SharedMemoryPlan)+alignof(int)-1)
@@ -4651,8 +4715,8 @@ __forceinline__ __device__ bool sparse_decode_v41_task_allvalid(
     return __builtin_ppu_to_uniform_b32(task_valid)!=0;
 }
 template<typename T>
-__forceinline__ __device__ SparseDecodeV41TileParams make_sparse_decode_v41_task(
-    const Flash_fwd_params &p,const int4 &schedule,int first_split,int batch,int query) {
+__forceinline__ __device__ typename T::Params make_sparse_decode_v41_task(
+    const typename T::KernelParams &p,const int4 &schedule,int first_split,int batch,int query) {
     const int main_length=p.topk_len_ptr?__ldg(p.topk_len_ptr+batch):p.topk;
     const int extra_length=p.extra_topk>=0
         ?(p.extra_topk_len_ptr?__ldg(p.extra_topk_len_ptr+batch):p.extra_topk):0;
@@ -4663,7 +4727,7 @@ __forceinline__ __device__ SparseDecodeV41TileParams make_sparse_decode_v41_task
     const bool no_split=start==0 && end==total/32;
     const int split=p.num_splits_ptr[batch]+(batch==schedule.x?first_split:0);
 
-    SparseDecodeV41TileParams task{};
+    typename T::Params task{};
     task.s_q=1; task.s_kv=p.num_blocks*p.page_block_size;
     task.h_q=p.ngroups; task.d_qk=p.d;
     task.topk=total; task.sm_scale_div_log2=p.scale_softmax_log2;
@@ -4693,14 +4757,22 @@ __forceinline__ __device__ SparseDecodeV41TileParams make_sparse_decode_v41_task
             +int64_t(query)*p.ngroups*T::kHeadDimV;
         task.lse=static_cast<float*>(p.softmax_lseaccum_ptr)+int64_t(split)*p.seqlen_q+int64_t(query)*p.ngroups;
     }
+    if constexpr(T::kFusedNativeDecode) {
+        task.fused=&p.fused;
+        task.token_idx=batch;
+        task.real_heads=128;
+        task.h_kv=1; task.d_v=p.d_v; task.sm_scale=p.scale_softmax;
+        task.q=const_cast<cutlass::bfloat16_t*>(static_cast<const cutlass::bfloat16_t*>(p.fused.q))
+            +int64_t(batch)*p.fused.stride_q_s_q;
+    }
     return task;
 }
 
 template<typename T, bool FullLengths = false>
 __forceinline__ __device__ void run_sparse_decode_v41_task(
-        const Flash_fwd_params &p,const int4 &schedule,int first_split,
+        const typename T::KernelParams &p,const int4 &schedule,int first_split,
         int batch,int query,int head_tile) {
-    SparseDecodeV41TileParams task = make_sparse_decode_v41_task<T>(
+    typename T::Params task = make_sparse_decode_v41_task<T>(
         p,schedule,first_split,batch,query);
     if constexpr(T::kTaskAllValidGuard) {
         const bool task_allvalid=sparse_decode_v41_task_allvalid<T,FullLengths>(p,task);
@@ -4727,7 +4799,7 @@ __forceinline__ __device__ void run_sparse_decode_v41_task(
 
 struct SparseDecodeV41Scheduler {
     template<typename T>
-    static __forceinline__ __device__ void run(const Flash_fwd_params &p) {
+    static __forceinline__ __device__ void run(const typename T::KernelParams &p) {
         const int partition=blockIdx.z;
         const int tile=blockIdx.x;
         const int head_tiles=p.ngroups/T::kBlockM;
@@ -4747,7 +4819,7 @@ struct SparseDecodeV41Scheduler {
 
 struct SparseDecodeV41DirectScheduler {
     template<typename T>
-    static __forceinline__ __device__ void run(const Flash_fwd_params &p) {
+    static __forceinline__ __device__ void run(const typename T::KernelParams &p) {
         const int64_t ordinal=int64_t(blockIdx.z);
         const int tile=blockIdx.x;
         const int head_tiles=p.ngroups/T::kBlockM;
@@ -4782,7 +4854,7 @@ struct SparseDecodeV41DirectScheduler {
 
 struct SparseDecodeV41BoundedPrefixScheduler {
     template<typename T>
-    static __forceinline__ __device__ void run(const Flash_fwd_params &p) {
+    static __forceinline__ __device__ void run(const typename T::KernelParams &p) {
         const int64_t ordinal=int64_t(blockIdx.z);
         const int tile=blockIdx.x;
         const int head_tiles=p.ngroups/T::kBlockM;
@@ -4830,7 +4902,7 @@ struct SparseDecodeV41BoundedPrefixScheduler {
 };
 
 template<typename T>
-void launch_sparse_decode_wg_v41_main(Flash_fwd_params &p,hggcStream_t stream) {
+void launch_sparse_decode_wg_v41_main(typename T::KernelParams &p,hggcStream_t stream) {
     auto kernel=&::flash_sparse_decode_wg_kernel<T>;
     constexpr size_t bytes=std::max(sizeof(typename T::SharedMemoryPlan),sizeof(typename T::SharedMemoryOutPut));
     static_assert(bytes==262144 && sizeof(typename T::SharedMemoryPlan)==248880);
@@ -4987,7 +5059,7 @@ void launch_sparse_decode_wg_v41(Flash_fwd_params &p,hggcStream_t stream) {
 // expresses causal masking via indices, not via traditional causal mask path.
 template<typename T>
 __global__ void __launch_bounds__(T::NUM_THREADS, 1, 1)
-flash_sparse_decode_wg_kernel(__grid_constant__ const Flash_fwd_mla_params params) {
+flash_sparse_decode_wg_kernel(__grid_constant__ const typename SparseDecodeWGKernelParams<T>::Type params) {
     if constexpr (T::kV41PairedPipeline) {
         static_assert(T::kDecode && T::Arch_value == 89 && T::kUsePairedCubes && T::kHeadDim == 512);
         using Scheduler = typename T::Scheduler;

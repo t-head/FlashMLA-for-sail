@@ -30,6 +30,8 @@ using cutlass::arch::NamedBarrier;
 
 #include "kerutils/device/ppu/dequant.cuh"
 
+namespace flashmla::sparse_prefill {
+
 static constexpr float MAX_INIT_VAL_SM = -1e30f;
 static constexpr float MAX_INIT_VAL = -1e33f;
 
@@ -374,7 +376,7 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_qkt_gemm(
     Tensor thr_mma_sKV1_tiled = smem_thr_copy_K.partition_S(sKV1_tiled);
 #endif
 
-    #define QKT_GEMM_ONE_TILE(TILE_IDX) \
+    #define PREFILL_WG_QKT_GEMM_ONE_TILE(TILE_IDX) \
         if constexpr(T::kCacheLastQ && TILE_IDX == T::NUM_TILES - 1) { \
             qkt_gemm_one_tile_rQ(tiled_mma, smem_tiled_copy_K, smem_thr_copy_K, \
                     rQ8, sKV1_tiled(_, _, Int<TILE_IDX>{}), thr_mma_sKV1_tiled(_, _, _, Int<TILE_IDX>{}), \
@@ -400,31 +402,31 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_qkt_gemm(
             kernel_sleep_ns();
         };
 
-        QKT_GEMM_ONE_TILE(0);
-        QKT_GEMM_ONE_TILE(1);
-        QKT_GEMM_ONE_TILE(2);
-        QKT_GEMM_ONE_TILE(3);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(0);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(1);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(2);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(3);
     } else if constexpr (PHASE_IDX == 1) {
         // In PHASE-1, warpgroup 1 calculates Q K^T for all the NUM_TILES tiles
         while (!cutlass::arch::test_wait(&barriers[1], cur_phase, 1)) {
             kernel_sleep_ns();
         };
 
-        QKT_GEMM_ONE_TILE(4);
-        QKT_GEMM_ONE_TILE(5);
-        QKT_GEMM_ONE_TILE(6);
-        QKT_GEMM_ONE_TILE(7);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(4);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(5);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(6);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(7);
         if constexpr (T::NUM_TILES > 8) {
-            QKT_GEMM_ONE_TILE(8);
+            PREFILL_WG_QKT_GEMM_ONE_TILE(8);
         }
 
         while (!cutlass::arch::test_wait(&barriers[0], cur_phase, 1)) {
             kernel_sleep_ns();
         };
-        QKT_GEMM_ONE_TILE(0);
-        QKT_GEMM_ONE_TILE(1);
-        QKT_GEMM_ONE_TILE(2);
-        QKT_GEMM_ONE_TILE(3);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(0);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(1);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(2);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(3);
         cur_phase = (cur_phase + 1) & 1;
     } else {
         // In PHASE-2, warpgroup 0 calculates Q K^T for the last (NUM_TILES - 4) tiles
@@ -434,12 +436,12 @@ __forceinline__ __device__ void dsa_warpgroup_cooperative_qkt_gemm(
             kernel_sleep_ns();
         };
 
-        QKT_GEMM_ONE_TILE(4);
-        QKT_GEMM_ONE_TILE(5);
-        QKT_GEMM_ONE_TILE(6);
-        QKT_GEMM_ONE_TILE(7);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(4);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(5);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(6);
+        PREFILL_WG_QKT_GEMM_ONE_TILE(7);
         if constexpr (T::NUM_TILES > 8) {
-            QKT_GEMM_ONE_TILE(8);
+            PREFILL_WG_QKT_GEMM_ONE_TILE(8);
         }
         cur_phase = (cur_phase + 1) & 1;
     }
@@ -574,6 +576,7 @@ __forceinline__ __device__ auto wg0_bunch_0(
         CUTLASS_PRAGMA_UNROLL
         for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
             int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+            const float row_scale = T::score_scale(scale_softmax_log2, row_idx);
             // Mask, and get row-wise max
             float cur_max = MAX_INIT_VAL;
             CUTLASS_PRAGMA_UNROLL
@@ -592,7 +595,7 @@ __forceinline__ __device__ auto wg0_bunch_0(
             cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
 
             // Update sM and sL
-            cur_max *= scale_softmax_log2;
+            cur_max *= row_scale;
             float new_max = max(sM(row_idx), cur_max);
             float scale_for_old = exp2f(sM(row_idx) - new_max);
 
@@ -608,10 +611,10 @@ __forceinline__ __device__ auto wg0_bunch_0(
             float cur_sum = 0;
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 4 : 0; i < size(rP0); i += 8) {
-                rP0(i) = exp2f(rP0(i)*scale_softmax_log2 - new_max);
-                rP0(i+1) = exp2f(rP0(i+1)*scale_softmax_log2 - new_max);
-                rP0(i+2) = exp2f(rP0(i+2)*scale_softmax_log2 - new_max);
-                rP0(i+3) = exp2f(rP0(i+3)*scale_softmax_log2 - new_max);
+                rP0(i) = exp2f(rP0(i)*row_scale - new_max);
+                rP0(i+1) = exp2f(rP0(i+1)*row_scale - new_max);
+                rP0(i+2) = exp2f(rP0(i+2)*row_scale - new_max);
+                rP0(i+3) = exp2f(rP0(i+3)*row_scale - new_max);
                 cur_sum += (rP0(i) + rP0(i+1) + rP0(i+2) + rP0(i+3));
             }
 
@@ -624,6 +627,7 @@ __forceinline__ __device__ auto wg0_bunch_0(
         CUTLASS_PRAGMA_UNROLL
         for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
             int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+            const float row_scale = T::score_scale(scale_softmax_log2, row_idx);
 
             // Mask, and get row-wise max
             float cur_max = MAX_INIT_VAL;
@@ -640,7 +644,7 @@ __forceinline__ __device__ auto wg0_bunch_0(
             cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
 
             // Update sM and sL
-            cur_max *= scale_softmax_log2;
+            cur_max *= row_scale;
             float new_max = max(sM(row_idx), cur_max);
             float scale_for_old = exp2f(sM(row_idx) - new_max);
             __syncwarp();   // Make sure all reads have finished before updating sM
@@ -653,8 +657,8 @@ __forceinline__ __device__ auto wg0_bunch_0(
             float cur_sum = 0;
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
-                rP0(i) = exp2f(rP0(i)*scale_softmax_log2 - new_max);
-                rP0(i+1) = exp2f(rP0(i+1)*scale_softmax_log2 - new_max);
+                rP0(i) = exp2f(rP0(i)*row_scale - new_max);
+                rP0(i+1) = exp2f(rP0(i+1)*row_scale - new_max);
                 rPb(i) = (typename T::InputT)rP0(i);
                 rPb(i+1) = (typename T::InputT)rP0(i+1);
                 cur_sum += rP0(i) + rP0(i+1);
@@ -695,6 +699,7 @@ __forceinline__ __device__ auto wg1_bunch_0(
         for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx)
         {
             int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+            const float row_scale = T::score_scale(scale_softmax_log2, row_idx);
 
             const float cur_max = r_cur_max[local_row_idx];
 
@@ -716,10 +721,10 @@ __forceinline__ __device__ auto wg1_bunch_0(
                 CUTLASS_PRAGMA_UNROLL
                 for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8)
                 {
-                    rP1(i) = exp2f(rP1(i) * scale_softmax_log2 - new_max);
-                    rP1(i + 1) = exp2f(rP1(i + 1) * scale_softmax_log2 - new_max);
-                    rP1(i + 2) = exp2f(rP1(i + 2) * scale_softmax_log2 - new_max);
-                    rP1(i + 3) = exp2f(rP1(i + 3) * scale_softmax_log2 - new_max);
+                    rP1(i) = exp2f(rP1(i) * row_scale - new_max);
+                    rP1(i + 1) = exp2f(rP1(i + 1) * row_scale - new_max);
+                    rP1(i + 2) = exp2f(rP1(i + 2) * row_scale - new_max);
+                    rP1(i + 3) = exp2f(rP1(i + 3) * row_scale - new_max);
                     cur_sum += (rP1(i) + rP1(i + 1) + rP1(i + 2) + rP1(i + 3));
                 }
             }
@@ -737,6 +742,7 @@ __forceinline__ __device__ auto wg1_bunch_0(
         CUTLASS_PRAGMA_UNROLL
         for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
             int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+            const float row_scale = T::score_scale(scale_softmax_log2, row_idx);
 
             // Mask, and get row-wise max
             const float cur_max = r_cur_max[local_row_idx];
@@ -755,8 +761,8 @@ __forceinline__ __device__ auto wg1_bunch_0(
             if constexpr (!IS_BLK0_LAST) {
                 CUTLASS_PRAGMA_UNROLL
                 for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
-                    rP1(i) = exp2f(rP1(i)*scale_softmax_log2 - new_max);
-                    rP1(i+1) = exp2f(rP1(i+1)*scale_softmax_log2 - new_max);
+                    rP1(i) = exp2f(rP1(i)*row_scale - new_max);
+                    rP1(i+1) = exp2f(rP1(i+1)*row_scale - new_max);
                     rP1b(i) = (typename T::InputT)rP1(i);
                     rP1b(i+1) = (typename T::InputT)rP1(i+1);
                     cur_sum += rP1(i) + rP1(i+1);
@@ -819,6 +825,8 @@ __forceinline__ __device__ void dsa_wg1_bunch_0_pre(
     if constexpr (T::Arch_value == 80) {
         CUTLASS_PRAGMA_UNROLL
         for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+            const int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+            const float row_scale = T::score_scale(scale_softmax_log2, row_idx);
             float cur_max = MAX_INIT_VAL;
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 4 : 0; i < size(rP1); i += 8) {
@@ -838,11 +846,13 @@ __forceinline__ __device__ void dsa_wg1_bunch_0_pre(
             }
             cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
             cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
-            r_cur_max[local_row_idx] = cur_max * scale_softmax_log2;
+            r_cur_max[local_row_idx] = cur_max * row_scale;
         }
     } else {
         CUTLASS_PRAGMA_UNROLL
         for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+            const int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+            const float row_scale = T::score_scale(scale_softmax_log2, row_idx);
             float cur_max = MAX_INIT_VAL;
             CUTLASS_PRAGMA_UNROLL
             for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
@@ -857,7 +867,7 @@ __forceinline__ __device__ void dsa_wg1_bunch_0_pre(
             }
             cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
             cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
-            r_cur_max[local_row_idx] = cur_max * scale_softmax_log2;
+            r_cur_max[local_row_idx] = cur_max * row_scale;
         }
     }
 }
@@ -1339,7 +1349,7 @@ __forceinline__ __device__ void dsa_wg0_subroutine(
 
     // Retire V1L readers before the next iteration reuses their shared slot.
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST)
-        NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup0);
+        T::template sync_warpgroup<0>();
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST)
     {
@@ -1463,7 +1473,7 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
         if constexpr (T::kHeadDim == 512) {
             // Retire the previous V0R readers before reusing their shared slot.
             if (block_idx != 0)
-                NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup1);
+                T::template sync_warpgroup<1>();
         }
 #if DSA_SIM_AIU
         auto gmem_thr_copy_K = tiled_copy.get_thread_slice(sim_cross_tid);
@@ -1541,7 +1551,7 @@ __forceinline__ __device__ void dsa_wg1_subroutine(
 
     if constexpr (T::kHeadDim == 576 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
         // Retire V0R readers before the next iteration reuses their shared slot.
-        NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup1);
+        T::template sync_warpgroup<1>();
     }
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
@@ -1602,9 +1612,14 @@ __forceinline__ __device__ bool dsa_query_all_indices_valid(
     return all_valid;
 }
 
-template<typename T, bool Is_causal, bool EnableQueryValidation>
+template<typename T, bool Is_causal, bool EnableQueryValidation,
+         typename KernelParams = SparsePrefillParams>
 __global__ void __launch_bounds__(T::NUM_THREADS, 1, 1)
-flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams params) {
+flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const KernelParams params) {
+    constexpr bool kFusedH128 = !std::is_same_v<KernelParams, SparsePrefillParams>;
+    if constexpr (kFusedH128) {
+        static_assert(T::kFusedH128);
+    }
     const int m_block_idx = blockIdx.x;
     const int k_head_idx = blockIdx.y;
     const int warpgroup_idx = __builtin_ppu_to_uniform_b32(threadIdx.x / 256);
@@ -1664,7 +1679,12 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
         sM[threadIdx.x] = MAX_INIT_VAL_SM;
     const int seqlen_k = params.topk_length ? __ldg(params.topk_length + q_idx) : params.topk;
     __syncthreads();
-    launch_q_dsa_prefill_wg<T>(params, m_block_idx, sQ, tidx, warp_idx, barrier_Q);
+    [[maybe_unused]] int fused_q_position = 0;
+    if constexpr (kFusedH128) {
+        fused_q_position = T::issue_q(params, m_block_idx, sQ, tidx, warp_idx, barrier_Q);
+    } else {
+        launch_q_dsa_prefill_wg<T>(params, m_block_idx, sQ, tidx, warp_idx, barrier_Q);
+    }
     const bool query_all_valid = EnableQueryValidation &&
         dsa_query_all_indices_valid<T>(params, q_idx, seqlen_k, smem_valid_indices);
 
@@ -1750,7 +1770,7 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
             // between the prolog write and that read). WG0-only: does not couple the
             // WG0/WG1 arrive/wait skew, hence no cross-WG sync stall.
             if constexpr (!query_all_valid)
-                NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup0);
+                T::template sync_warpgroup<0>();
             if (start_block_idx + 2 < end_block_idx) {
                 dsa_compute_K_addr<T, true, query_all_valid>(params, gK_base, nxt_token_idx0, start_block_idx + 2, seqlen_k, idx_in_warpgroup,
                     smem_valid_indices, (start_block_idx/2+1)%2, precomp_ptr0, precomp_valid0);
@@ -1783,7 +1803,7 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
                 // exactly like WG0's mGroup0. WG1-only (256 threads): does not
                 // couple the WG0/WG1 arrive/wait skew, hence no cross-WG stall.
                 if constexpr (!query_all_valid)
-                    NamedBarrier::arrive_and_wait(T::NUM_THREADS/2, NamedBarriers::mGroup1);
+                    T::template sync_warpgroup<1>();
                 if (start_block_idx + 3 < end_block_idx) {
                     dsa_compute_K_addr<T, true, query_all_valid>(params, gK_base, nxt_token_idx1, start_block_idx + 3, seqlen_k, idx_in_warpgroup,
                         smem_valid_indices, 2+(start_block_idx/2+1)%2, precomp_ptr0, precomp_valid0);
@@ -1806,6 +1826,9 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
             kernel_sleep_ns();
         }
         cur_phase_Q = (cur_phase_Q + 1) & 1;
+        if constexpr (kFusedH128) {
+            T::finish_q(params, m_block_idx, sQ, tidx, fused_q_position);
+        }
 
         // rQ8 stores the last tile of Q (tile 8 for 576, tile 7 for 512) to leave smem room for sP0/sP1
         Tensor rQ8 = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
@@ -1828,7 +1851,7 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
             }
 
             int idx = 0;
-            #define DSA_LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
+            #define PREFILL_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
                 dsa_wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, query_all_valid>(                            \
                 gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
                 rP0, rO, rL,                   \
@@ -1840,14 +1863,14 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
 
             #pragma unroll 1
             for (; block_idx < end_block_idx-2; block_idx += 2) {
-                DSA_LAUNCH_WG0_SUBROUTINE(false, false);
+                PREFILL_WG0_SUBROUTINE(false, false);
             }
 
             // [Even-align] end_block_idx is always even, so the loop leaves exactly
             // one uniform 2-block tail; the IS_BLK0_LAST single-block branch is
             // unreachable and removed (mirrors decode's single tail form).
             if (block_idx < end_block_idx) {
-                DSA_LAUNCH_WG0_SUBROUTINE(false, true);
+                PREFILL_WG0_SUBROUTINE(false, true);
             }
         }
         else {
@@ -1862,7 +1885,7 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
             }
 
             int idx = 0;
-            #define DSA_LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
+            #define PREFILL_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST)                     \
                 dsa_wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, query_all_valid>(                            \
                 gmem_tiled_copy_K, tKgK, sQ, sK, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
                 rP1, rO, rL,                 \
@@ -1876,11 +1899,11 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
             // 2-block tail.
             #pragma unroll 1
             for (; block_idx < end_block_idx-2; block_idx += 2) {
-                DSA_LAUNCH_WG1_SUBROUTINE(false, false);
+                PREFILL_WG1_SUBROUTINE(false, false);
             }
 
             if (block_idx < end_block_idx) {
-                DSA_LAUNCH_WG1_SUBROUTINE(false, true);
+                PREFILL_WG1_SUBROUTINE(false, true);
             }
         }
 
@@ -1917,6 +1940,11 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
             __syncwarp();
             rL[0] = sL_reduction_wksp[my_row];
             rL[1] = sL_reduction_wksp[my_row + 8];
+        }
+
+        if constexpr (kFusedH128) {
+            T::store_output(params, rO, plan, warpgroup_idx, idx_in_warpgroup);
+            return;
         }
 
         // Prune out when rL is 0.0f or NaN
@@ -1982,6 +2010,14 @@ flash_sparse_prefill_fwd_wg_kernel(__grid_constant__ const SparsePrefillParams p
         run_query_body(cute::false_type{});
 
 }
+
+#undef PREFILL_WG_QKT_GEMM_ONE_TILE
+#undef PREFILL_WG0_SUBROUTINE
+#undef PREFILL_WG1_SUBROUTINE
+
+} // namespace flashmla::sparse_prefill
+
+using flashmla::sparse_prefill::flash_sparse_prefill_fwd_wg_kernel;
 
 template<typename InputT, int Arch, int HEAD_DIM>
 void run_flash_sparse_prefill_fwd_wg(SparsePrefillParams &params) {
