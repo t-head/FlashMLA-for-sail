@@ -83,7 +83,7 @@ inline bool sparse_decode_hs64_v41_supported(
     const auto pow2 = [](int size) { return size > 0 && (size & (size - 1)) == 0; };
     constexpr int64_t max_index_stride = std::numeric_limits<int>::max();
     // The API already validates D512/Hkv1 for V4.1.
-    return p.ngroups == 64 && p.q_orig > 1 && p.num_sm_parts > 0 &&
+    return p.ngroups == 64 && p.q_orig > 0 && p.num_sm_parts > 0 &&
            pow2(p.page_block_size) &&
            p.indices_row_stride >= 0 && p.indices_row_stride <= max_index_stride &&
            sparse_decode_hs64_v41_cache_range_supported(
