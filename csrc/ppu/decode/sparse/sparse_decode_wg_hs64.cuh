@@ -104,13 +104,22 @@ namespace flashmla::dsa::hs64 {
 enum class Hs64Worklist { Single, Batch, Flat };
 template<int MainCapacity, Hs64Worklist Worklist>
 struct Hs64PackedDecode : Hs64Traits<512, true, 89, true, true> {};
+struct Hs64PackedFp8ExtraDecode : Hs64Traits<512, true, 89, true, false> {};
+template<int MainCapacity, Hs64Worklist W>
+struct Hs64PackedFp8ExtraWorklist : Hs64PackedFp8ExtraDecode {};
 
 template<typename T> inline constexpr int kPackedMain = 0;
 template<int MainCapacity, Hs64Worklist W>
 inline constexpr int kPackedMain<Hs64PackedDecode<MainCapacity, W>> = MainCapacity;
+template<> inline constexpr int kPackedMain<Hs64PackedFp8ExtraDecode> = 128;
+template<int MainCapacity, Hs64Worklist W>
+inline constexpr int kPackedMain<Hs64PackedFp8ExtraWorklist<MainCapacity, W>> = MainCapacity;
 template<typename T> inline constexpr Hs64Worklist kWorklist = Hs64Worklist::Single;
 template<int MainCapacity, Hs64Worklist W>
 inline constexpr Hs64Worklist kWorklist<Hs64PackedDecode<MainCapacity, W>> = W;
+template<> inline constexpr Hs64Worklist kWorklist<Hs64PackedFp8ExtraDecode> = Hs64Worklist::Flat;
+template<int MainCapacity, Hs64Worklist W>
+inline constexpr Hs64Worklist kWorklist<Hs64PackedFp8ExtraWorklist<MainCapacity, W>> = W;
 
 template<typename T> struct Hs64PackedExtraStep : T {};
 template<typename T> inline constexpr int kPackedMain<Hs64PackedExtraStep<T>> = kPackedMain<T>;
@@ -4861,7 +4870,7 @@ __forceinline__ __device__ void wg1_subroutine(
     }
 
     Hs64OddHighPacket packet{};
-    if constexpr (kPackedExtraStep<T>) {
+    if constexpr (kPackedExtraStep<T> && T::kExtraFP4) {
         packet = hs64_read_odd_high<T>(idx_in_warpgroup, precomp_ptr0, precomp_valid0);
         asm volatile("" :: "l"(packet.packed[0]), "l"(packet.packed[1]),
             "l"(packet.packed[2]), "l"(packet.packed[3]), "r"(unsigned(packet.scales[0])),
@@ -6439,7 +6448,7 @@ void run_flash_sparse_decode_wg_kernel_hs64(
     Flash_fwd_params &params, hggcStream_t stream,
     bool is_v41_fp8, bool is_extra_fp4) {
     if (is_v41_fp8) {
-        FLASH_ASSERT(params.d == 512 && params.ngroups == 64 && params.q_orig > 1);
+        FLASH_ASSERT(params.d == 512 && params.ngroups == 64 && params.q_orig > 0);
         if (is_extra_fp4) {
             run_flash_sparse_decode_wg_kernel_hs64_hdim<512, true, 89, true, true>(
                 params, stream);

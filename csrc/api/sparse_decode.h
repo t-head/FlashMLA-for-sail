@@ -21,12 +21,14 @@ namespace flashmla::dsa::hs64 {
 void run_v41_packed_page_decode(Flash_fwd_params &, hggcStream_t);
 }
 
+template<bool ExtraFP4 = true>
 static bool use_v41_packed_h64(const Flash_fwd_params &p) {
+    constexpr int extra_bytes = ExtraFP4 ? 288 : 528;
     const bool fixed_window = p.topk == 128 && p.page_block_size == 128;
     const bool ragged_window = p.topk == 256 && p.page_block_size == 256;
     if ((!fixed_window && !ragged_window) || p.ngroups != 64 || p.h != 1 ||
         p.d != 512 || p.d_v != 512 || p.extra_topk != 512 || p.extra_page_block_size != 64 ||
-        p.k_batch_stride != p.page_block_size * 528 || p.extra_k_batch_stride != 64 * 288 ||
+        p.k_batch_stride != p.page_block_size * 528 || p.extra_k_batch_stride != 64 * extra_bytes ||
         p.b <= 0 || p.b > 65535 || p.num_sm_parts <= 0)
         return false;
 
@@ -40,7 +42,8 @@ static bool use_v41_packed_h64(const Flash_fwd_params &p) {
         !flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
             p.num_blocks, p.page_block_size, 528, 8, p.k_batch_stride) ||
         !flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
-            p.extra_num_blocks, p.extra_page_block_size, 288, 4, p.extra_k_batch_stride))
+            p.extra_num_blocks, p.extra_page_block_size, extra_bytes,
+            ExtraFP4 ? 4 : 8, p.extra_k_batch_stride))
         return false;
 
     const auto *device = at::cuda::getCurrentDeviceProperties();
@@ -50,11 +53,25 @@ static bool use_v41_packed_h64(const Flash_fwd_params &p) {
         return fixed_window && (p.q_orig == 3 || p.q_orig == 4 || p.q_orig == 5) &&
                int64_t(p.b) * p.q_orig >= 2 * sm_count;
 
-    if (p.b < 2 * sm_count) return false;
-    const int tail = p.b % sm_count;
-    const int slots = ((p.b + sm_count - 1) / sm_count) * sm_count;
-    return p.b >= 16 * sm_count || tail == 0 || 3 * tail >= sm_count ||
-           (fixed_window && 8 * p.b >= 7 * slots);
+    return p.b >= 2 * sm_count;
+}
+
+static bool use_v41_packed_fp8_extra_h64(const Flash_fwd_params &p) {
+    const int sq = p.q_orig;
+    if (!(sq == 1 || sq == 3 || sq == 4 || sq == 5) || p.b <= 0 || p.b > 65535 / sq ||
+        p.seqlen_q != 64 * sq ||
+        p.o_row_stride < p.d_v || p.o_row_stride > std::numeric_limits<int>::max() ||
+        p.o_row_stride % 8 != 0 || !use_v41_packed_h64<false>(p))
+        return false;
+    if (sq == 1) return true;
+    const auto affine = [](int64_t batch_pitch, int64_t row_pitch, int rows) {
+        return batch_pitch > 0 && row_pitch > 0 &&
+               batch_pitch % rows == 0 && batch_pitch / rows == row_pitch;
+    };
+    return affine(p.q_batch_stride, p.q_row_stride, sq * 64) &&
+           affine(p.o_batch_stride, p.o_row_stride, sq * 64) &&
+           affine(p.indices_batch_stride, p.indices_row_stride, sq) &&
+           affine(p.extra_indices_batch_stride, p.extra_indices_row_stride, sq);
 }
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
@@ -416,8 +433,18 @@ sparse_attn_decode_interface(
         dense_vector(topk_length, batch_size) && dense_vector(extra_topk_length, batch_size) &&
         dense_vector(attn_sink, ngroups) &&
         use_v41_packed_h64(params);
+    const bool packed_fp8_extra_h64 = !enable_batch_invariant && is_v41_fp8 && !is_extra_fp4 &&
+        extra_kv && extra_indices &&
+        kv.device() == q.device() && extra_kv->device() == q.device() && out.device() == q.device() &&
+        indices.device() == q.device() && extra_indices->device() == q.device() &&
+        extra_indices->dim() == 3 && extra_indices->dtype() == torch::kInt32 &&
+        extra_indices->size(0) == batch_size && extra_indices->size(1) == seqlen_q_ori &&
+        extra_indices->stride(-1) == 1 &&
+        dense_vector(topk_length, batch_size) && dense_vector(extra_topk_length, batch_size) &&
+        dense_vector(attn_sink, ngroups) &&
+        use_v41_packed_fp8_extra_h64(params);
     at::Tensor hs64_metadata, hs64_num_splits;
-    if (!packed_h64 && is_v41_fp8 &&
+    if (!packed_h64 && !packed_fp8_extra_h64 && is_v41_fp8 &&
         flashmla::dsa::sparse_decode_hs64_v41_supported(params, is_extra_fp4) &&
         is_sm89_or_newer()) {
         if (params.b <= 4 && params.q_orig <= params.num_sm_parts) {
@@ -450,7 +477,7 @@ sparse_attn_decode_interface(
     //std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
     //    params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
     //    head_size, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
-    if (!enable_batch_invariant && !packed_h64) {
+    if (!enable_batch_invariant && !packed_h64 && !packed_fp8_extra_h64) {
         softmax_lse_accum = torch::empty({batch_size + params.num_sm_parts, num_heads, seqlen_q}, opts.dtype(at::kFloat));
         out_accum = torch::empty({batch_size + params.num_sm_parts, num_heads, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
         params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
@@ -460,7 +487,7 @@ sparse_attn_decode_interface(
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
     // TORCH_CHECK(head_size == 576);
 
-    if (packed_h64) {
+    if (packed_h64 || packed_fp8_extra_h64) {
         flashmla::dsa::hs64::run_v41_packed_page_decode(params, stream);
     } else if (is_fp8) {
         if (head_size == 576) {
