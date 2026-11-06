@@ -9,6 +9,7 @@ from flash_mla.flash_mla_interface import (
     flash_mla_sparse_quantized_decode_fwd,
 )
 
+from flash_mla import fused_norm_rope_attn_rope_cast
 from flash_mla_cuda import QuantizedAttentionConfig
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     "get_mla_metadata",
     "flash_mla_with_kvcache",
     "flash_mla_sparse_fwd",
+    "fused_norm_rope_attn_rope_cast",
 ]
