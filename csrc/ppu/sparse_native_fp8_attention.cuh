@@ -2,6 +2,68 @@
 
 #include <hggc_runtime.h>
 
+#include <algorithm>
+#include <cstdint>
+
+namespace flashmla::sparse_native_fp8 {
+
+inline constexpr int ValueDim = 512;
+inline constexpr int TileKeys = 64;
+inline constexpr int MaxTopk = 2048;
+inline constexpr int MaxVerifyQueries = 32;
+
+// Measured M890P reuse crossover for sparse FP8 gathers. This is a launch
+// policy budget, not a claim about physical cache capacity. Pools below it
+// benefit from narrower gathers and more resident CTAs; streaming pools favor
+// wider transactions and fewer competing CTAs.
+inline bool prefer_kv_reuse(int64_t working_bytes, int l2_bytes) {
+    constexpr int ReuseBudgetL2Multiple = 16;
+    return l2_bytes > 0 && working_bytes <= int64_t(l2_bytes) * ReuseBudgetL2Multiple;
+}
+
+// Keep at least four key tiles per partition while exposing roughly two
+// query/head CTAs per CU. Power-of-two splits bound the merge overhead.
+inline int choose_splits(int queries, int heads, int width, int compute_units) {
+    constexpr int MaxSplits = 8;
+    constexpr int MinTilesPerSplit = 4;
+    const int head_tile = heads <= 16 ? 16 : 32;
+    const int groups = (heads + head_tile - 1) / head_tile;
+    const int budget = std::min(MaxSplits, std::max(1, width / TileKeys / MinTilesPerSplit));
+    const int desired = std::min<int64_t>(
+        budget, std::max<int64_t>(1, 2LL * compute_units / (int64_t(queries) * groups)));
+    int splits = 1;
+    while (splits * 2 <= desired)
+        splits *= 2;
+    return splits;
+}
+
+// Full-Q H16 pipelines amortize short sparse lists without the older decode
+// schedule's partial-Q loads. Small grids still need independent key partitions:
+// use one N128 tile at very low occupancy, then four N64 pipeline partitions.
+inline int choose_short_h16_splits(int queries, int width, int compute_units) {
+    constexpr int MinSplitTiles = 8;
+    constexpr int PipelineSplits = 4;
+    if (width < MinSplitTiles * TileKeys || int64_t(queries) * 2 > compute_units)
+        return 1;
+    if (int64_t(queries) * 8 <= compute_units)
+        return (width + 2 * TileKeys - 1) / (2 * TileKeys);
+    return PipelineSplits;
+}
+
+// Small head tiles fit three double-buffered or two triple-buffered CTAs per
+// M890P CU. Compare complete waves using their measured relative tile costs.
+inline bool prefer_two_stages(int queries, int splits, int heads, int compute_units) {
+    const int64_t tasks = int64_t(queries) * splits;
+    const int64_t two_stage_wave = 3LL * compute_units;
+    const int64_t three_stage_wave = 2LL * compute_units;
+    constexpr int TwoStageCost = 10;
+    constexpr int ThreeStageCost = 8;
+    return heads <= 16 && ((tasks + two_stage_wave - 1) / two_stage_wave) * TwoStageCost <=
+                              ((tasks + three_stage_wave - 1) / three_stage_wave) * ThreeStageCost;
+}
+
+} // namespace flashmla::sparse_native_fp8
+
 namespace flashmla::sparse_native_fp8 {
 
 // One prepared request is passed through host routing to the final device launch.
@@ -73,15 +135,20 @@ void run_native_fp8_attention_verify(const flashmla::sparse_native_fp8::Attentio
 void run_native_fp8_attention_window(const flashmla::sparse_native_fp8::AttentionParams &params);
 void run_native_fp8_attention_merge(const flashmla::sparse_native_fp8::MergeParams &params);
 
-// Host C++ includes only launch contracts. Device implementation and the
+// Host C++ includes launch contracts and policy. Device implementation and the
 // actlize version override belong to HGGC translation units only.
 #ifdef __HGGCCC__
 
 // Shared native FP8 sparse attention for prefill, decode and verification:
 // E4M3 conversion, LSE storage, standard CTA kernels and WS pipeline components.
 
-#include "ppu/sparse_native_fp8_arch.h"
-#include "sparse_native_fp8_config.h"
+// Select native PPU0015 definitions before including any actlize headers.
+// This override is local to native FP8 translation units; existing kernels
+// retain the build's ACOMPUTE_VERSION=10000 configuration.
+#ifdef ACOMPUTE_VERSION
+#undef ACOMPUTE_VERSION
+#endif
+#define ACOMPUTE_VERSION 10500
 #include <hgrt/hggc_extend_device_functions.h>
 #include <hggc_bf16.h>
 #include <hggc_fp8.h>
