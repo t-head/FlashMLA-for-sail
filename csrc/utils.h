@@ -526,7 +526,7 @@ CUTLASS_DEVICE void permute_output_fp8(Fragment &out) {
 #endif
 }
 
-template<typename Kernel_traits, bool Split, bool CrossCut = false, bool IsSparse = false, typename AccO, typename Softmax>
+template<typename Kernel_traits, bool Split, bool CrossCut = false, bool IsSparse = false, bool UniqueLseWriter = false, typename AccO, typename Softmax>
 __forceinline__ __device__ void store(const Flash_fwd_params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
                                       __shared__ char* smem_,  AccO acc_o, Softmax softmax) {
 
@@ -622,9 +622,10 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
         // const int warp_id_m = (tidx / 32) % Kernel_traits::AtomLayoutQ;
         const int row_lse_base = warp_id % Kernel_traits::AtomLayoutQ * MMA_ATOM_M + (tidx % 32) / 4;
         const int warp_stride = MMA_ATOM_M * Kernel_traits::AtomLayoutQ;
-        if (warp_id < Kernel_traits::kNWarps0 &&
-            (!IsSparse || params.oaccum_ptr != nullptr ||
-             (warp_id < Kernel_traits::AtomLayoutQ && tidx % 4 == 0))) {
+        if (UniqueLseWriter ? (warp_id < Kernel_traits::AtomLayoutQ && tidx % 4 == 0)
+                            : (warp_id < Kernel_traits::kNWarps0 &&
+                               (!IsSparse || params.oaccum_ptr != nullptr ||
+                                (warp_id < Kernel_traits::AtomLayoutQ && tidx % 4 == 0)))) {
             #pragma unroll
             for (int mi = 0; mi < size(lse); ++mi) {
                 const int row = row_lse_base + (mi / MMA_ATOM_K_M) * warp_stride + (mi % MMA_ATOM_K_M) *8;

@@ -945,6 +945,10 @@ struct SparseDecodeV41BaseTraits : Traits_v2<cutlass::bfloat16_t, 512, true> {
 struct SparseDecodeV41Traits : SparseDecodeV41BaseTraits {
     // Select the V4.1 paired pipeline without enabling the legacy QK/PV variants.
     static constexpr bool kV41PairedPipeline = true;
+    static constexpr bool kFusedNativeDecode = false;
+    static __forceinline__ __device__ float score_scale(float scale, int) {
+        return scale;
+    }
     static constexpr int kAtomLayoutM = 8;
     static constexpr int kMmaThreads = 256;
     static constexpr bool kIsCrossCut = false;

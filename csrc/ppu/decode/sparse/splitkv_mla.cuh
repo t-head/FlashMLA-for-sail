@@ -11,6 +11,7 @@
 #include <cute/util/debug.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
+#include <type_traits>
 
 #include <c10/cuda/CUDAException.h>
 
@@ -29,6 +30,17 @@
 
 namespace flash {
 using namespace cute;
+
+template<typename P, typename = void>
+struct is_fused_splitkv : std::false_type {};
+template<typename P>
+struct is_fused_splitkv<P, std::void_t<decltype(P::kFusedSplitKV)>>
+    : std::bool_constant<P::kFusedSplitKV> {};
+template<typename P, typename = void>
+struct is_fused_splitkv_norm : std::false_type {};
+template<typename P>
+struct is_fused_splitkv_norm<P, std::void_t<decltype(P::kEnableNorm)>>
+    : std::bool_constant<is_fused_splitkv<P>::value && P::kEnableNorm> {};
 
 template<typename Kernel_traits, bool IsV41FP8, bool IsExtraFP4, typename Params>
 __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
@@ -63,8 +75,10 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 
     if (row_base >= params.seqlen_q) return;
 
-    constexpr bool RegisterFP4 = IsExtraFP4 && kBlockM <= 32;
-    using KVCacheGmemFP4 = KVCacheG2SFP4<kBlockN, Kernel_traits::kNThreads, RegisterFP4>;
+    constexpr bool kFusedSplitKV = is_fused_splitkv<Params>::value;
+    constexpr bool kFusedSplitKVNorm = is_fused_splitkv_norm<Params>::value;
+    constexpr bool RegisterFP4 = IsExtraFP4 && (kBlockM <= 32 || kFusedSplitKV);
+    using KVCacheGmemFP4 = KVCacheG2SFP4<kBlockN, Kernel_traits::kNThreads, RegisterFP4, kFusedSplitKV>;
     uint32_t* fp4_lut = nullptr;
     if constexpr (IsExtraFP4 && !RegisterFP4) {
         fp4_lut = reinterpret_cast<uint32_t*>(
@@ -123,6 +137,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     int page_block_size = params.page_block_size;
     ElementKVCache* k_ptr = gK_base;
     int real_block = n_block_min;
+    int idx_storage = kFusedSplitKV ? params.topk : 0;
 
     if constexpr (kHeadDim == 512) {
         if (n_block_min >= ori_block_max) {
@@ -133,13 +148,19 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
             row_stride = extra_row_stride;
             k_ptr = gExK_base;
             real_block = n_block_min - ori_block_max;
+            if constexpr (kFusedSplitKV) { idx_storage = params.extra_topk; }
         }
     }
 
     auto load_token = [&](const int block_idx) {
         // #pragma unroll
         // for (int v = 0; v < KVCacheGmem::kColPerGmemNope; v++)
-        nxt_token_idx = __ldg(gIndices_ptr + block_idx * kBlockN);
+        if constexpr (kFusedSplitKV) {
+            nxt_token_idx = block_idx * kBlockN + col_in_indices < idx_storage
+                ? __ldg(gIndices_ptr + block_idx * kBlockN) : -1;
+        } else {
+            nxt_token_idx = __ldg(gIndices_ptr + block_idx * kBlockN);
+        }
     };
 
     auto update_block = [&](const int block_idx) {
@@ -154,6 +175,16 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         }
         valid = (nxt_token_idx >= 0)
             & ((col_in_indices + block_idx * kBlockN) < topk_len);
+        if constexpr (kFusedSplitKV) {
+            const int64_t capacity = k_ptr == gExK_base
+                ? int64_t(params.extra_num_blocks) * params.extra_page_block_size
+                : int64_t(params.num_blocks) * params.page_block_size;
+            valid = valid && int64_t(nxt_token_idx) < capacity;
+            if (!valid) {
+                block_index = 0;
+                rel_idx_in_block = 0;
+            }
+        }
     };
 
     auto load_scale = [&](FragScale& scale) {
@@ -277,8 +308,12 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     // Allocate predicate tensors for k
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
 
-    flash::copy<false, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
-                params.ngroups - h_k_idx * kBlockM);
+    if constexpr (kFusedSplitKV) {
+        Params::template load_q<Kernel_traits, IsExtraFP4>(params, batch_id, h_k_idx, smem_, tidx);
+    } else {
+        flash::copy<false, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
+                    params.ngroups - h_k_idx * kBlockM);
+    }
 
     if constexpr (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
@@ -351,6 +386,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
                 real_block = n_block_min + 1 - ori_block_max;
                 topk_len = ext_klen;
                 page_block_size = extra_block_size;
+                if constexpr (kFusedSplitKV) { idx_storage = params.extra_topk; }
 
             }
         }
@@ -372,6 +408,10 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, AtomLayoutP, kNWarps0/AtomLayoutQ, ForceUseTsm> softmax;
 
     Tensor acc_s = partition_fragment_C(tiled_mma_s, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+    Tensor tSrRowScale = make_tensor<float>(Int<kFusedSplitKVNorm ? decltype(size(acc_s))::value : 1>{});
+    if constexpr (kFusedSplitKVNorm) {
+        Params::template load_row_scale<Kernel_traits, IsExtraFP4>(tSrRowScale, thr_mma_s, smem_);
+    }
     // update_block(n_block_min + 1);
 
     struct IsOrigBlock {};
@@ -404,11 +444,13 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
                 page_block_size = extra_block_size;
                 topk_len = ext_klen;
                 real_block = block_idx + 2 - ori_block_max;
+                if constexpr (kFusedSplitKV) { idx_storage = params.extra_topk; }
             } else {
                 if (kHeadDim == 512) {
                     if ((block_idx + 2) >= ori_block_max) {
                         gIndices_ptr = gExIndices;
                         real_block = block_idx + 2 - ori_block_max;
+                        if constexpr (kFusedSplitKV) { idx_storage = params.extra_topk; }
                     }
                 }
             }
@@ -467,6 +509,12 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 
             constexpr int MMA_N_S = kBlockN / decltype(typename Kernel_traits::TiledMmaS{}.template tile_size_mnk<1>())::value;
             const int warpN_idx = (warp_idx / AtomLayoutQ) * MMA_N_S;
+            if constexpr (kFusedSplitKVNorm) {
+                #pragma unroll
+                for (int i = 0; i < size(acc_s); ++i) {
+                    acc_s(i) *= tSrRowScale(i);
+                }
+            }
             flash::apply_indices_mask(acc_s, smem_valid_indices, warpN_idx, buf_idx);
 
             if constexpr (IS_FIRST_BLOCK) {
@@ -551,9 +599,13 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 
     // Epilogue
     if (NoSplit) {
-        flash::store<Kernel_traits, false, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+        if constexpr (kFusedSplitKV) {
+            Params::template store_output<Kernel_traits>(params, batch_id, h_k_idx, smem_, acc_o, softmax);
+        } else {
+            flash::store<Kernel_traits, false, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+        }
     } else {
-        flash::store<Kernel_traits, true, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+        flash::store<Kernel_traits, true, true, true, kFusedSplitKV>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
     }
 }
 
