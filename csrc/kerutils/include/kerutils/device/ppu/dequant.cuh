@@ -648,7 +648,7 @@ struct KVCacheG2SFP8 {
     }
 };
 
-template<int kBlockN, int kNThreads, bool RegisterDecode = false>
+template<int kBlockN, int kNThreads, bool RegisterDecode = false, bool FusedDecode = false>
 struct KVCacheG2SFP4 {
     using Base = KVCacheG2SFP8<kBlockN, kNThreads, 512, true>;
     using index_t = int64_t;
@@ -705,19 +705,41 @@ struct KVCacheG2SFP4 {
             + kBlockN * kDataBytesPerToken;
         const int lane_in_row = tidx % kThreadsPerRow;
         const int token = tidx / kThreadsPerRow;
-        uint64_t packed[kWideTiles];
-        uint8_t scale_raw[kWideTiles];
-        #pragma unroll
-        for (int w = 0; w < kWideTiles; ++w) {
-            packed[w] = sdata[tidx * kWideTiles + w];
-            scale_raw[w] = sscale[token * kScalesPerToken + w * kThreadsPerRow + lane_in_row];
-        }
-        __syncthreads();  // staging read done before in-place bf16 write clobbers it
-        #pragma unroll
-        for (int w = 0; w < kWideTiles; ++w) {
-            __hg_fp8_e4m3 scale_e4m3 = *reinterpret_cast<const __hg_fp8_e4m3*>(&scale_raw[w]);
-            fp4x16_to_bf16<RegisterDecode>(packed[w], tKrK_bf16(_, _, w), float(scale_e4m3), lut);
-            cute::copy(r2s_wide, tKrK_bf16(_, _, w), tKsK_bf16(_, _, w));
+        if constexpr (FusedDecode) {
+            static_assert(RegisterDecode);
+            const uint64_t packed0 = sdata[tidx * kWideTiles];
+            const uint64_t packed1 = sdata[tidx * kWideTiles + 1];
+            const uint64_t packed2 = sdata[tidx * kWideTiles + 2];
+            const uint64_t packed3 = sdata[tidx * kWideTiles + 3];
+            const uint8_t scale0 = sscale[token * kScalesPerToken + lane_in_row];
+            const uint8_t scale1 = sscale[token * kScalesPerToken + kThreadsPerRow + lane_in_row];
+            const uint8_t scale2 = sscale[token * kScalesPerToken + 2 * kThreadsPerRow + lane_in_row];
+            const uint8_t scale3 = sscale[token * kScalesPerToken + 3 * kThreadsPerRow + lane_in_row];
+            __syncthreads();
+            const auto store_tile = [&](uint64_t packed, uint8_t scale, auto tile) {
+                const __hg_fp8_e4m3 scale_e4m3 = *reinterpret_cast<const __hg_fp8_e4m3*>(&scale);
+                fp4x16_to_bf16<RegisterDecode>(packed, tKrK_bf16(_, _, tile), float(scale_e4m3), lut);
+                cute::copy(r2s_wide, tKrK_bf16(_, _, tile), tKsK_bf16(_, _, tile));
+            };
+            store_tile(packed0, scale0, Int<0>{});
+            store_tile(packed1, scale1, Int<1>{});
+            store_tile(packed2, scale2, Int<2>{});
+            store_tile(packed3, scale3, Int<3>{});
+        } else {
+            uint64_t packed[kWideTiles];
+            uint8_t scale_raw[kWideTiles];
+            #pragma unroll
+            for (int w = 0; w < kWideTiles; ++w) {
+                packed[w] = sdata[tidx * kWideTiles + w];
+                scale_raw[w] = sscale[token * kScalesPerToken + w * kThreadsPerRow + lane_in_row];
+            }
+            __syncthreads();  // staging read done before in-place bf16 write clobbers it
+            #pragma unroll
+            for (int w = 0; w < kWideTiles; ++w) {
+                __hg_fp8_e4m3 scale_e4m3 = *reinterpret_cast<const __hg_fp8_e4m3*>(&scale_raw[w]);
+                fp4x16_to_bf16<RegisterDecode>(packed[w], tKrK_bf16(_, _, w), float(scale_e4m3), lut);
+                cute::copy(r2s_wide, tKrK_bf16(_, _, w), tKsK_bf16(_, _, w));
+            }
         }
     }
 };

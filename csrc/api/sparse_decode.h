@@ -18,6 +18,7 @@ void run_sparse_decode_fwd_dispatch(Flash_fwd_params &params, hggcStream_t strea
 void get_mla_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
 
 namespace flashmla::dsa::hs64 {
+bool supports_v41_packed_flat_mtp(const Flash_fwd_params &, int extra_bytes);
 void run_v41_packed_page_decode(Flash_fwd_params &, hggcStream_t);
 }
 
@@ -49,6 +50,15 @@ static bool use_v41_packed_h64(const Flash_fwd_params &p) {
     const auto *device = at::cuda::getCurrentDeviceProperties();
     const int sm_count = device->multiProcessorCount;
     if (device->major != 8 || device->minor != 9 || sm_count != 39) return false;
+    if constexpr (ExtraFP4) {
+        if (p.q_orig == 2) {
+            // Only the flat view is enabled for Sq2. Keep the ordinary split
+            // path when Q, O, or either index tensor cannot be flattened.
+            return int64_t(p.b) * p.q_orig >= 2 * sm_count &&
+                   p.o_row_stride >= p.d_v && p.o_row_stride <= max_stride && p.o_row_stride % 8 == 0 &&
+                   flashmla::dsa::hs64::supports_v41_packed_flat_mtp(p, extra_bytes);
+        }
+    }
     if (p.q_orig != 1)
         return fixed_window && (p.q_orig == 3 || p.q_orig == 4 || p.q_orig == 5) &&
                int64_t(p.b) * p.q_orig >= 2 * sm_count;

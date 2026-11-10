@@ -3,6 +3,7 @@
 // /usr/local/cuda/include/cuda_math_constants.h
 #define CUDART_LN2_F 0.693147180559945309f
 
+namespace flashmla::sparse_prefill {
 namespace Config {
 
 static constexpr int BLOCK_SIZE_M = 128;
@@ -23,3 +24,4 @@ enum NamedBarriers : int {
     mGroup1 = 11,
     tma_copy_issued = 12
 };
+}

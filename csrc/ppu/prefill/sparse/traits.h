@@ -37,13 +37,24 @@ struct DSA_Traits {
     using ElementAccum = float;
     using index_t = int64_t;
 
-    static constexpr int BLOCK_SIZE_M = Config::BLOCK_SIZE_M;
-    static constexpr int PAGE_BLOCK_SIZE = Config::PAGE_BLOCK_SIZE;
-    static constexpr int kBlockM = Config::BLOCK_SIZE_M;
-    static constexpr int kBlockN = Config::BLOCK_SIZE_N;
+    static __forceinline__ __device__ float score_scale(float scale, int) {
+        return scale;
+    }
+
+    template<int Group>
+    static __forceinline__ __device__ void sync_warpgroup() {
+        cutlass::arch::NamedBarrier::arrive_and_wait(NUM_THREADS / 2,
+            Group == 0 ? flashmla::sparse_prefill::NamedBarriers::mGroup0
+                       : flashmla::sparse_prefill::NamedBarriers::mGroup1);
+    }
+
+    static constexpr int BLOCK_SIZE_M = flashmla::sparse_prefill::Config::BLOCK_SIZE_M;
+    static constexpr int PAGE_BLOCK_SIZE = flashmla::sparse_prefill::Config::PAGE_BLOCK_SIZE;
+    static constexpr int kBlockM = flashmla::sparse_prefill::Config::BLOCK_SIZE_M;
+    static constexpr int kBlockN = flashmla::sparse_prefill::Config::BLOCK_SIZE_N;
     static constexpr int kHeadDim = HEAD_DIM;
     static constexpr int NUM_TILES = kHeadDim / 64;  // 9 for 576, 8 for 512
-    static constexpr int kHeadDimV = Config::HEAD_DIM_V;
+    static constexpr int kHeadDimV = flashmla::sparse_prefill::Config::HEAD_DIM_V;
     static constexpr float Page_In_BlockN = float(kBlockN) / (float)PAGE_BLOCK_SIZE;
 
     static constexpr int NUM_THREADS = 512;

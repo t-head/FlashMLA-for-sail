@@ -24,9 +24,13 @@ using namespace cute;
 namespace flash {
 
 template<typename Kernel_traits, bool HAVE_TOPK_LENGTH, bool Is_causal = false, bool CrossCut = true,
-         bool SINGLE_KV = false>
+         bool SINGLE_KV = false, typename PrefillParams = SparsePrefillParams>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
-flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams params) {
+flash_sparse_prefill_fwd_kernel(__grid_constant__ const PrefillParams params) {
+    constexpr bool kFusedSmallPrefill = !std::is_same_v<PrefillParams, SparsePrefillParams>;
+    if constexpr (kFusedSmallPrefill) {
+        static_assert(Kernel_traits::kFusedSmallPrefill && HAVE_TOPK_LENGTH && !SINGLE_KV);
+    }
 
     static_assert(CrossCut);
     static_assert(!SINGLE_KV || (Kernel_traits::kStages == 2 && !Kernel_traits::Share_Q_K_smem));
@@ -85,7 +89,13 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
 
     // const int n_block_max = params.topk / kBlockN;
 
-    const int topk_length = HAVE_TOPK_LENGTH ? __ldg(params.topk_length + s_q_idx) : params.topk;
+    const int topk_length = [&] {
+        if constexpr (kFusedSmallPrefill) {
+            return params.topk_length ? __ldg(params.topk_length + s_q_idx) : params.topk;
+        } else {
+            return HAVE_TOPK_LENGTH ? __ldg(params.topk_length + s_q_idx) : params.topk;
+        }
+    }();
     const int n_block_max = HAVE_TOPK_LENGTH ? cute::ceil_div(topk_length, (int)kBlockN) : (int)((unsigned int)params.topk/(unsigned int)kBlockN);
 
     const index_t row_offset_q = s_q_idx * params.stride_q_s_q + m_block * (kBlockM * params.stride_q_h_q);
@@ -191,9 +201,23 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     // Allocate predicate tensors for k
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
 
+    if constexpr (kFusedSmallPrefill) {
+        static_assert(!Kernel_traits::Share_Q_K_smem && !Kernel_traits::Is_Q_in_regs);
+        const bool live = nxt_token_idx >= 0 && nxt_token_idx < params.s_kv
+            && load_col_idx < topk_length;
+        tKgK.data() = reinterpret_cast<Element*>(params.kv)
+            + nxt_token_idx * (index_t)params.stride_kv_s_kv + (tidx % 8) * 8;
+        gmem_tiled_copy_K.pred = live;
+        cute::copy(gmem_tiled_copy_K, tKgK, tKsK);
+        smem_valid_indices(0, col_in_indices) = live;
+        cute::cp_async_fence();
+        if (n_block_max > 1) nxt_token_idx = __ldg(gIndices_ptr + kBlockN);
+        Kernel_traits::template load_fused_q<Kernel_traits>(params, sQ, smem_, tidx, m_block, s_q_idx);
+    } else {
     copy<false, true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
                              params.h_q - m_block * kBlockM);
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
+    }
 
     if (Kernel_traits::Share_Q_K_smem) {
         flash::cp_async_wait<0>();
@@ -259,6 +283,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
         is_token_valid &= (load_col_idx < topk_length);
     }
 
+    if constexpr (!kFusedSmallPrefill) {
     tKgK.data() = gK_base + indice_idx * (index_t)params.stride_kv_s_kv + (tidx%8)*8;
     gmem_tiled_copy_K.pred = is_token_valid;
     cute::copy(gmem_tiled_copy_K, tKgK, tKsK);
@@ -268,9 +293,12 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     }
 
     smem_valid_indices(kv_store_num%2, col_in_indices) = is_token_valid;
+    }
 
     kv_store_num++;
-    cute::cp_async_fence();
+    if constexpr (!kFusedSmallPrefill) {
+        cute::cp_async_fence();
+    }
 
     if (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
         flash::cp_async_wait<1>();
@@ -283,6 +311,13 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     clear(acc_o);
 
     flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, AtomLayoutP, kNWarps0/AtomLayoutQ, 1/*ForceUseTsm*/> softmax;
+    if constexpr (kFusedSmallPrefill) {
+        // Empty lengths skip the first QK iteration that initializes these fragments.
+        if (topk_length == 0) {
+            cute::fill(softmax.row_max, -INFINITY);
+            cute::clear(softmax.row_sum);
+        }
+    }
 
     // These are the iterations where we don't need masking on S
     for (int n_block = 0; n_block < n_block_max; ++n_block) {
@@ -334,6 +369,10 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
                 flash::gemm<Kernel_traits::Is_Q_in_regs>(
                     acc_s, tSrQ, tSrK, tSsQ, tSsK_current, tiled_mma_s, smem_tiled_copy_Q, smem_tiled_copy_K,
                     smem_thr_copy_Q, smem_thr_copy_K);
+            }
+
+            if constexpr (kFusedSmallPrefill) {
+                Kernel_traits::template scale_scores<Kernel_traits>(acc_s, thr_mma_s, smem_);
             }
 
             constexpr int MMA_N_S = kBlockN / decltype(typename Kernel_traits::TiledMmaS{}.template tile_size_mnk<1>())::value;
@@ -407,6 +446,12 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const SparsePrefillParams para
     for (int mi = 0; mi < size(lse); ++mi) {
         lse(mi) = softmax.lse(mi) * float(M_LOG2E);
         mlogits(mi) = softmax.row_max(mi) *  params.sm_scale_div_log2;
+    }
+
+    if constexpr (kFusedSmallPrefill) {
+        Kernel_traits::template store_fused_output<Kernel_traits>(
+            params, acc_o, lse, mlogits, smem_, tidx, m_block, s_q_idx, topk_length);
+        return;
     }
 
     // Convert acc_o from fp32 to fp16/bf16
