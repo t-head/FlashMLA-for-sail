@@ -1,4 +1,4 @@
-#include "projection.h"
+#include "fused_v41_projection.h"
 #include <cassert>
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj {

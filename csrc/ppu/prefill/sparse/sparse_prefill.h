@@ -28,6 +28,22 @@ void run_sparse_prefill_fwd_dispatch(SparsePrefillParams& params) {
     // static constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits)
 
     FLASH_ASSERT(params.h_kv == 1);
+    if constexpr (std::is_same_v<T, cutlass::bfloat16_t>) {
+        if (params.h_q == 8 && params.h_kv == 1 &&
+            params.d_qk == 512 && params.d_v == 512 &&
+            params.topk > 0 && params.topk % 64 == 0) {
+            const auto *props = at::cuda::getCurrentDeviceProperties();
+            if (props->major == 8 && props->minor == 9) {
+                using H8Traits = Flash_fwd_kernel_traits<
+                    512, 16, 32, 8, false, false, T, 512, true, false,
+                    1, 1, 32, 2, 2>;
+                DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
+                    run_flash_sparse_prefill_fwd<H8Traits, HAVE_TOPK_LENGTH>(params);
+                });
+                return;
+            }
+        }
+    }
     FLASH_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
     FLASH_ASSERT(params.topk > 0);
     // FLASH_ASSERT(params.h_q % B_H == 0);

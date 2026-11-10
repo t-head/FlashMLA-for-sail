@@ -1,4 +1,4 @@
-#include "kernel.h"
+#include "fused_v41.h"
 
 #include <cmath>
 #include <cutlass/cutlass.h>

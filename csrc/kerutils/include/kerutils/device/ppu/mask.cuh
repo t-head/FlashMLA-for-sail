@@ -107,7 +107,7 @@ struct Mask {
     }
 };
 
-template <typename Tensor0, typename Tensor1>
+template <int kIndexGroupStride = 16, typename Tensor0, typename Tensor1>
 __forceinline__ __device__ void apply_indices_mask(Tensor0 &tensor_, Tensor1 &smem_valid_indices,  const int warpN_idx, const int buffer) {
     Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
     const int lane_id = threadIdx.x % 32;
@@ -128,7 +128,7 @@ __forceinline__ __device__ void apply_indices_mask(Tensor0 &tensor_, Tensor1 &sm
             // const int col_in_indices = col_nj + j;
             // const int col_in_indices = load_col_idx;
             // const int col_in_indices = (col%8)*8 + col/8;
-            const int col_in_indices = (lane_id % 4) * 16 + warpN_idx *4 + nj * 4 + j;
+            const int col_in_indices = (lane_id % 4) * kIndexGroupStride + warpN_idx * 4 + nj * 4 + j;
             // const int col_in_indices = (load_col_idx % 4) * 16 + (load_col_idx / 16) * 4 + (load_col_idx % 16) / 4;
 #else
             // const int col_idx = col_base + (lane_id % 4) * 2 + nj * 8 + j;

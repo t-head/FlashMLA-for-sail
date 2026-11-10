@@ -42,7 +42,7 @@ template<typename P>
 struct is_fused_splitkv_norm<P, std::void_t<decltype(P::kEnableNorm)>>
     : std::bool_constant<is_fused_splitkv<P>::value && P::kEnableNorm> {};
 
-template<typename Kernel_traits, bool IsV41FP8, bool IsExtraFP4, typename Params>
+template<typename Kernel_traits, bool IsV41FP8, bool IsExtraFP4, bool CheckKvCapacity = false, typename Params>
 __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     const Params &params, const int batch_id, const int bidh, const int m_block,
     const int n_split_idx, const int n_block_min, const int n_block_max, const bool NoSplit,
@@ -110,7 +110,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 #if ACOMPUTE_VERSION ==10000
     const int lane_idx = tidx % 32;
     // const int col_in_indices = ((load_col_idx)% 8)*8 + (load_col_idx)/8;
-    const int col_in_indices = (lane_idx/8) * 16 + warp_idx; // + v * RowsPerGmem/4
+    const int col_in_indices = (lane_idx / 8) * (kBlockN / 4) + warp_idx;
     // const int col_in_indices1 = (load_col_idx % 4) * 16 + (load_col_idx / 16) * 4 + (load_col_idx % 16) / 4;
     // const int col_in_indices = load_col_idx;
 #else
@@ -175,7 +175,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         }
         valid = (nxt_token_idx >= 0)
             & ((col_in_indices + block_idx * kBlockN) < topk_len);
-        if constexpr (kFusedSplitKV) {
+        if constexpr (kFusedSplitKV || CheckKvCapacity) {
             const int64_t capacity = k_ptr == gExK_base
                 ? int64_t(params.extra_num_blocks) * params.extra_page_block_size
                 : int64_t(params.num_blocks) * params.page_block_size;
@@ -515,7 +515,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
                     acc_s(i) *= tSrRowScale(i);
                 }
             }
-            flash::apply_indices_mask(acc_s, smem_valid_indices, warpN_idx, buf_idx);
+            flash::apply_indices_mask<kBlockN / 4>(acc_s, smem_valid_indices, warpN_idx, buf_idx);
 
             if constexpr (IS_FIRST_BLOCK) {
                 softmax.template softmax_rescale_per_warp</*Is_first=*/true,  /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.scale_softmax_log2);
@@ -589,7 +589,9 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
 
     if (warp_idx < kNWarps0) {
         if (NoSplit) {
-            softmax.template normalize_softmax_lse_per_warp<false, /*UseTbSync=*/false>(smem_row_via_warp, smem_row_scale, params.scale_softmax, params.attn_sink_ptr, params.scale_softmax_log2, h_k_idx);
+            softmax.template normalize_softmax_lse_per_warp<false, /*UseTbSync=*/false>(
+                smem_row_via_warp, smem_row_scale, params.scale_softmax, params.attn_sink_ptr,
+                params.scale_softmax_log2, h_k_idx, kBlockM == 16 ? params.ngroups : INT_MAX);
         } else {
             softmax.template normalize_softmax_lse_per_warp<true, /*UseTbSync=*/false>(smem_row_via_warp, smem_row_scale, params.scale_softmax);
         }

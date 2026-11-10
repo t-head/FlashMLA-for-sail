@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <climits>
 #include <cmath>
 
 #include <cute/tensor.hpp>
@@ -449,7 +450,8 @@ struct SoftmaxBetweenWarps {
 
   template<bool Split, bool UseTbSync = true, typename Tensor0, typename Tensor1>
     __forceinline__ __device__ void normalize_softmax_lse_per_warp(
-        Tensor0 &smem_row_sum, Tensor1 &smem_row_scale, float softmax_scale, const float* sink = nullptr, float sm_scale_div_log2 = 0, int m_block = 0) {
+        Tensor0 &smem_row_sum, Tensor1 &smem_row_scale, float softmax_scale, const float* sink = nullptr,
+        float sm_scale_div_log2 = 0, int m_block = 0, int sink_heads = INT_MAX) {
 
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
@@ -469,7 +471,7 @@ struct SoftmaxBetweenWarps {
             } else {
                 scores_scale(mi) = (sum == 0.f || sum != sum) ? 1.f : sum;
                 int q_row_idx = m_block * kBlockM + (warp_id % AtomLayoutQ) * MMA_ATOM_M + (mi % 2) * 8 + (threadIdx.x % 32 / 4) + (mi / 2) * AtomLayoutQ * MMA_ATOM_M;
-                float attn_sink = sink == nullptr ? -HGGCRT_INF_F : sink[q_row_idx]*CUDART_L2E_F;
+                float attn_sink = q_row_idx < sink_heads ? sink[q_row_idx] * CUDART_L2E_F : -HGGCRT_INF_F;
                 float cur_max = row_max(mi) == -INFINITY ? 0.0f : row_max(mi);
                 scores_scale(mi) = 1.f / (scores_scale(mi) + exp2f(attn_sink - cur_max * sm_scale_div_log2));
             }

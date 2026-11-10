@@ -30,6 +30,7 @@ def prefill(
     """
     A fused kernel for Q Norm + Q RoPE + Core Attn (sparse attention) + O RoPE + O cast to FP8, for DeepSeek-V4.1
     Only support PPU sm80 / sm89 architectures.
+    H8 is supported on SM89 with positive topk divisible by 64 and 16-byte-aligned KV rows.
 
     Args (Norm):
         enable_q_norm: bool, whether to apply Q RMSNorm
@@ -107,6 +108,7 @@ def decode(
     """
     Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4.1
     Only support PPU sm80 / sm89 architectures.
+    H8 is supported on SM89.
 
     The batch size is always 1, and the batch dimension is not included in any tensor shape below.
 

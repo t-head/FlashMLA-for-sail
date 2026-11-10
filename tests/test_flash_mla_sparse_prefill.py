@@ -21,6 +21,12 @@ def run_test(p: TestParam) -> bool:
     torch.cuda.empty_cache()
 
     t = lib.generate_testcase(p)
+    if p.h_q == 8 and t.topk_length is not None:
+        # Cover both an empty row and a nonempty row with no valid KV indices.
+        t.topk_length[0] = 0
+        if p.is_all_indices_invalid:
+            t.indices[-1].fill_(-1)
+            t.topk_length[-1] = p.topk
     torch.cuda.synchronize()
 
     def run_prefill():
@@ -169,6 +175,16 @@ def main(loops=1):
     ]
 
     testcases = correctness_cases + correctness_cases_with_features + corner_cases + performance_cases
+    if torch.cuda.get_device_capability(device) == (8, 9):
+        testcases.extend([
+            TestParam(1, 128, 128, h_q=8, seed=8100, num_runs=0, is_fp8=False),
+            TestParam(62, 95, 128, h_q=8, seed=8101, num_runs=0, is_fp8=False,
+                      have_attn_sink=True),
+            TestParam(274, 128, 128, h_q=8, seed=8102, num_runs=0, is_fp8=False,
+                      have_attn_sink=True, have_topk_length=True),
+            TestParam(274, 95, 128, h_q=8, seed=8103, num_runs=0, is_fp8=False,
+                      have_attn_sink=True, have_topk_length=True, is_all_indices_invalid=True),
+        ])
     # testcases = first_case
 
     is_no_cooldown = lib.is_no_cooldown()
