@@ -139,7 +139,7 @@ def gen_testcase() -> List[RawTestParam]:
                                 num_runs=0)]
 
     # return first_case
-    return correctness_cases + corner_cases + performance_cases + gen_v41_testcase()
+    return correctness_cases + corner_cases + performance_cases + gen_v41_testcase() + gen_v41_h8_testcase()
 
 
 def gen_v41_testcase() -> List[RawTestParam]:
@@ -269,6 +269,29 @@ def gen_v41_testcase() -> List[RawTestParam]:
     return testcases
 
 
+def gen_v41_h8_testcase() -> List[RawTestParam]:
+    if torch.cuda.get_device_capability() != (8, 9):
+        return []
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    logical_sm_count = 20 if "810E" in props.name else props.multi_processor_count
+    direct_min_rows = 2 * logical_sm_count
+    fixed = RawTestParam(
+        direct_min_rows, 8, 1, 1, 128, False, 128,
+        block_size=128, extra_s_k=512, extra_topk=512, extra_block_size=64,
+        d_qk=512, num_runs=0, seed=3260,
+        fp8_kvcache_layout=quant.FP8KVCacheLayout.V41_FP8Sparse,
+        extra_fp8_kvcache_layout=quant.FP8KVCacheLayout.V41_FP4Sparse,
+    )
+    return [
+        dataclasses.replace(fixed, b=direct_min_rows - 1, seed=3261),
+        fixed,
+        dataclasses.replace(fixed, b=logical_sm_count, s_q=2, seed=3262),
+        dataclasses.replace(fixed, is_varlen=True, have_topk_length=True, have_extra_topk_length=True, seed=3263),
+        dataclasses.replace(fixed, extra_fp8_kvcache_layout=quant.FP8KVCacheLayout.V41_FP8Sparse, seed=3264),
+    ]
+
+
 @dataclasses.dataclass
 class Result:
     is_correct: bool
@@ -319,7 +342,10 @@ def test_flash_mla(p: TestParam) -> Result:
         combine_kernel_name = "flash_fwd_splitkv_mla_combine_kernel"
         if p.fp8_kvcache_layout == quant.FP8KVCacheLayout.V41_FP8Sparse:
             kernel_names = result.get_kernel_names()
-            if any("flash_sparse_decode_wg_kernel" in kernel for kernel in kernel_names):
+            direct_kernel_name = "flash_sparse_decode_fwd_h8_fp8_fp4_direct_kernel"
+            if any(direct_kernel_name in kernel for kernel in kernel_names):
+                splitkv_kernel_name = direct_kernel_name
+            elif any("flash_sparse_decode_wg_kernel" in kernel for kernel in kernel_names):
                 splitkv_kernel_name = "flash_sparse_decode_wg_kernel"
             if any("flash_fwd_mla_combine_kernel" in name for name in kernel_names):
                 combine_kernel_name = "flash_fwd_mla_combine_kernel"

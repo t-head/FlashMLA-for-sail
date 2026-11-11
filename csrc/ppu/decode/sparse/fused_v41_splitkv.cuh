@@ -4,8 +4,8 @@
 #include <cstdint>
 #include <cutlass/float8.h>
 
-#include "kernel.h"
-#include "../combine/kernel.h"
+#include "sparse/fused_v41.h"
+#include "ppuxx/decode/combine/fused_v41.h"
 #include "decode/sparse/splitkv_mla.cuh"
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
@@ -14,11 +14,13 @@ namespace splitkv {
 
 using namespace cute;
 
-template<bool PagePow2>
+template<int Heads, bool PagePow2>
 using Traits = Flash_fwd_kernel_traits<
-    512, 64, 64, 16, /*Is_Q_in_regs=*/true, /*Share_Q_K_smem=*/false, cutlass::bfloat16_t, 512,
-    /*CrossCut=*/true, /*USE_MMA_M8=*/false, /*AtomLayoutQ=*/4, /*AtomLayoutP=*/2, 64, 2,
-    /*kNWarps0=*/16, PagePow2>;
+    512, Heads == 8 ? 16 : 64, Heads == 8 ? 32 : 64, Heads == 8 ? 8 : 16,
+    /*Is_Q_in_regs=*/true, /*Share_Q_K_smem=*/false,
+    cutlass::bfloat16_t, 512, /*CrossCut=*/true, /*USE_MMA_M8=*/false,
+    /*AtomLayoutQ=*/Heads == 8 ? 1 : 4, /*AtomLayoutP=*/Heads == 8 ? 1 : 2,
+    Heads == 8 ? 32 : 64, 2, /*kNWarps0=*/Heads == 8 ? 2 : 16, PagePow2>;
 
 template<typename KT, bool ExtraFP4>
 constexpr size_t scratch_offset() {
@@ -64,36 +66,43 @@ __forceinline__ __device__ void load_q(
     constexpr int kChunks = KT::kHeadDim / 16;
     static_assert(KT::kHeadDim == 512 && kChunks % kParts == 0 && (kParts & (kParts - 1)) == 0);
     static_assert(KT::Is_Q_in_regs && !KT::Share_Q_K_smem);
-    const int row = tidx % kBlockM;
-    const int part = tidx / kBlockM;
+    constexpr bool h8 = kBlockM == 16;
+    const int row = h8 ? (tidx % 8) + (tidx / (8 * kParts)) * 8 : tidx % kBlockM;
+    const int part = h8 ? (tidx / 8) % kParts : tidx / kBlockM;
     const int head = h_k_idx * kBlockM + row;
     const bool live = head < p.real_heads;
     const Element* src = reinterpret_cast<const Element*>(p.q_ptr)
         + int64_t(token) * p.stride_q_token + head * 16;
     Element* dst = reinterpret_cast<Element*>(smem);
-    const int position = __ldg(p.token_positions + token);
-    const float* rope = p.cos_sin_cache + int64_t(position) * 64;
     float sum = 0.0f;
     #pragma unroll
     for (int k = 0; k < kChunks / kParts; ++k) {
         const int chunk = part + k * kParts;
-        float x[16];
+        uint4 raw[2]{};
         if (live) {
             const uint4* g = reinterpret_cast<const uint4*>(
                 src + int64_t(chunk) * (p.real_heads * 16));
-            const uint4 raw[2] = {__ldg(g), __ldg(g + 1)};
-            const Element* e = reinterpret_cast<const Element*>(raw);
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) x[i] = float(e[i]);
-        } else {
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) x[i] = 0.0f;
+            raw[0] = __ldg(g);
+            raw[1] = __ldg(g + 1);
         }
+        if constexpr (h8 && !P::kEnableNorm) {
+            if (chunk < 28 || !live) {
+                *reinterpret_cast<uint4*>(dst + native_offset<kBlockM>(row, chunk * 16)) = raw[0];
+                *reinterpret_cast<uint4*>(dst + native_offset<kBlockM>(row, chunk * 16 + 8)) = raw[1];
+                continue;
+            }
+        }
+        float x[16];
+        const Element* e = reinterpret_cast<const Element*>(raw);
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) x[i] = float(e[i]);
         if constexpr (P::kEnableNorm) {
             #pragma unroll
             for (int i = 0; i < 16; ++i) sum = fmaf(x[i], x[i], sum);
         }
-        if (chunk * 16 >= 448) {
+        if (chunk >= 28 && live) {
+            const int position = __ldg(p.token_positions + token);
+            const float* rope = p.cos_sin_cache + int64_t(position) * 64;
             #pragma unroll
             for (int i = 0; i < 16; i += 2) {
                 const int pair = (chunk * 16 + i - 448) / 2;
@@ -118,12 +127,21 @@ __forceinline__ __device__ void load_q(
         partials[part * kBlockM + row] = sum;
         __syncthreads();
         if (tidx < kBlockM) {
-            static_assert(kParts == 8);
-            const float s01 = __fadd_rn(partials[tidx], partials[kBlockM + tidx]);
-            const float s23 = __fadd_rn(partials[2 * kBlockM + tidx], partials[3 * kBlockM + tidx]);
-            const float s45 = __fadd_rn(partials[4 * kBlockM + tidx], partials[5 * kBlockM + tidx]);
-            const float s67 = __fadd_rn(partials[6 * kBlockM + tidx], partials[7 * kBlockM + tidx]);
-            const float sqr = __fadd_rn(__fadd_rn(s01, s23), __fadd_rn(s45, s67));
+            static_assert(kParts == 8 || kParts == 16);
+            float sums[kParts / 8];
+            #pragma unroll
+            for (int group = 0; group < kParts / 8; ++group) {
+                const float* group_partials = partials + group * 8 * kBlockM + tidx;
+                const float s01 = __fadd_rn(group_partials[0], group_partials[kBlockM]);
+                const float s23 = __fadd_rn(group_partials[2 * kBlockM], group_partials[3 * kBlockM]);
+                const float s45 = __fadd_rn(group_partials[4 * kBlockM], group_partials[5 * kBlockM]);
+                const float s67 = __fadd_rn(group_partials[6 * kBlockM], group_partials[7 * kBlockM]);
+                sums[group] = __fadd_rn(__fadd_rn(s01, s23), __fadd_rn(s45, s67));
+            }
+            float sqr = sums[0];
+            if constexpr (kParts == 16) {
+                sqr = __fadd_rn(sums[0], sums[1]);
+            }
             norm[tidx] = h_k_idx * kBlockM + tidx < p.real_heads
                 ? rsqrtf(sqr / 512.0f + p.rms_norm_eps) : 1.0f;
         }
@@ -139,6 +157,86 @@ __forceinline__ __device__ void load_row_scale(Frag& frag, ThrMma& thr_mma, char
     static_assert(decltype(size(tScS))::value == decltype(size(frag))::value);
     #pragma unroll
     for (int i = 0; i < size(frag); ++i) frag(i) = norm[get<0>(tScS(i))];
+}
+
+__forceinline__ __device__ uint16_t fp8_pair_from_float(float low, float high) {
+    uint16_t result;
+    asm volatile("ppu.cvt.rtte.satfinite.e4m3x2.f32 %0, %1, %2;"
+        : "=h"(result) : "f"(high), "f"(low));
+    return result;
+}
+
+template<typename KT>
+constexpr bool h8_output_float4_layout() {
+    typename KT::SmemLayoutO layout{};
+    for (int head = 0; head < 8; ++head) {
+        for (int col = 0; col < KT::kHeadDimV; col += 4) {
+            const int offset = layout(head, col);
+            if (offset % 4 != 0) return false;
+            for (int i = 1; i < 4; ++i) {
+                if (layout(head, col + i) != offset + i) return false;
+            }
+        }
+    }
+    return true;
+}
+
+template<typename KT, typename P, typename TensorO>
+__forceinline__ __device__ void store_h8_output(const P& p, int token, int tidx, const TensorO& sO) {
+    constexpr int kHeads = 8;
+    constexpr int kChunks = KT::kHeadDimV / 32;
+    constexpr int kLanesPerScale = 2;
+    constexpr int kChannelsPerLane = 32 / kLanesPerScale;
+    static_assert(KT::kNThreads == kHeads * kChunks * kLanesPerScale);
+    static_assert(h8_output_float4_layout<KT>());
+
+    // Each contiguous pair owns one 32-channel scale.
+    const int scale_index = tidx / kLanesPerScale;
+    const int head = scale_index % kHeads;
+    const int chunk = scale_index / kHeads;
+    const int lane = tidx % kLanesPerScale;
+    const int col = chunk * 32 + lane * kChannelsPerLane;
+    alignas(16) float values[kChannelsPerLane];
+    #pragma unroll
+    for (int i = 0; i < kChannelsPerLane; i += 4) {
+        const float4 values4 = *reinterpret_cast<const float4*>(&sO(head, col + i));
+        *reinterpret_cast<float4*>(values + i) = values4;
+    }
+    if (col >= 448) {
+        const int position = __ldg(p.token_positions + token);
+        const float* rope = p.cos_sin_cache + int64_t(position) * 64;
+        #pragma unroll
+        for (int i = 0; i < kChannelsPerLane; i += 2) {
+            const int pair = (col - 448 + i) / 2;
+            const float2 rotated = apply_rope(float2{values[i], values[i + 1]},
+                __ldg(rope + pair), -__ldg(rope + 32 + pair));
+            values[i] = rotated.x;
+            values[i + 1] = rotated.y;
+        }
+    }
+
+    float amax = 1e-4f;
+    #pragma unroll
+    for (int i = 0; i < kChannelsPerLane; ++i) amax = fmaxf(amax, fabsf(values[i]));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, kLanesPerScale));
+    const float scale = amax / 448.0f;
+    const int exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
+    const float scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
+    uint32_t words[4];
+    #pragma unroll
+    for (int i = 0; i < kChannelsPerLane / 4; ++i) {
+        const int d = i * 4;
+        const uint32_t pair_lo = fp8_pair_from_float(values[d] * scale_inv, values[d + 1] * scale_inv);
+        const uint32_t pair_hi = fp8_pair_from_float(values[d + 2] * scale_inv, values[d + 3] * scale_inv);
+        words[i] = pair_lo | (pair_hi << 16);
+    }
+    const int64_t out_offset = int64_t(token) * kHeads * KT::kHeadDimV + scale_index * 32
+        + lane * kChannelsPerLane;
+    *reinterpret_cast<uint4*>(p.out_fp8 + out_offset) = make_uint4(words[0], words[1], words[2], words[3]);
+    if (lane == 0) {
+        auto* sf_word = p.out_sf + token + int64_t(scale_index / 4) * p.stride_out_sf_word;
+        reinterpret_cast<uint8_t*>(sf_word)[scale_index % 4] = uint8_t(exponent + 127);
+    }
 }
 
 template<typename KT, typename P, typename AccO, typename Softmax>
@@ -162,7 +260,8 @@ __forceinline__ __device__ void store_output(
             if (head < p.real_heads) p.lse_out[int64_t(token) * p.real_heads + head] = softmax.lse(mi);
         }
     }
-    __syncthreads();
+    // H8 stages O below the row scales, so its PV warps can finish rescaling independently.
+    if constexpr (kBlockM != 16) __syncthreads();
 
     Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem)), typename KT::SmemLayoutO{});
     typename KT::TiledMma tiled_mma;
@@ -172,6 +271,11 @@ __forceinline__ __device__ void store_output(
     Tensor tOsO = smem_thr_copy_O.partition_D(sO);
     cute::copy(smem_tiled_copy_O, tOrO, tOsO);
     __syncthreads();
+
+    if constexpr (kBlockM == 16) {
+        store_h8_output<KT>(p, token, tidx, sO);
+        return;
+    }
 
     const int position = __ldg(p.token_positions + token);
     const float* rope = p.cos_sin_cache + int64_t(position) * 64;
@@ -266,6 +370,25 @@ fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
     const int bidh = blockIdx.y;
     const int partition_idx = blockIdx.z;
 
+    if constexpr (KT::kBlockM == 16) {
+        if (!params.tile_scheduler_metadata_ptr) {
+            // The H8 direct dispatch guarantees full 128 + 512 index rows.
+            constexpr int kMainTopk = 128;
+            constexpr int kExtraTopk = 512;
+            const int rows = params.b / params.num_sm_parts;
+            const int remainder = params.b % params.num_sm_parts;
+            const int begin = partition_idx * rows + cute::min(partition_idx, remainder);
+            const int end = begin + rows + int(partition_idx < remainder);
+            #pragma unroll 1
+            for (int token = begin; token < end; ++token) {
+                flash::compute_attn_fp8_sparse_splitkv<KT, true, ExtraFP4>(
+                    params, token, 0, 0, 0, 0, (kMainTopk + kExtraTopk) / kBlockN,
+                    true, kMainTopk, kMainTopk / kBlockN, kExtraTopk);
+                __syncthreads();
+            }
+            return;
+        }
+    }
     const int* metadata = params.tile_scheduler_metadata_ptr + partition_idx * TileSchedulerMetaDataSize;
     const int4 tile = __ldg(reinterpret_cast<const int4*>(metadata));
     const int begin_idx = tile.x;
@@ -303,7 +426,7 @@ fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
 template<int Heads, bool EnableNorm, bool ExtraFP4>
 void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
     const Params& params, const SplitKVParams& split) {
-    static_assert(Heads == 64 || Heads == 128);
+    static_assert(Heads == 8 || Heads == 64 || Heads == 128);
     TORCH_CHECK(params.mode == FwdMode::Decode && params.h_q == Heads
         && params.enable_q_norm == EnableNorm && params.extra_fp4 == ExtraFP4);
     TORCH_CHECK(params.wv_group_size == 8 && params.n_wv_group == Heads / 8);
@@ -370,7 +493,7 @@ void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
     p.real_heads = Heads;
 
     IS_PAGE_POWER2(p.page_block_size, p.extra_page_block_size, [&] {
-        using KT = splitkv::Traits<kPagePow2>;
+        using KT = splitkv::Traits<Heads, kPagePow2>;
         constexpr size_t smem_size = splitkv::scratch_offset<KT, ExtraFP4>() + splitkv::scratch_bytes<KT>();
         static_assert(smem_size <= 256 * 1024);
         auto kernel = &fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<KT, EnableNorm, ExtraFP4>;
@@ -383,6 +506,9 @@ void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
         CHECK_CUDA_KERNEL_LAUNCH();
     });
 
+    if constexpr (Heads == 8) {
+        if (!split.tile_scheduler_metadata) return;
+    }
     combine::Params c{};
     c.s_q = params.s_q;
     c.h_q = Heads;

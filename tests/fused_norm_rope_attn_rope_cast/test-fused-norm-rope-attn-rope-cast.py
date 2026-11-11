@@ -430,8 +430,11 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     lib.stick_unit_test_args(parser)
-    parser.add_argument("--h-q", type=int, nargs="+", default=[128, 64], help="Head counts to test (default: every supported one)")
+    parser.add_argument("--h-q", type=int, nargs="+", choices=[8, 64, 128], default=[128, 64],
+                        help="Head counts to test (H8 requires SM89)")
     args = parser.parse_args()
+    if 8 in args.h_q and torch.cuda.get_device_capability() != (8, 9):
+        parser.error("--h-q 8 requires SM89")
 
     correctness_cases_prefill = []
     correctness_cases_decode = []
@@ -465,6 +468,8 @@ if __name__ == '__main__':
                 (False, True, True)
             ]:
                 for s_q in [1, 184, 2123]:
+                    if h_q == 8 and topk % 64 != 0:
+                        continue
                     # Prefill
                     correctness_cases_prefill.extend([TestParam(
                         s_q, s_kv, topk, h_q,
@@ -520,6 +525,8 @@ if __name__ == '__main__':
     performance_cases_prefill = []
     performance_cases_decode = []
     for (d_qk, h_q, extra_topk, topk, s_kv_list, kvcache_layouts, decoding_bsz_and_s_q) in performance_case_templates:
+        if h_q not in args.h_q:
+            continue
         for s_kv in s_kv_list:
             for prefill_s_q in [4096]:
                 performance_cases_prefill.append(TestParam(prefill_s_q, s_kv, topk+extra_topk, h_q, d_qk=d_qk, have_attn_sink=True, check_correctness=True))

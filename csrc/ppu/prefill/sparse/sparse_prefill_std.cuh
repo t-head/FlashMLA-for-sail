@@ -40,6 +40,8 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const PrefillParams params) {
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
+    constexpr int kIndexGroupStride = kFusedSmallPrefill || (kBlockM == 16 && kBlockN == 32)
+        ? kBlockN / 4 : 16;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
     constexpr int kNWarps = Kernel_traits::kNWarps;
@@ -77,7 +79,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const PrefillParams params) {
     // col = col_x * 16 + col_y * 4 + col_z; -> col_in_indices = col_z * 16 + col_x * 4 + col_y;
     // (col_x, col_y, col_z) = (col_load / 16, (col_load % 16) / 4, col_load % 4) ->
 #if ACOMPUTE_VERSION ==10000
-    const int col_in_indices = (lane_idx/8) * 16 + warp_idx;
+    const int col_in_indices = (lane_idx / 8) * kIndexGroupStride + warp_idx;
     // const int col_in_indices = (load_col_idx % 4) * 16 + (load_col_idx / 16) * 4 + (load_col_idx % 16) / 4;
     // const int col_in_indices = load_col_idx;
 #else
@@ -311,7 +313,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const PrefillParams params) {
     clear(acc_o);
 
     flash::SoftmaxBetweenWarps<USE_MMA_M8, kBlockM, AtomLayoutQ, AtomLayoutP, kNWarps0/AtomLayoutQ, 1/*ForceUseTsm*/> softmax;
-    if constexpr (kFusedSmallPrefill) {
+    if constexpr (kFusedSmallPrefill || (kBlockM == 16 && kBlockN == 32)) {
         // Empty lengths skip the first QK iteration that initializes these fragments.
         if (topk_length == 0) {
             cute::fill(softmax.row_max, -INFINITY);
@@ -354,8 +356,8 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const PrefillParams params) {
         auto tOsVt_current = kv_load_num % 2 == 0 ? tOsVt : tOsVt_double;
 
         if (warp_idx < kNWarps0) {
-            if constexpr (SINGLE_KV) {
-                constexpr int kKeepQSteps = 8;
+            if constexpr (SINGLE_KV || kFusedSmallPrefill || (kBlockM == 16 && kBlockN == 32)) {
+                constexpr int kKeepQSteps = SINGLE_KV ? 8 : (kBlockN == 32 ? 4 : 32);
                 if (n_block == 0) {
                     Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
                     #pragma unroll
@@ -377,7 +379,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const PrefillParams params) {
 
             constexpr int MMA_N_S = kBlockN / decltype(typename Kernel_traits::TiledMmaS{}.template tile_size_mnk<1>())::value;
             if constexpr (MMA_N_S == 1) {
-                flash::apply_indices_mask(acc_s, smem_valid_indices, (warp_idx / AtomLayoutQ) * MMA_N_S, kv_load_num % 2);
+                flash::apply_indices_mask<kIndexGroupStride>(acc_s, smem_valid_indices, (warp_idx / AtomLayoutQ) * MMA_N_S, kv_load_num % 2);
             } else {
                 auto score_coords = thr_mma_s.partition_C(
                     make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{}));
@@ -386,7 +388,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const PrefillParams params) {
                     int col = get<1>(score_coords(i));
 #if ACOMPUTE_VERSION == 10000
                     // Match col_in_indices used when storing valid indices.
-                    col = (col % 4) * 16 + (col / 16) * 4 + (col % 16) / 4;
+                    col = (col % 4) * kIndexGroupStride + (col / 16) * 4 + (col % 16) / 4;
 #endif
                     if (!smem_valid_indices(kv_load_num % 2, col))
                         acc_s(i) = -INFINITY;
@@ -434,7 +436,9 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const PrefillParams params) {
     }
 
     if (warp_idx < kNWarps0) {
-        softmax.template normalize_softmax_lse_per_warp<false, /*UseTbSync=*/false>(smem_row_via_warp, smem_row_scale, params.sm_scale, params.attn_sink, params.sm_scale_div_log2, m_block);
+        softmax.template normalize_softmax_lse_per_warp<false, /*UseTbSync=*/false>(
+            smem_row_via_warp, smem_row_scale, params.sm_scale, params.attn_sink,
+            params.sm_scale_div_log2, m_block, kBlockM == 16 ? params.h_q : INT_MAX);
     }
     __syncthreads();
 

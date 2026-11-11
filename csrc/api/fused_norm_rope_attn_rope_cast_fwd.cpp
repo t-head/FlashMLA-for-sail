@@ -1,8 +1,8 @@
 #include "common.h"
 #include "fused_norm_rope_attn_rope_cast_fwd.h"
 #include "ppu/decode/sparse/sparse_decode_wg.h"
-#include "ppu/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h"
-#include "ppu/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/projection.h"
+#include "ppu/sparse/fused_v41.h"
+#include "ppu/sparse/fused_v41_projection.h"
 
 void get_mla_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
 void get_mla_uniform_sparse_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
@@ -52,7 +52,8 @@ Params make_fused_params(
     KU_CHECK_DTYPE(topk_length, torch::kInt32);
     KU_CHECK_DTYPE(token_positions, torch::kInt32);
     KU_CHECK_DTYPE(cos_sin_cache, torch::kFloat32);
-    TORCH_CHECK(q.size(1) == 64 || q.size(1) == 128, "Only 64 or 128 Q heads are supported");
+    TORCH_CHECK(q.size(1) == 8 || q.size(1) == 64 || q.size(1) == 128,
+                "Only 8, 64 or 128 Q heads are supported");
     TORCH_CHECK(q.size(2) == 512 && d_v == 512, "Only V4.1 head dimensions 512/512 are supported");
     TORCH_CHECK(n_wv_group > 0 && q.size(1) % n_wv_group == 0);
     TORCH_CHECK(q.size(1) / n_wv_group == 8, "WV group size must be 8");
@@ -79,6 +80,7 @@ Params make_fused_params(
     check_device(cos_sin_cache);
     const auto [major, minor] = get_compute_capability(q.get_device());
     TORCH_CHECK(major == 8 && (minor == 0 || minor == 9), "Fused attention requires PPU SM80 or SM89");
+    TORCH_CHECK(q.size(1) != 8 || minor == 9, "H8 fused attention requires PPU SM89");
 
     Params p{};
     p.arch = minor == 9 ? 89 : 80;
@@ -156,6 +158,17 @@ template<int Heads, bool EnableNorm, bool ExtraFP4>
 void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
     Params p = raw;
     const int sm_count = logical_sm_count();
+    if constexpr (Heads == 8) {
+        if (p.s_q >= 2 * sm_count && p.topk == 128 && p.extra_topk == 512
+            && !p.topk_length && !p.extra_topk_length) {
+            // Each partition owns complete query rows, so no split workspace is needed.
+            const fused::core_attn::SplitKVParams direct{
+                nullptr, nullptr, 2 * sm_count, nullptr, nullptr};
+            fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<
+                Heads, EnableNorm, ExtraFP4>(p, direct);
+            return;
+        }
+    }
     if constexpr (Heads == 64) {
         constexpr int extra_bytes = ExtraFP4 ? 288 : 528;
         const auto aligned = [](const void* ptr) { return reinterpret_cast<uintptr_t>(ptr) % 16 == 0; };
@@ -225,26 +238,28 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
 
 template<int Heads, bool EnableNorm>
 void launch_fused_decode(const Params& p, const at::Tensor& q) {
-    bool use_wi = false;
     if constexpr (Heads == 128) {
         if (p.s_q >= logical_sm_count()) {
             const bool uniform_topk = !p.topk_length && !p.extra_topk_length;
             const bool long_extra = p.topk == 64 && p.extra_topk == 2048;
-            use_wi = p.arch == 89
+            const bool use_wi = p.arch == 89
                 ? (p.extra_topk == 0 && p.topk <= 128) || long_extra
                 : uniform_topk && !p.extra_fp4 && long_extra;
+            if (use_wi) {
+                launch_fused<FwdMode::Decode, Heads, EnableNorm>(p);
+                return;
+            }
         }
     }
-    if (use_wi) {
-        launch_fused<FwdMode::Decode, Heads, EnableNorm>(p);
-    } else {
-        if (p.extra_fp4) launch_fused_decode_splitkv<Heads, EnableNorm, true>(p, q);
-        else launch_fused_decode_splitkv<Heads, EnableNorm, false>(p, q);
-    }
+    if (p.extra_fp4) launch_fused_decode_splitkv<Heads, EnableNorm, true>(p, q);
+    else launch_fused_decode_splitkv<Heads, EnableNorm, false>(p, q);
 }
 
 void dispatch_fused_decode(const Params& p, const at::Tensor& q) {
-    if (p.h_q == 64) {
+    if (p.h_q == 8) {
+        if (p.enable_q_norm) launch_fused_decode<8, true>(p, q);
+        else launch_fused_decode<8, false>(p, q);
+    } else if (p.h_q == 64) {
         if (p.enable_q_norm) launch_fused_decode<64, true>(p, q);
         else launch_fused_decode<64, false>(p, q);
     } else {
@@ -298,7 +313,12 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     p.lse = lse.data_ptr<float>();
     p.stride_out_sf_group = out_sf.stride(1);
     p.stride_out_sf_word = out_sf.stride(2);
-    dispatch_fused<FwdMode::Prefill>(p);
+    if (p.h_q == 8) {
+        if (p.enable_q_norm) fused::core_attn::run_fused_norm_rope_attn_rope_cast_prefill_small<true>(p);
+        else fused::core_attn::run_fused_norm_rope_attn_rope_cast_prefill_small<false>(p);
+    } else {
+        dispatch_fused<FwdMode::Prefill>(p);
+    }
     return {out_fp8, out_sf, max_logits, lse};
 }
 
