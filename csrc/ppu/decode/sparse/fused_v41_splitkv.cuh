@@ -166,6 +166,285 @@ __forceinline__ __device__ uint16_t fp8_pair_from_float(float low, float high) {
     return result;
 }
 
+// Reuse the retired KV storage after the FP32 output image for this epilogue.
+// Each scale belongs to one token and eight complete 512-channel heads.
+template<typename KT, bool H8, bool EnableNorm = true, typename P, typename TensorO, typename Retired>
+__forceinline__ __device__ void store_per_token_output(
+    const P& p, int64_t token, int first_head, char* smem, TensorO& sO, Retired& retired,
+    const bool* valid = nullptr, const float* lse = nullptr) {
+    constexpr int kGroups = H8 ? 1 : KT::kBlockM / 8;
+    constexpr int kThreadsPerGroup = KT::kNThreads / kGroups;
+    constexpr int kWarpsPerGroup = kThreadsPerGroup / 32;
+    constexpr int kWarps = KT::kNThreads / 32;
+    constexpr size_t kStageBytes = cute::cosize(typename KT::SmemLayoutO{}) * sizeof(float);
+    static_assert(KT::kBlockM % 8 == 0 && KT::kHeadDimV == 512);
+    static_assert(KT::kNThreads % kGroups == 0 && kThreadsPerGroup % 32 == 0);
+    static_assert(kStageBytes + (kWarps + kGroups) * sizeof(float) <= KT::kSmemSizeAccum);
+    float* partials = reinterpret_cast<float*>(smem + kStageBytes);
+    float* inverses = partials + kWarps;
+    const int tidx = threadIdx.x;
+    const int group = tidx / kThreadsPerGroup;
+    const int group_lane = tidx % kThreadsPerGroup;
+    const int global_group = first_head / 8 + group;
+    const int position = __ldg(p.token_positions + token);
+    const float* rope = p.cos_sin_cache + int64_t(position) * 64;
+
+    auto publish_inverse = [&](float amax) {
+        if constexpr (P::per_token_scale && !EnableNorm) {
+            // All warps in a WV group need the same maximum. After publishing
+            // partials, each warp derives its own inverse, so no CTA barrier
+            // follows the independent global SF write.
+            if constexpr (kWarpsPerGroup > 1) {
+                if (tidx % 32 == 0) partials[tidx / 32] = amax;
+                __syncthreads();
+            }
+            float inverse = 0.0f;
+            if (tidx % 32 == 0) {
+                if constexpr (kWarpsPerGroup > 1) {
+                    amax = 1e-4f;
+                    #pragma unroll
+                    for (int warp = 0; warp < kWarpsPerGroup; ++warp)
+                        amax = fmaxf(amax, partials[group * kWarpsPerGroup + warp]);
+                }
+                const float scale = amax / 448.0f;
+                inverse = 1.0f / scale;
+                if (group_lane == 0 && global_group < p.h_q / 8) {
+                    reinterpret_cast<float*>(p.out_sf)[token * p.stride_out_sf_token
+                        + int64_t(global_group) * p.stride_out_sf_group] = scale;
+                }
+            }
+            return __shfl_sync(0xffffffff, inverse, 0);
+        } else {
+            if (tidx % 32 == 0) partials[tidx / 32] = amax;
+            __syncthreads();
+            if (group_lane == 0) {
+                #pragma unroll
+                for (int warp = 0; warp < kWarpsPerGroup; ++warp)
+                    amax = fmaxf(amax, partials[group * kWarpsPerGroup + warp]);
+                const float scale = amax / 448.0f;
+                inverses[group] = 1.0f / scale;
+                if (global_group < p.h_q / 8) {
+                    reinterpret_cast<float*>(p.out_sf)[token * p.stride_out_sf_token
+                        + int64_t(global_group) * p.stride_out_sf_group] = scale;
+                }
+            }
+            __syncthreads();
+            return inverses[group];
+        }
+    };
+
+    if constexpr (P::per_token_scale && H8 && kThreadsPerGroup == 256) {
+        // Each H8 thread owns two vectors. Keep the post-RoPE FP32 bits
+        // across the scale reduction instead of storing and reloading sO.
+        alignas(16) float retained[2][8]{};
+        float amax = 1e-4f;
+        float amax1 = 0.0f, amax2 = 0.0f, amax3 = 0.0f;
+        cute::for_each(make_seq<2>{}, [&](auto slot) {
+            constexpr int kSlot = decltype(slot)::value;
+            const int vector = group_lane + kSlot * kThreadsPerGroup;
+            const int row = group * 8 + vector / 64;
+            const int col = (vector % 64) * 8;
+            const int head = first_head + row;
+            const bool live = head < p.h_q && (valid ? valid[row]
+                : (!lse || ((__float_as_uint(lse[token * p.h_q + head]) & 0x7f800000u) != 0x7f800000u)));
+            auto& values = retained[kSlot];
+            if (live) {
+                *reinterpret_cast<float4*>(values) = *reinterpret_cast<const float4*>(&sO(row, col));
+                *reinterpret_cast<float4*>(values + 4) = *reinterpret_cast<const float4*>(&sO(row, col + 4));
+            }
+            if (col >= 448) {
+                #pragma unroll
+                for (int i = 0; i < 8; i += 2) {
+                    const int pair = (col - 448 + i) / 2;
+                    const float2 x = apply_rope(float2{values[i], values[i + 1]},
+                        __ldg(rope + pair), -__ldg(rope + 32 + pair));
+                    values[i] = x.x;
+                    values[i + 1] = x.y;
+                }
+            }
+            if constexpr (!EnableNorm) {
+                #pragma unroll
+                for (int i = 0; i < 8; i += 4) {
+                    amax = fmaxf(amax, fabsf(values[i]));
+                    amax1 = fmaxf(amax1, fabsf(values[i + 1]));
+                    amax2 = fmaxf(amax2, fabsf(values[i + 2]));
+                    amax3 = fmaxf(amax3, fabsf(values[i + 3]));
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(values[i]));
+            }
+        });
+        if constexpr (!EnableNorm)
+            amax = fmaxf(fmaxf(amax, amax1), fmaxf(amax2, amax3));
+        if constexpr (P::per_token_scale && !EnableNorm) {
+            // Each lane maximum is positive (floor1e-4). Its unsigned IEEE
+            // bits have the same ordering; SM89 lowers this to v.red.max.u32.
+            amax = __uint_as_float(__reduce_max_sync(0xffffffff, __float_as_uint(amax)));
+        } else {
+        #pragma unroll
+        for (int delta = 16; delta > 0; delta /= 2)
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
+        }
+        const float scale_inv = publish_inverse(amax);
+        cute::for_each(make_seq<2>{}, [&](auto slot) {
+            constexpr int kSlot = decltype(slot)::value;
+            const int vector = group_lane + kSlot * kThreadsPerGroup;
+            const int row = group * 8 + vector / 64;
+            const int col = (vector % 64) * 8;
+            if (first_head + row >= p.h_q) return;
+            const auto& values = retained[kSlot];
+            uint2 packed;
+            #pragma unroll
+            for (int i = 0; i < 8; i += 4) {
+                const uint32_t low = fp8_pair_from_float(values[i] * scale_inv,
+                    values[i + 1] * scale_inv);
+                const uint32_t high = fp8_pair_from_float(values[i + 2] * scale_inv,
+                    values[i + 3] * scale_inv);
+                (i == 0 ? packed.x : packed.y) = low | (high << 16);
+            }
+            const int64_t offset = token * p.h_q * 512 + int64_t(global_group) * 4096
+                + (col / 32) * (8 * 32) + (row % 8) * 32 + col % 32;
+            *reinterpret_cast<uint2*>(p.out_fp8 + offset) = packed;
+        });
+        return;
+    }
+    if constexpr (P::per_token_scale && !EnableNorm && !H8) {
+        // The MMA accumulator is retired after staging O. Keep the transformed
+        // values there until the group scale is ready instead of staging twice.
+        constexpr int kVectors = 512 / kThreadsPerGroup;
+        static_assert(decltype(cute::size(retired))::value >= kVectors * 8);
+        float amax = 1e-4f;
+        float amax1 = 0.0f, amax2 = 0.0f, amax3 = 0.0f;
+        cute::for_each(make_seq<kVectors>{}, [&](auto slot) {
+        constexpr int kSlot = decltype(slot)::value;
+        const int vector = group_lane + kSlot * kThreadsPerGroup;
+        const int row = group * 8 + vector / 64;
+        const int col = (vector % 64) * 8;
+        const int head = first_head + row;
+        const bool live = head < p.h_q && (valid ? valid[row]
+            : (!lse || ((__float_as_uint(lse[token * p.h_q + head]) & 0x7f800000u) != 0x7f800000u)));
+        alignas(16) float values[8]{};
+        if (live) {
+            *reinterpret_cast<float4*>(values) = *reinterpret_cast<const float4*>(&sO(row, col));
+            *reinterpret_cast<float4*>(values + 4) = *reinterpret_cast<const float4*>(&sO(row, col + 4));
+        }
+        if (col >= 448) {
+            #pragma unroll
+            for (int i = 0; i < 8; i += 2) {
+                const int pair = (col - 448 + i) / 2;
+                const float2 x = apply_rope(float2{values[i], values[i + 1]},
+                    __ldg(rope + pair), -__ldg(rope + 32 + pair));
+                values[i] = x.x;
+                values[i + 1] = x.y;
+            }
+        }
+        if constexpr (!EnableNorm) {
+                #pragma unroll
+                for (int i = 0; i < 8; i += 4) {
+                    amax = fmaxf(amax, fabsf(values[i]));
+                    amax1 = fmaxf(amax1, fabsf(values[i + 1]));
+                    amax2 = fmaxf(amax2, fabsf(values[i + 2]));
+                    amax3 = fmaxf(amax3, fabsf(values[i + 3]));
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(values[i]));
+            }
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) retired(kSlot * 8 + i) = values[i];
+        });
+    if constexpr (!EnableNorm)
+            amax = fmaxf(fmaxf(amax, amax1), fmaxf(amax2, amax3));
+    if constexpr (P::per_token_scale && !EnableNorm) {
+            // Each lane maximum is positive (floor1e-4). Its unsigned IEEE
+            // bits have the same ordering; SM89 lowers this to v.red.max.u32.
+            amax = __uint_as_float(__reduce_max_sync(0xffffffff, __float_as_uint(amax)));
+        } else {
+    #pragma unroll
+    for (int delta = 16; delta > 0; delta /= 2)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
+        }
+    const float scale_inv = publish_inverse(amax);
+        cute::for_each(make_seq<kVectors>{}, [&](auto slot) {
+        constexpr int kSlot = decltype(slot)::value;
+        const int vector = group_lane + kSlot * kThreadsPerGroup;
+        const int row = group * 8 + vector / 64;
+        const int col = (vector % 64) * 8;
+        if (first_head + row >= p.h_q) return;
+        uint2 packed;
+        #pragma unroll
+        for (int i = 0; i < 8; i += 4) {
+            const uint32_t low = fp8_pair_from_float(retired(kSlot * 8 + i) * scale_inv,
+                retired(kSlot * 8 + i + 1) * scale_inv);
+            const uint32_t high = fp8_pair_from_float(retired(kSlot * 8 + i + 2) * scale_inv,
+                retired(kSlot * 8 + i + 3) * scale_inv);
+            (i == 0 ? packed.x : packed.y) = low | (high << 16);
+        }
+        const int64_t offset = token * p.h_q * 512 + int64_t(global_group) * 4096
+            + (col / 32) * (8 * 32) + (row % 8) * 32 + col % 32;
+        *reinterpret_cast<uint2*>(p.out_fp8 + offset) = packed;
+        });
+        return;
+    }
+    float amax = 1e-4f;
+    #pragma unroll
+    for (int vector = group_lane; vector < 4096 / 8; vector += kThreadsPerGroup) {
+        const int row = group * 8 + vector / 64;
+        const int col = (vector % 64) * 8;
+        const int head = first_head + row;
+        const bool live = head < p.h_q && (valid ? valid[row]
+            : (!lse || ((__float_as_uint(lse[token * p.h_q + head]) & 0x7f800000u) != 0x7f800000u)));
+        alignas(16) float values[8]{};
+        if (live) {
+            *reinterpret_cast<float4*>(values) = *reinterpret_cast<const float4*>(&sO(row, col));
+            *reinterpret_cast<float4*>(values + 4) = *reinterpret_cast<const float4*>(&sO(row, col + 4));
+        }
+        if (col >= 448) {
+            #pragma unroll
+            for (int i = 0; i < 8; i += 2) {
+                const int pair = (col - 448 + i) / 2;
+                const float2 x = apply_rope(float2{values[i], values[i + 1]},
+                    __ldg(rope + pair), -__ldg(rope + 32 + pair));
+                values[i] = x.x;
+                values[i + 1] = x.y;
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(values[i]));
+        *reinterpret_cast<float4*>(&sO(row, col)) = *reinterpret_cast<const float4*>(values);
+        *reinterpret_cast<float4*>(&sO(row, col + 4)) = *reinterpret_cast<const float4*>(values + 4);
+    }
+    if constexpr (P::per_token_scale && !EnableNorm) {
+            // Each lane maximum is positive (floor1e-4). Its unsigned IEEE
+            // bits have the same ordering; SM89 lowers this to v.red.max.u32.
+            amax = __uint_as_float(__reduce_max_sync(0xffffffff, __float_as_uint(amax)));
+        } else {
+    #pragma unroll
+    for (int delta = 16; delta > 0; delta /= 2)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
+        }
+    const float scale_inv = publish_inverse(amax);
+    #pragma unroll
+    for (int vector = group_lane; vector < 4096 / 8; vector += kThreadsPerGroup) {
+        const int row = group * 8 + vector / 64;
+        const int col = (vector % 64) * 8;
+        if (first_head + row >= p.h_q) continue;
+        uint2 packed;
+        #pragma unroll
+        for (int i = 0; i < 8; i += 4) {
+            const uint32_t low = fp8_pair_from_float(sO(row, col + i) * scale_inv,
+                sO(row, col + i + 1) * scale_inv);
+            const uint32_t high = fp8_pair_from_float(sO(row, col + i + 2) * scale_inv,
+                sO(row, col + i + 3) * scale_inv);
+            (i == 0 ? packed.x : packed.y) = low | (high << 16);
+        }
+        const int64_t offset = token * p.h_q * 512 + int64_t(global_group) * 4096
+            + (col / 32) * (8 * 32) + (row % 8) * 32 + col % 32;
+        *reinterpret_cast<uint2*>(p.out_fp8 + offset) = packed;
+    }
+}
+
 template<typename KT>
 constexpr bool h8_output_float4_layout() {
     typename KT::SmemLayoutO layout{};
@@ -250,6 +529,13 @@ __forceinline__ __device__ void store_output(
     const int tidx = threadIdx.x;
     const int warp = tidx / 32;
     const int lane = tidx % 32;
+    constexpr bool kDeferredLSE = P::per_token_scale && !P::kEnableNorm;
+    constexpr size_t kStageBytes = cute::cosize(typename KT::SmemLayoutO{}) * sizeof(float);
+    constexpr size_t kPartialsBytes = (KT::kNThreads / 32 + kBlockM / 8) * sizeof(float);
+    if constexpr (kDeferredLSE)
+        static_assert(kStageBytes + kPartialsBytes + kBlockM * sizeof(bool) <= KT::kSmemSizeAccum);
+    bool* row_valid = reinterpret_cast<bool*>(smem + KT::kSmemSizeAccum - kBlockM * sizeof(bool));
+    auto publish_lse = [&](auto local_only) {
     if (warp < KT::AtomLayoutQ && lane % 4 == 0) {
         const int row_base = warp * MMA_ATOM_M + lane / 4;
         #pragma unroll
@@ -257,9 +543,17 @@ __forceinline__ __device__ void store_output(
             const int row = row_base + (mi / MMA_ATOM_K_M) * (MMA_ATOM_M * KT::AtomLayoutQ)
                 + (mi % MMA_ATOM_K_M) * 8;
             const int head = h_k_idx * kBlockM + row;
-            if (head < p.real_heads) p.lse_out[int64_t(token) * p.real_heads + head] = softmax.lse(mi);
+            if constexpr (decltype(local_only)::value) {
+                row_valid[row] = (__float_as_uint(softmax.lse(mi)) & 0x7f800000u) != 0x7f800000u;
+            } else {
+                if (head < p.real_heads) p.lse_out[int64_t(token) * p.real_heads + head] = softmax.lse(mi);
+            }
         }
     }
+    };
+    // The staging barrier publishes local validity. Keep the public LSE store
+    // after quantization so this path does not reread its own global output.
+    publish_lse(cute::bool_constant<kDeferredLSE>{});
     // H8 stages O below the row scales, so its PV warps can finish rescaling independently.
     if constexpr (kBlockM != 16) __syncthreads();
 
@@ -272,6 +566,13 @@ __forceinline__ __device__ void store_output(
     cute::copy(smem_tiled_copy_O, tOrO, tOsO);
     __syncthreads();
 
+    if (p.per_token_scale) {
+        store_per_token_output<KT, kBlockM == 16, P::kEnableNorm>(
+            p, token, h_k_idx * kBlockM, smem, sO, acc_o,
+            kDeferredLSE ? row_valid : nullptr, kDeferredLSE ? nullptr : p.lse_out);
+        if constexpr (kDeferredLSE) publish_lse(cute::false_type{});
+        return;
+    }
     if constexpr (kBlockM == 16) {
         store_h8_output<KT>(p, token, tidx, sO);
         return;
@@ -326,7 +627,7 @@ __forceinline__ __device__ void store_output(
 
 }
 
-template<bool EnableNorm>
+template<bool EnableNorm, bool PerTokenScale>
 struct FusedSplitKVParams : Flash_fwd_params {
     float rms_norm_eps;
     const int32_t* token_positions;
@@ -336,6 +637,8 @@ struct FusedSplitKVParams : Flash_fwd_params {
     float* lse_out;
     int64_t stride_out_sf_group;
     int64_t stride_out_sf_word;
+    int64_t stride_out_sf_token;
+    static constexpr bool per_token_scale = PerTokenScale;
     int64_t stride_q_token;
     int real_heads;
 
@@ -360,10 +663,10 @@ struct FusedSplitKVParams : Flash_fwd_params {
     }
 };
 
-template<typename KT, bool EnableNorm, bool ExtraFP4>
+template<typename KT, bool EnableNorm, bool ExtraFP4, bool PerTokenScale>
 __global__ void __launch_bounds__(KT::kNThreads, 1, 1)
 fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
-    __grid_constant__ const FusedSplitKVParams<EnableNorm> params) {
+    __grid_constant__ const FusedSplitKVParams<EnableNorm, PerTokenScale> params) {
     constexpr int kBlockN = KT::kBlockN;
     constexpr int kMetadataBlockN = 64;
     const int m_block = blockIdx.x;
@@ -423,8 +726,8 @@ fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
     }
 }
 
-template<int Heads, bool EnableNorm, bool ExtraFP4>
-void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
+template<int Heads, bool EnableNorm, bool ExtraFP4, bool PerTokenScale>
+void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel_impl(
     const Params& params, const SplitKVParams& split) {
     static_assert(Heads == 8 || Heads == 64 || Heads == 128);
     TORCH_CHECK(params.mode == FwdMode::Decode && params.h_q == Heads
@@ -437,7 +740,7 @@ void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
     const bool has_extra = params.extra_kv != nullptr && params.extra_topk > 0;
     if (has_extra) TORCH_CHECK(params.extra_page_block_size > 0);
 
-    FusedSplitKVParams<EnableNorm> p{};
+    FusedSplitKVParams<EnableNorm, PerTokenScale> p{};
     p.b = params.s_q;
     p.q_orig = 1;
     p.seqlen_q = Heads;
@@ -489,6 +792,7 @@ void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
     p.lse_out = params.lse;
     p.stride_out_sf_group = params.stride_out_sf_group;
     p.stride_out_sf_word = params.stride_out_sf_word;
+    p.stride_out_sf_token = params.stride_out_sf_token;
     p.stride_q_token = params.stride_q_s_q;
     p.real_heads = Heads;
 
@@ -496,7 +800,7 @@ void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
         using KT = splitkv::Traits<Heads, kPagePow2>;
         constexpr size_t smem_size = splitkv::scratch_offset<KT, ExtraFP4>() + splitkv::scratch_bytes<KT>();
         static_assert(smem_size <= 256 * 1024);
-        auto kernel = &fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<KT, EnableNorm, ExtraFP4>;
+        auto kernel = &fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<KT, EnableNorm, ExtraFP4, PerTokenScale>;
         if (smem_size >= 48 * 1024) {
             C10_CUDA_CHECK(hggcFuncSetAttribute(
                 kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -510,6 +814,7 @@ void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
         if (!split.tile_scheduler_metadata) return;
     }
     combine::Params c{};
+    c.per_token_scale = PerTokenScale;
     c.s_q = params.s_q;
     c.h_q = Heads;
     c.num_sm_parts = split.num_sm_parts;
@@ -524,8 +829,19 @@ void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
     c.lse = params.lse;
     c.stride_out_sf_group = params.stride_out_sf_group;
     c.stride_out_sf_word = params.stride_out_sf_word;
+    c.stride_out_sf_token = params.stride_out_sf_token;
     c.stream = params.stream;
     combine::run_fused_norm_rope_attn_rope_cast_combine_kernel(c);
+}
+
+template<int Heads, bool EnableNorm, bool ExtraFP4>
+void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
+    const Params& params, const SplitKVParams& split) {
+    if (params.per_token_scale) {
+        run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel_impl<Heads, EnableNorm, ExtraFP4, true>(params, split);
+    } else {
+        run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel_impl<Heads, EnableNorm, ExtraFP4, false>(params, split);
+    }
 }
 
 }

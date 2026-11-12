@@ -13,6 +13,7 @@ struct Params {
     int s_q, s_kv, h_q, topk;
     float sm_scale, sm_scale_log2, rms_norm_eps;
     bool enable_q_norm;
+    bool per_token_scale;
     const void* q;
     const void* kv;
     const int32_t* indices;
@@ -36,8 +37,15 @@ struct Params {
     uint32_t* out_sf;
     float* max_logits;
     float* lse;
-    int64_t stride_out_sf_group, stride_out_sf_word;
+    int64_t stride_out_sf_token, stride_out_sf_group, stride_out_sf_word;
     hggcStream_t stream;
+};
+
+// Keep output-format choices constant inside kernels while the host API selects
+// the format for each call through the existing quantization parameters.
+template<bool PerTokenScale>
+struct OutputParams : Params {
+    static constexpr bool per_token_scale = PerTokenScale;
 };
 
 template<FwdMode Mode, int Heads, bool EnableNorm, bool ExtraFP4>

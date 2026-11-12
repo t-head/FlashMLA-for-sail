@@ -1,31 +1,40 @@
 #pragma once
 
 #include <cstddef>
+#include <type_traits>
 #include "api/common.h"
 #include "fused_v41_wi.cuh"
 #include "decode/sparse/sparse_decode_wg_hs64.cuh"
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
+template<bool PerTokenScale>
 struct FusedHs64Params : Flash_fwd_mla_params {
     float rms_norm_eps;
     const int32_t* token_positions;
     const float* cos_sin_cache;
     uint8_t* out_fp8;
     uint32_t* out_sf;
+    static constexpr bool per_token_scale = PerTokenScale;
     float* max_logits;
     int64_t stride_q_s_q;
+    int64_t stride_out_sf_token;
     int64_t stride_out_sf_group;
     int64_t stride_out_sf_word;
 };
 
-template<bool Norm, typename Base, bool WideOutput = false, bool SkipNextKPrefetch = false>
+template<bool Norm, typename Base, bool WideOutput = false, bool SkipNextKPrefetch = false,
+         bool PerTokenScale = false>
 struct FusedHs64Traits : Base {
+    using FusedParams = FusedHs64Params<PerTokenScale>;
+    static constexpr bool kPerTokenScale = PerTokenScale;
     using SharedMemoryPlan = typename Base::SharedMemoryPlan;
     using SmemLayoutO_Half64x256 = typename Base::SmemLayoutO_Half;
     static constexpr bool kFusedHs64 = true;
+    static constexpr bool kFusedDirectQueries = false;
     static constexpr bool kSkipNextKPrefetch = SkipNextKPrefetch;
     static constexpr bool kPersistentPrefillQueries = false;
+    static constexpr int kFixedPrefillBlocks = 0;
     static constexpr bool kCachePrefillRope = false;
     static constexpr bool kDeferPrefillSink = false;
     static constexpr bool kFusedPackedFp4 =
@@ -56,9 +65,6 @@ struct FusedHs64Traits : Base {
     static_assert(cosize_v<SmemLayoutO_Half64x256> * sizeof(float) == 65536);
     static_assert(Base::kBlockM == 64 && Base::kBlockN == 64 && Base::NUM_THREADS == 512);
     static_assert(Base::kUsePairedCubes == Base::kIsPrefill && Base::kUsePv2x4);
-    static_assert(!WideOutput || (Base::kIsPrefill && (Base::kGroupPrefillQueries || !Norm))
-        || kFusedPackedFp4 || (!Norm && flashmla::dsa::hs64::kPackedMain<Base> == 128
-            && flashmla::dsa::hs64::kWorklist<Base> != flashmla::dsa::hs64::Hs64Worklist::Batch));
 
     static __forceinline__ __device__ int q_offset(int row, int dim) {
         if constexpr (Base::kUsePairedCubes) return paired_q_offset<64>(row, dim);
@@ -83,7 +89,7 @@ struct FusedHs64Traits : Base {
 
     template<typename T>
     static __forceinline__ __device__ void prefetch_prefill_rope(
-        const FusedHs64Params& fused, int batch_idx, int tidx) {
+        const FusedParams& fused, int batch_idx, int tidx) {
         if constexpr (T::kCachePrefillRope) {
             if (tidx < 64) {
                 const int position = __ldg(fused.token_positions + batch_idx);
@@ -96,7 +102,7 @@ struct FusedHs64Traits : Base {
 
     template<typename T>
     static __forceinline__ __device__ const float* q_rope(
-        const FusedHs64Params& fused, int batch_idx) {
+        const FusedParams& fused, int batch_idx) {
         if constexpr (T::kCachePrefillRope) {
             return prefill_rope_slot(batch_idx);
         } else {
@@ -116,7 +122,7 @@ struct FusedHs64Traits : Base {
         const Flash_fwd_mla_params& params, int batch_idx, int, int,
         TensorQ& sQ, int tidx, int, __mbarrier_t* barrier_Q) {
         extern __shared__ char wksp_buf[];
-        const auto& fused = static_cast<const FusedHs64Params&>(params);
+        const auto& fused = static_cast<const FusedParams&>(params);
         auto* partials = reinterpret_cast<float*>(wksp_buf + kNormScratchOffset);
         auto* norm = reinterpret_cast<float*>(wksp_buf + kNormOffset);
         const int row = tidx % 64;
@@ -231,7 +237,7 @@ struct FusedHs64Traits : Base {
     template<typename T, typename TensorQ>
     static __forceinline__ __device__ void finish_fused_q(
         const Flash_fwd_mla_params& params, int batch_idx, TensorQ& sQ, int tidx) {
-        const auto& fused = static_cast<const FusedHs64Params&>(params);
+        const auto& fused = static_cast<const FusedParams&>(params);
         const auto* src = static_cast<const typename T::InputT*>(fused.q_ptr)
             + int64_t(batch_idx) * fused.stride_q_s_q;
         if((reinterpret_cast<uintptr_t>(src) & 15) != 0) return;
@@ -337,7 +343,7 @@ struct FusedHs64Traits : Base {
     static __forceinline__ __device__ float2 load_rms(
         const Flash_fwd_mla_params& params, int idx_in_warpgroup) {
         extern __shared__ char wksp_buf[];
-        const auto& fused = static_cast<const FusedHs64Params&>(params);
+        const auto& fused = static_cast<const FusedParams&>(params);
         const auto* partials = reinterpret_cast<const float4*>(wksp_buf + kNormScratchOffset);
         const int row = flashmla::dsa::hs64::get_AorC_row_idx<Base::kAtomLayoutM>(0, idx_in_warpgroup);
         auto rms = [&](int head) {
@@ -380,12 +386,19 @@ struct FusedHs64Traits : Base {
         TensorO& rO, const float* rNorm, char* sO_addr,
         const Flash_fwd_mla_params& params, int batch_idx, int, int,
         int num_valid_seq_q, int warpgroup_idx, int idx_in_warpgroup) {
-        const auto& fused = static_cast<const FusedHs64Params&>(params);
+        static_assert(!WideOutput || (Base::kIsPrefill && (Base::kGroupPrefillQueries || !Norm))
+            || kFusedPackedFp4 || (!Norm && flashmla::dsa::hs64::kPackedMain<Base> == 128
+                && flashmla::dsa::hs64::kWorklist<Base> != flashmla::dsa::hs64::Hs64Worklist::Batch)
+            || (T::kFusedDirectQueries && !Norm && Base::kArch == 89 && !Base::kIsPrefill
+                && Base::kHeadDim == 512 && Base::kV41FP8 && Base::kExtraFP4
+                && !Base::kHasExtraKTile && !Base::kParkQ5Fragment));
+        const auto& fused = static_cast<const FusedParams&>(params);
         Tensor rowcol = make_tensor(rO.data(),
             flashmla::dsa::hs64::hs64_convert_layout_acc_rowcol<T>(rO.layout()));
         static_assert(decltype(size<0>(rowcol))::value == 4);
         static_assert(decltype(size<1>(rowcol))::value == 16);
-        const bool deferred_sink = T::kDeferPrefillSink && params.attn_sink_ptr != nullptr;
+        const bool deferred_sink = T::kDeferPrefillSink &&
+            (Base::kIsPrefill || params.attn_sink_ptr != nullptr);
         if (!deferred_sink) {
             #pragma unroll
             for(int mi = 0; mi < 4; ++mi) {
@@ -404,14 +417,18 @@ struct FusedHs64Traits : Base {
         auto& plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
         auto* sink_scales = reinterpret_cast<float*>(wksp_buf + kNormOffset);
         if constexpr (T::kDeferPrefillSink) {
+            static_assert(!Norm && WideOutput);
             if (deferred_sink && item < 64) {
                 // The prolog to the output epilogue published both WG sums.
                 const float sum = plan.sL_reduction_wksp[head] + plan.sL_reduction_wksp[head + 128];
-                const auto* sink_logits = reinterpret_cast<const float*>(wksp_buf + kPrefillSinkOffset);
-                const float sink = sink_logits[head];
-                const float sink_exp = expf(sink - plan.smem_sM[head] * (float)M_LN2);
+                float denominator = sum;
+                if (params.attn_sink_ptr != nullptr) {
+                    const auto* sink_logits = reinterpret_cast<const float*>(wksp_buf + kPrefillSinkOffset);
+                    const float sink = sink_logits[head];
+                    denominator += expf(sink - plan.smem_sM[head] * (float)M_LN2);
+                }
                 sink_scales[head] = sum == 0.0f || sum != sum ? __uint_as_float(0x7fc00000u)
-                    : __fdividef(1.0f, sum + sink_exp);
+                    : __fdividef(1.0f, denominator);
             }
         }
         if constexpr (kFusedPackedFp4) {
@@ -454,10 +471,32 @@ struct FusedHs64Traits : Base {
                 cute::copy(copy_c, src, dst);
             }
         };
-        auto quantize_half = [&](const auto& half, int tile_begin) {
+        // P is retired after the final PV. Unlike RMS scratch, it cannot hold
+        // the following query's prefetched norm partials during this epilogue.
+        static_assert(sizeof(plan.smem_sP) >= (64 + 8) * sizeof(float));
+        auto* group_partials = reinterpret_cast<float*>(plan.smem_sP.data());
+        auto* group_scales = group_partials + 64;
+        auto flush_group_scales = [&] {
+            if constexpr (PerTokenScale && !Norm) {
+                // Publish global SF with the final FP8 stores. The scale
+                // publication barrier then has only shared-memory writes.
+                if (threadIdx.x < 8)
+                    reinterpret_cast<float*>(fused.out_sf)[int64_t(batch_idx) * fused.stride_out_sf_token
+                        + int64_t(threadIdx.x) * fused.stride_out_sf_group] = group_scales[threadIdx.x];
+            }
+        };
+        // Wide staging retires all 64 accumulator slots before either scan.
+        constexpr bool kCacheProcessedOutput = PerTokenScale && WideOutput && !Norm &&
+            !kFusedPackedFp4;
+        int output_cache_half = 0;
+        auto quantize_half = [&](const auto& half, int tile_begin, auto scan_only) {
             if(item < 64 * 8 && head < num_valid_seq_q) {
                 const int tile = item / 64 + tile_begin;
                 alignas(16) float values[32];
+                if constexpr (kCacheProcessedOutput && !decltype(scan_only)::value) {
+                    #pragma unroll
+                    for (int i = 0; i < 32; ++i) values[i] = rO(output_cache_half * 32 + i);
+                } else {
                 if constexpr (WideOutput) {
                     // The swizzle preserves the three low column bits.
                     const int col = (tile & 7) * 32;
@@ -502,25 +541,39 @@ struct FusedHs64Traits : Base {
                         }
                     }
                 }
-                float amax = 0.0f;
-                if constexpr (WideOutput) {
-                    float amax1 = 0.0f, amax2 = 0.0f, amax3 = 0.0f;
+                if constexpr (kCacheProcessedOutput && decltype(scan_only)::value) {
                     #pragma unroll
-                    for(int i = 0; i < 32; i += 4) {
-                        amax = fmaxf(amax, fabsf(values[i]));
-                        amax1 = fmaxf(amax1, fabsf(values[i + 1]));
-                        amax2 = fmaxf(amax2, fabsf(values[i + 2]));
-                        amax3 = fmaxf(amax3, fabsf(values[i + 3]));
-                    }
-                    amax = fmaxf(fmaxf(amax, amax1), fmaxf(amax2, amax3));
-                } else {
-                    #pragma unroll
-                    for(int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(values[i]));
+                    for (int i = 0; i < 32; ++i) rO(output_cache_half * 32 + i) = values[i];
                 }
-                amax = fmaxf(1e-4f, amax);
-                const float scale = amax / 448.0f;
-                const int exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
-                const float scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
+                }
+                float amax = 0.0f;
+                if constexpr (!PerTokenScale || decltype(scan_only)::value) {
+                    if constexpr (WideOutput) {
+                        float amax1 = 0.0f, amax2 = 0.0f, amax3 = 0.0f;
+                        #pragma unroll
+                        for(int i = 0; i < 32; i += 4) {
+                            amax = fmaxf(amax, fabsf(values[i]));
+                            amax1 = fmaxf(amax1, fabsf(values[i + 1]));
+                            amax2 = fmaxf(amax2, fabsf(values[i + 2]));
+                            amax3 = fmaxf(amax3, fabsf(values[i + 3]));
+                        }
+                        amax = fmaxf(fmaxf(amax, amax1), fmaxf(amax2, amax3));
+                    } else {
+                        #pragma unroll
+                        for(int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(values[i]));
+                    }
+                    amax = fmaxf(1e-4f, amax);
+                }
+                if constexpr (decltype(scan_only)::value) return amax;
+                int exponent = 0;
+                float scale_inv;
+                if constexpr (PerTokenScale) {
+                    scale_inv = __fdividef(1.0f, group_scales[head / 8]);
+                } else {
+                    const float scale = amax / 448.0f;
+                    exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
+                    scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
+                }
                 alignas(16) uint8_t packed[32];
                 auto* pairs = reinterpret_cast<uint16_t*>(packed);
                 #pragma unroll
@@ -535,11 +588,39 @@ struct FusedHs64Traits : Base {
                 const auto* words = reinterpret_cast<const uint4*>(packed);
                 out[0] = words[0];
                 out[1] = words[1];
-                const int sf_index = tile * 8 + in_group;
-                auto* sf_word = fused.out_sf + batch_idx + int64_t(group) * fused.stride_out_sf_group
-                    + int64_t(sf_index / 4) * fused.stride_out_sf_word;
-                reinterpret_cast<uint8_t*>(sf_word)[sf_index % 4] = uint8_t(exponent + 127);
+                if constexpr (!PerTokenScale) {
+                    const int sf_index = tile * 8 + in_group;
+                    auto* sf_word = fused.out_sf + batch_idx + int64_t(group) * fused.stride_out_sf_group
+                        + int64_t(sf_index / 4) * fused.stride_out_sf_word;
+                    reinterpret_cast<uint8_t*>(sf_word)[sf_index % 4] = uint8_t(exponent + 127);
+                }
             }
+            return 0.0f;
+        };
+        auto publish_group_scales = [&](float amax) {
+            // Eight adjacent lanes cover eight heads at the same V tile. Each
+            // thread first combines both of its tiles, then the CTA combines
+            // the eight tile-pair partials for each 4096-element WV group.
+            #pragma unroll
+            for (int offset = 4; offset >= 1; offset /= 2) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, 8));
+            }
+            if ((threadIdx.x & 7) == 0) group_partials[threadIdx.x / 8] = amax;
+            __syncthreads();
+            if (threadIdx.x < 8) {
+                const int group = threadIdx.x;
+                float group_amax = 1e-4f;
+                #pragma unroll
+                for (int tile_pair = 0; tile_pair < 8; ++tile_pair) {
+                    group_amax = fmaxf(group_amax, group_partials[tile_pair * 8 + group]);
+                }
+                const float scale = group_amax / 448.0f;
+                group_scales[group] = scale;
+                if constexpr (!PerTokenScale || Norm)
+                reinterpret_cast<float*>(fused.out_sf)[int64_t(batch_idx) * fused.stride_out_sf_token
+                    + int64_t(group) * fused.stride_out_sf_group] = scale;
+            }
+            __syncthreads();
         };
         using HalfLayout = typename T::SmemLayoutO_Half64x256;
         if constexpr (WideOutput) {
@@ -549,29 +630,124 @@ struct FusedHs64Traits : Base {
             auto* staging = reinterpret_cast<float*>(plan.smem_sK.data());
             auto stage = make_tensor(make_smem_ptr(staging + warpgroup_idx * half_elements), HalfLayout{});
             stage_half(stage);
-            if constexpr (kFusedPackedFp4) {
+            if constexpr (PerTokenScale) {
+                // A WV scale spans both warpgroups, even when the old packed
+                // output path needs only a warpgroup-local publication.
+                if constexpr (PerTokenScale && kFusedPackedFp4 && !Norm) {
+                    // Each warp owns eight consecutive heads at one N tile.
+                    // Reduce the normalized, inverse-rotated MMA registers
+                    // directly, without scanning the staged FP32 image.
+                    static_assert(T::kPvAtomLayoutM == 2 && T::kPvAtomLayoutN == 4);
+                    #pragma unroll
+                    for (int mi = 0; mi < 4; ++mi) {
+                        float amax = 1e-4f, amax1 = 0.0f, amax2 = 0.0f, amax3 = 0.0f;
+                        #pragma unroll
+                        for (int ni = 0; ni < 16; ni += 4) {
+                            amax = fmaxf(amax, fabsf(rowcol(mi, ni)));
+                            amax1 = fmaxf(amax1, fabsf(rowcol(mi, ni + 1)));
+                            amax2 = fmaxf(amax2, fabsf(rowcol(mi, ni + 2)));
+                            amax3 = fmaxf(amax3, fabsf(rowcol(mi, ni + 3)));
+                        }
+                        amax = fmaxf(fmaxf(amax, amax1), fmaxf(amax2, amax3));
+                        amax = __uint_as_float(__reduce_max_sync(0xffffffff, __float_as_uint(amax)));
+                        const int row = flashmla::dsa::hs64::get_PV_row_idx<T>(mi, idx_in_warpgroup);
+                        const int tile = warpgroup_idx * 4 + idx_in_warpgroup / 64;
+                        if ((threadIdx.x & 31) == 0) group_partials[tile * 8 + row / 8] = amax;
+                    }
+                    __syncthreads();
+                    if (threadIdx.x < 8) {
+                        float amax = 1e-4f;
+                        #pragma unroll
+                        for (int tile = 0; tile < 8; ++tile)
+                            amax = fmaxf(amax, group_partials[tile * 8 + threadIdx.x]);
+                        const float scale = amax / 448.0f;
+                        group_scales[threadIdx.x] = scale;
+                        if constexpr (!PerTokenScale || Norm)
+                        reinterpret_cast<float*>(fused.out_sf)[int64_t(batch_idx) * fused.stride_out_sf_token
+                            + int64_t(threadIdx.x) * fused.stride_out_sf_group] = scale;
+                    }
+                    __syncthreads();
+                    const int first_tile = warpgroup_idx * 8;
+                    quantize_half(stage, first_tile, std::false_type{});
+                    quantize_half(stage, first_tile + 4, std::false_type{});
+                    flush_group_scales();
+                    __syncthreads();
+                    return;
+                }
+                __syncthreads();
+                float amax = 0.0f;
+                if constexpr (kFusedPackedFp4) {
+                    const int first_tile = warpgroup_idx * 8;
+                    amax = quantize_half(stage, first_tile, std::true_type{});
+                    amax = fmaxf(amax, quantize_half(stage, first_tile + 4, std::true_type{}));
+                } else {
+                    #pragma unroll
+                    for (int pass = 0; pass < 2; ++pass) {
+                        auto half = make_tensor(make_smem_ptr(staging + pass * half_elements), HalfLayout{});
+                        if constexpr (kCacheProcessedOutput) output_cache_half = pass;
+                        amax = fmaxf(amax, quantize_half(half, pass * 8, std::true_type{}));
+                    }
+                }
+                publish_group_scales(amax);
+                if constexpr (kFusedPackedFp4) {
+                    const int first_tile = warpgroup_idx * 8;
+                    quantize_half(stage, first_tile, std::false_type{});
+                    quantize_half(stage, first_tile + 4, std::false_type{});
+                } else {
+                    #pragma unroll
+                    for (int pass = 0; pass < 2; ++pass) {
+                        auto half = make_tensor(make_smem_ptr(staging + pass * half_elements), HalfLayout{});
+                        if constexpr (kCacheProcessedOutput) output_cache_half = pass;
+                        quantize_half(half, pass * 8, std::false_type{});
+                    }
+                }
+                flush_group_scales();
+                // The next attention iteration may reuse P for score tiles.
+                __syncthreads();
+            } else if constexpr (kFusedPackedFp4) {
                 // The reductions have finished using barriers 8 and 9.
                 // Each warpgroup reads only its own staged output half.
                 __ppu_barrier_sync(8 + warpgroup_idx, T::NUM_THREADS / 2, 15u);
                 const int first_tile = warpgroup_idx * 8;
-                quantize_half(stage, first_tile);
-                quantize_half(stage, first_tile + 4);
+                quantize_half(stage, first_tile, std::false_type{});
+                quantize_half(stage, first_tile + 4, std::false_type{});
             } else {
                 __ppu_barrier_sync(0, T::NUM_THREADS, 15u);
                 #pragma unroll
                 for(int pass = 0; pass < 2; ++pass) {
                     auto half = make_tensor(make_smem_ptr(staging + pass * half_elements), HalfLayout{});
-                    quantize_half(half, pass * 8);
+                    quantize_half(half, pass * 8, std::false_type{});
                 }
             }
         } else {
             auto half = make_tensor(make_smem_ptr(reinterpret_cast<float*>(sO_addr)), HalfLayout{});
-            #pragma unroll
-            for(int pass = 0; pass < 2; ++pass) {
-                if(warpgroup_idx == pass) stage_half(half);
+            if constexpr (PerTokenScale) {
+                float amax = 0.0f;
+                #pragma unroll
+                for (int pass = 0; pass < 2; ++pass) {
+                    if (warpgroup_idx == pass) stage_half(half);
+                    __syncthreads();
+                    amax = fmaxf(amax, quantize_half(half, pass * 8, std::true_type{}));
+                    __syncthreads();
+                }
+                publish_group_scales(amax);
+                // Half 1 is still staged. Quantize it before restoring half 0;
+                // neither retired K bank nor a prefetched next Q is overwritten.
+                quantize_half(half, 8, std::false_type{});
                 __syncthreads();
-                quantize_half(half, pass * 8);
+                if (warpgroup_idx == 0) stage_half(half);
                 __syncthreads();
+                quantize_half(half, 0, std::false_type{});
+                flush_group_scales();
+                __syncthreads();
+            } else {
+                #pragma unroll
+                for(int pass = 0; pass < 2; ++pass) {
+                    if(warpgroup_idx == pass) stage_half(half);
+                    __syncthreads();
+                    quantize_half(half, pass * 8, std::false_type{});
+                    __syncthreads();
+                }
             }
         }
     }

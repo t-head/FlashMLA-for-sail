@@ -166,6 +166,7 @@ default_device = torch.device("cuda:0")
 max_token_position = 131072
 cos_sin_cache = build_cos_sin_cache(max_token_position, default_device)
 rms_norm_eps = 1e-4
+output_scale_gran = 32
 
 @functools.lru_cache(maxsize=None)  # To avoid generating q weight and permuted q weight for multiple times, we cache previously generated q_weight and use them later
 def get_q_b_weight(h_q: int, d_q: int, q_lora_rank: int, scale_gran: int):
@@ -179,10 +180,11 @@ def get_q_b_weight(h_q: int, d_q: int, q_lora_rank: int, scale_gran: int):
 def get_wb_weight(n_wv_group: int, wv_group_size: int, d_o: int, scale_gran: int, wv_proj_out_dim: int):
     kk.utils.set_random_seed(0)
     o_weight = torch.randn((n_wv_group*wv_proj_out_dim, wv_group_size * d_o), dtype=torch.bfloat16) / 10
-    o_weight_quanted = tile_kernels.quant.per_token_cast(o_weight, 'e4m3', scale_gran, use_tma_aligned_col_major_sf=False, round_sf=True, use_packed_ue8m0=False)
-    o_weight_quanted_sf = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
-        o_weight_quanted[1].view(n_wv_group, wv_proj_out_dim, wv_group_size * d_o // scale_gran),
-    )
+    channel_wise = scale_gran == wv_group_size * d_o
+    o_weight_quanted = tile_kernels.quant.per_token_cast(o_weight, 'e4m3', scale_gran, use_tma_aligned_col_major_sf=False, round_sf=not channel_wise, use_packed_ue8m0=False)
+    o_weight_quanted_sf = o_weight_quanted[1].view(n_wv_group, wv_proj_out_dim, wv_group_size * d_o // scale_gran)
+    if not channel_wise:
+        o_weight_quanted_sf = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(o_weight_quanted_sf)
     o_weight_quanted = (o_weight_quanted[0].view(n_wv_group, wv_proj_out_dim, wv_group_size * d_o), o_weight_quanted_sf)
     o_weight_quanted_permuted = flash_mla.fused_norm_rope_attn_rope_cast.permute_wv_proj(o_weight_quanted, wv_group_size, d_o)
     return o_weight_quanted, o_weight_quanted_permuted
@@ -203,6 +205,7 @@ def bench_fused(fn, num_runs):
     main_symbols = (
         "fused_norm_rope_attn_rope_cast_fwd_kernel",
         "fused_norm_rope_attn_rope_cast_decode_hs64_packed_kernel",
+        "fused_norm_rope_attn_rope_cast_decode_hs64_direct_kernel",
         "fused_norm_rope_attn_rope_cast_prefill_hs64_kernel",
         "flash_sparse_prefill_fwd_wg_kernel",
         "flash_sparse_prefill_fwd_kernel",
@@ -238,14 +241,14 @@ def run_test(p: TestParam) -> bool:
     q_b_proj, q_b_proj_permuted = get_q_b_weight(p.h_q, p.d_qk, q_lora_rank, q_b_proj_scale_gran)
     # TODO Make q weight non-contiguous
 
-    o_scale_gran = 32
+    o_scale_gran = output_scale_gran
     enable_q_norm = random.choice([False, True])
     token_positions = torch.randint(0, max_token_position, (p.s_q, ), dtype=torch.int32)
 
     wv_group_size = 8
     n_wv_group = p.h_q // 8
     wv_proj_out_dim = random.choice([256, 512, 1024])
-    wv_proj_scale_gran = 32
+    wv_proj_scale_gran = output_scale_gran
     wv_proj, wv_proj_permuted = get_wb_weight(n_wv_group, wv_group_size, p.d_v, wv_proj_scale_gran, wv_proj_out_dim)
     
     def calculate_q_b_proj(weight) -> torch.Tensor:
@@ -256,7 +259,7 @@ def run_test(p: TestParam) -> bool:
 
     def calculate_wv_proj(output, weight) -> torch.Tensor:
         wv_proj_out = torch.empty((p.s_q, n_wv_group, wv_proj_out_dim), dtype=torch.bfloat16)
-        fp8_einsum_reference(output, weight, wv_proj_out, 32)
+        fp8_einsum_reference(output, weight, wv_proj_out, o_scale_gran)
         return wv_proj_out
     
     def run_fused_norm_rope_attn_rope_cast_fwd():
@@ -265,7 +268,7 @@ def run_test(p: TestParam) -> bool:
             rms_norm_eps,
             token_positions,
             False, 64, cos_sin_cache,
-            n_wv_group, o_scale_gran, True, True, True,
+            n_wv_group, o_scale_gran, o_scale_gran == 32, o_scale_gran == 32, o_scale_gran == 32,
             q_for_fused, t.kv, t.indices,
             sm_scale=t.sm_scale,
             attn_sink=t.attn_sink,
@@ -275,6 +278,9 @@ def run_test(p: TestParam) -> bool:
     lib.device_synchronize()
     ans_out_fp8, ans_out_sf, ans_max_logits, ans_lse = run_fused_norm_rope_attn_rope_cast_fwd()
     lib.device_synchronize()
+    if o_scale_gran == 4096:
+        assert ans_out_sf.dtype == torch.float32 and ans_out_sf.shape == (p.s_q, n_wv_group, 1)
+        assert ans_out_sf.is_contiguous()
     ans_wv_proj_out = calculate_wv_proj((ans_out_fp8, ans_out_sf), wv_proj_permuted)
 
     if p.num_runs > 0:
@@ -294,22 +300,23 @@ def run_test(p: TestParam) -> bool:
         ref_lse[ref_lse == float("-inf")] = float("+inf")
 
         ans_out_sf_2d = ans_out_sf.view(p.s_q, -1)
-        if ans_out_sf_2d.stride(0) != 1:
+        if o_scale_gran == 32 and ans_out_sf_2d.stride(0) != 1:
             # PyTorch normalizes strides of size-1 dims during view(), which breaks
             # tile_kernels' col-major sf layout detection (`sf.stride(0) == 1`) when s_q == 1,
             # so we restore the token-dim stride to 1 manually here
             assert p.s_q == 1
             ans_out_sf_2d = ans_out_sf_2d.as_strided(ans_out_sf_2d.shape, (1, ans_out_sf_2d.stride(1)))
-        ans_wv_out_dequantized = tile_kernels.quant.per_token_cast_back((ans_out_fp8.view(p.s_q, -1), ans_out_sf_2d), 'fp32', 32)
+        ans_wv_out_dequantized = tile_kernels.quant.per_token_cast_back((ans_out_fp8.view(p.s_q, -1), ans_out_sf_2d), 'fp32', o_scale_gran)
         ans_wv_out_dequantized = ans_wv_out_dequantized \
-            .view(p.s_q, n_wv_group, p.d_v // o_scale_gran, wv_group_size, o_scale_gran) \
+            .view(p.s_q, n_wv_group, p.d_v // 32, wv_group_size, 32) \
             .transpose(2, 3) \
             .reshape(p.s_q, p.h_q, p.d_v)
 
-        assert o_scale_gran == 32
-        ref_out_fp8, ref_out_sf = tile_kernels.quant.per_token_cast(ref_out.view(p.s_q, -1), 'e4m3', 32, round_sf=True, use_tma_aligned_col_major_sf=True, use_packed_ue8m0=True)
+        packed = o_scale_gran == 32
+        quant_input = ref_out.view(p.s_q, -1) if packed else ref_out.reshape(p.s_q * n_wv_group, 4096)
+        ref_out_fp8, ref_out_sf = tile_kernels.quant.per_token_cast(quant_input, 'e4m3', o_scale_gran, round_sf=packed, use_tma_aligned_col_major_sf=packed, use_packed_ue8m0=packed)
         ref_wv_proj_out = calculate_wv_proj(
-            (ref_out_fp8.view(p.s_q, n_wv_group, wv_group_size * p.d_v), ref_out_sf.view(p.s_q, n_wv_group, wv_group_size * p.d_v // (32*4))),
+            (ref_out_fp8.view(p.s_q, n_wv_group, wv_group_size * p.d_v), ref_out_sf.view(p.s_q, n_wv_group, wv_group_size * p.d_v // (o_scale_gran * (4 if packed else 1)))),
             wv_proj
         )
         
@@ -344,7 +351,7 @@ def run_decode_test(p: TestParam) -> bool:
     q_lora = tile_kernels.quant.per_token_cast(q_lora, 'e4m3', q_b_proj_scale_gran, None, use_tma_aligned_col_major_sf=True, round_sf=True, use_packed_ue8m0=True)
     q_b_proj, q_b_proj_permuted = get_q_b_weight(p.h_q, p.d_qk, q_lora_rank, q_b_proj_scale_gran)
 
-    o_scale_gran = 32
+    o_scale_gran = output_scale_gran
     enable_q_norm = random.choice([False, True])
     wv_group_size = 8
     n_wv_group = p.h_q // 8
@@ -368,9 +375,9 @@ def run_decode_test(p: TestParam) -> bool:
             cos_sin_cache=cos_sin_cache,
             n_wv_group=n_wv_group,
             num_per_channels=o_scale_gran,
-            use_tma_aligned_col_major_sf=True,
-            round_sf=True,
-            use_packed_ue8m0=True,
+            use_tma_aligned_col_major_sf=o_scale_gran == 32,
+            round_sf=o_scale_gran == 32,
+            use_packed_ue8m0=o_scale_gran == 32,
             q=q_for_fused,
             k_cache=t.kv_scope.get_kvcache_for_flash_mla(),
             indices_in_kvcache=t.kv_scope.indices_in_kvcache.reshape(b*s_q, p.topk),
@@ -386,6 +393,9 @@ def run_decode_test(p: TestParam) -> bool:
     lib.device_synchronize()
     ans_out_fp8, ans_out_sf, ans_lse = run_fused_norm_rope_attn_rope_cast_decode()
     lib.device_synchronize()
+    if o_scale_gran == 4096:
+        assert ans_out_sf.dtype == torch.float32 and ans_out_sf.shape == (b*s_q, n_wv_group, 1)
+        assert ans_out_sf.is_contiguous()
 
     if p.num_runs > 0:
         flops_and_mem_vol = lib.count_flop_and_mem_vol_for_decode(p, t)
@@ -404,11 +414,11 @@ def run_decode_test(p: TestParam) -> bool:
 
         # NOTE Tensors returned by the fused decode kernel do not have the batch dimension (batch size is always 1)
         ans_out_sf_2d = ans_out_sf.view(b*s_q, -1)
-        if ans_out_sf_2d.stride(0) != 1:
+        if o_scale_gran == 32 and ans_out_sf_2d.stride(0) != 1:
             assert s_q == 1
             ans_out_sf_2d = ans_out_sf_2d.as_strided(ans_out_sf_2d.shape, (1, ans_out_sf_2d.stride(1)))
         ans_wv_out_dequantized = tile_kernels.quant.per_token_cast_back(
-            (ans_out_fp8.view(b*s_q, -1), ans_out_sf_2d), 'fp32', 32
+            (ans_out_fp8.view(b*s_q, -1), ans_out_sf_2d), 'fp32', o_scale_gran
         )
         ans_wv_out_dequantized = ans_wv_out_dequantized \
             .view(b*s_q, n_wv_group, p.d_v // 32, wv_group_size, 32) \
@@ -432,7 +442,10 @@ if __name__ == '__main__':
     lib.stick_unit_test_args(parser)
     parser.add_argument("--h-q", type=int, nargs="+", choices=[8, 64, 128], default=[128, 64],
                         help="Head counts to test (H8 requires SM89)")
+    parser.add_argument("--output-scale", choices=("block32", "per-token"), default="block32",
+                        help="Output FP8 scale format; per-token uses one FP32 scale per WV group")
     args = parser.parse_args()
+    output_scale_gran = 4096 if args.output_scale == "per-token" else 32
     if 8 in args.h_q and torch.cuda.get_device_capability() != (8, 9):
         parser.error("--h-q 8 requires SM89")
 
