@@ -4,6 +4,7 @@
 
 #include "api/common.h"
 #include "sparse/fused_v41_wi.cuh"
+#include "decode/sparse/fused_v41_splitkv.cuh"
 #include "prefill/sparse/sparse_prefill_std.cuh"
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
@@ -383,6 +384,8 @@ struct FusedSmallPrefillTraits
         char* smem, int tidx, int m_block, int64_t s_q_idx, int topk_length) {
         using namespace cute;
         const auto& p = params.fused;
+        constexpr bool kRegisterOutput = H8 && !Norm && Params::per_token_scale
+            && ACOMPUTE_VERSION >= 10500;
         bool* valid = reinterpret_cast<bool*>(smem + kScratchOffset);
         constexpr int atom_m = KT::USE_MMA_M8 ? 8 : 16;
         constexpr int atom_k_m = KT::USE_MMA_M8 ? 1 : 2;
@@ -397,10 +400,12 @@ struct FusedSmallPrefillTraits
                 const int head = m_block * KT::kBlockM + row;
                 const bool live = topk_length > 0 && (__float_as_uint(lse(mi)) & 0x7f800000u) != 0x7f800000u;
                 valid[row] = live;
-                if (head < (H8 ? 8 : params.h_q)) {
-                    const int64_t index = s_q_idx * params.h_q + head;
-                    p.lse[index] = live ? lse(mi) * CUDART_LN2_F : INFINITY;
-                    p.max_logits[index] = live ? mlogits(mi) * CUDART_LN2_F : -INFINITY;
+                if constexpr (!kRegisterOutput) {
+                    if (head < (H8 ? 8 : params.h_q)) {
+                        const int64_t index = s_q_idx * params.h_q + head;
+                        p.lse[index] = live ? lse(mi) * CUDART_LN2_F : INFINITY;
+                        p.max_logits[index] = live ? mlogits(mi) * CUDART_LN2_F : -INFINITY;
+                    }
                 }
             }
         }
@@ -411,6 +416,98 @@ struct FusedSmallPrefillTraits
             __syncthreads();
         }
 
+#if FLASHMLA_FUSED_OUTPUT_CHANNELWISE
+        if constexpr (kRegisterOutput) {
+            // Adjacent columns stay paired in the native M16 accumulator.
+            // Keep the eight live rows in registers through scale reduction,
+            // then store FP8 pairs directly without an output staging barrier.
+            static_assert(KT::kBlockM == 16 && KT::kHeadDimV == 512
+                          && KT::kNThreads == 256 && KT::AtomLayoutP == 1);
+            typename KT::TiledMma mma;
+            auto coords = mma.get_thread_slice(tidx).partition_C(
+                make_identity_tensor(Shape<Int<KT::kBlockM>, Int<KT::kHeadDimV>>{}));
+            static_assert(decltype(size(coords))::value == decltype(size(acc_o))::value);
+            const int position = __ldg(p.token_positions + s_q_idx);
+            const float* rope = p.cos_sin_cache + int64_t(position) * 64;
+            // Publish the valid-row flags before consuming any accumulator.
+            __syncthreads();
+            float amax = 1e-4f;
+            #pragma unroll
+            for (int i = 0; i < size(acc_o); i += 2) {
+                const int row = get<0>(coords(i));
+                const int col = get<1>(coords(i));
+                if (row < 8) {
+                    float2 values = valid[row] ? float2{acc_o(i), acc_o(i + 1)}
+                                              : float2{0.0f, 0.0f};
+                    if (col >= 448) {
+                        const int pair = (col - 448) / 2;
+                        values = small_prefill::apply_rope(values,
+                            __ldg(rope + pair), -__ldg(rope + 32 + pair));
+                    }
+                    acc_o(i) = values.x;
+                    acc_o(i + 1) = values.y;
+                    amax = fmaxf(amax, fmaxf(fabsf(values.x), fabsf(values.y)));
+                }
+            }
+            amax = __uint_as_float(__reduce_max_sync(0xffffffff, __float_as_uint(amax)));
+            auto* partials = reinterpret_cast<float*>(smem + 4096);
+            if (tidx % 32 == 0) partials[tidx / 32] = amax;
+            __syncthreads();
+            float inverse = 0.0f;
+            if (tidx % 32 == 0) {
+                #pragma unroll
+                for (int warp = 0; warp < KT::kNThreads / 32; ++warp)
+                    amax = fmaxf(amax, partials[warp]);
+                const float scale = amax / 448.0f;
+                inverse = 1.0f / scale;
+                if (tidx == 0)
+                    reinterpret_cast<float*>(p.out_sf)[s_q_idx * p.stride_out_sf_token] = scale;
+            }
+            inverse = __shfl_sync(0xffffffff, inverse, 0);
+#if defined(__HGGC_ARCH__) && ACOMPUTE_VERSION >= 10500
+            using Mma = typename KT::TiledMma;
+            using NativeCLayout = Layout<Shape<Shape<_4, _8>, Shape<_2, _2, _2>>,
+                Stride<Stride<_32, _1>, Stride<_16, _8, _128>>>;
+            static_assert(std::is_same_v<typename Mma::LayoutC_TV, NativeCLayout>);
+            using NativeMma = TiledMMA<typename Mma::Atom,
+                Layout<Shape<_1, _8, _1>>, Tile<_16, _128, _16>>;
+            static_assert(std::is_same_v<Mma, NativeMma>);
+#endif
+            static_assert(decltype(size(acc_o))::value == 32);
+            #pragma unroll
+            for (int i = 0; i < size(acc_o); i += 8) {
+                const uint32_t low = small_prefill::fp8_pair_from_float(
+                    acc_o(i) * inverse, acc_o(i + 1) * inverse);
+                const uint32_t high = small_prefill::fp8_pair_from_float(
+                    acc_o(i + 4) * inverse, acc_o(i + 5) * inverse);
+                const uint32_t low_word = low | (__shfl_xor_sync(0xffffffff, low, 1) << 16);
+                const uint32_t high_word = high | (__shfl_xor_sync(0xffffffff, high, 1) << 16);
+                const uint4 packed{low_word, __shfl_xor_sync(0xffffffff, low_word, 2),
+                    high_word, __shfl_xor_sync(0xffffffff, high_word, 2)};
+                if (tidx % 4 == 0) {
+                    const int row = get<0>(coords(i));
+                    const int col = get<1>(coords(i));
+                    const int offset = (col / 32) * (8 * 32) + row * 32 + col % 32;
+                    *reinterpret_cast<uint4*>(p.out_fp8 + s_q_idx * 4096 + offset) = packed;
+                }
+            }
+            // Publish independent global statistics after every CTA barrier.
+            if (warp < KT::kNWarps0 && warp / KT::AtomLayoutQ == 0 && tidx % 4 == 0) {
+                #pragma unroll
+                for (int mi = 0; mi < size(lse); ++mi) {
+                    const int row = row_lse_base + (mi / atom_k_m) * (atom_m * KT::AtomLayoutQ)
+                        + (mi % atom_k_m) * 8;
+                    if (row < 8) {
+                        const int64_t index = s_q_idx * params.h_q + row;
+                        p.lse[index] = valid[row] ? lse(mi) * CUDART_LN2_F : INFINITY;
+                        p.max_logits[index] = valid[row] ? mlogits(mi) * CUDART_LN2_F : -INFINITY;
+                    }
+                }
+            }
+            return;
+        }
+#endif
+
         Tensor staged = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem)), typename KT::SmemLayoutO{});
         typename KT::TiledMma mma;
         auto copy_c = make_tiled_copy_C(typename KT::SmemCopyAtomOaccum{}, mma);
@@ -420,6 +517,11 @@ struct FusedSmallPrefillTraits
         cute::copy(copy_c, src, dst);
         __syncthreads();
 
+        if (p.per_token_scale) {
+            splitkv::store_per_token_output<KT, H8, Norm>(
+                p, s_q_idx, m_block * KT::kBlockM, smem, staged, acc_o, valid);
+            return;
+        }
         const int position = __ldg(p.token_positions + s_q_idx);
         const float* rope = p.cos_sin_cache + int64_t(position) * 64;
         if constexpr (H8) {

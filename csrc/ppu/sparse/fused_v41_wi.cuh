@@ -1012,6 +1012,38 @@ __forceinline__ __device__ void Config<Mode, Heads, EnableNorm, ExtraFP4, Arch>:
     }
     __syncthreads();
 
+    float group_scale_inv = 0.0f;
+    if(fused.per_token_scale) {
+        // Four lanes cover one head; a warp covers one complete WV group.
+        float group_amax = 0.0f;
+        if(head < p.real_heads && multiplier != 0.0f) {
+            #pragma unroll
+            for(int step = 0; step < 4; ++step) {
+                const int tile = lane + step * 4;
+                #pragma unroll
+                for(int i = 0; i < 32; i += 2) {
+                    float2 value{staged(head, tile * 32 + i), staged(head, tile * 32 + i + 1)};
+                    if(tile >= 14) {
+                        const int pair = (tile - 14) * 16 + i / 2;
+                        value = apply_rope(value, __ldg(rope + pair), -__ldg(rope + 32 + pair));
+                    }
+                    group_amax = fmaxf(group_amax, fmaxf(fabsf(value.x), fabsf(value.y)));
+                }
+            }
+            group_amax *= multiplier;
+        }
+        #pragma unroll
+        for(int offset = 16; offset >= 1; offset /= 2) {
+            group_amax = fmaxf(group_amax, __shfl_xor_sync(0xffffffffu, group_amax, offset));
+        }
+        const float scale = fmaxf(1e-4f, group_amax) / 448.0f;
+        group_scale_inv = __fdividef(1.0f, scale);
+        if((threadIdx.x & 31) == 0 && head < p.real_heads) {
+            reinterpret_cast<float*>(fused.out_sf)[int64_t(p.token_idx) * fused.stride_out_sf_token
+                + int64_t(head / 8) * fused.stride_out_sf_group] = scale;
+        }
+    }
+
     if(head < p.real_heads) {
         // Tiles are independent; unrolling lets their reads and casts overlap.
         #pragma unroll
@@ -1039,21 +1071,25 @@ __forceinline__ __device__ void Config<Mode, Heads, EnableNorm, ExtraFP4, Arch>:
                     values[i + 1] = rotated.y;
                 }
             }
-            // fmaxf over non-negative values is order independent.
-            float amax0 = 0.0f, amax1 = 0.0f, amax2 = 0.0f, amax3 = 0.0f;
-            #pragma unroll
-            for(int i = 0; i < 32; i += 4) {
-                amax0 = fmaxf(amax0, fabsf(values[i]));
-                amax1 = fmaxf(amax1, fabsf(values[i + 1]));
-                amax2 = fmaxf(amax2, fabsf(values[i + 2]));
-                amax3 = fmaxf(amax3, fabsf(values[i + 3]));
+            int exponent = 0;
+            float cast_multiplier = multiplier * group_scale_inv;
+            if(!fused.per_token_scale) {
+                // fmaxf over non-negative values is order independent.
+                float amax0 = 0.0f, amax1 = 0.0f, amax2 = 0.0f, amax3 = 0.0f;
+                #pragma unroll
+                for(int i = 0; i < 32; i += 4) {
+                    amax0 = fmaxf(amax0, fabsf(values[i]));
+                    amax1 = fmaxf(amax1, fabsf(values[i + 1]));
+                    amax2 = fmaxf(amax2, fabsf(values[i + 2]));
+                    amax3 = fmaxf(amax3, fabsf(values[i + 3]));
+                }
+                float amax = fmaxf(fmaxf(amax0, amax1), fmaxf(amax2, amax3));
+                amax = fmaxf(1e-4f, amax * multiplier);
+                const float scale = amax / 448.0f;
+                exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
+                const float scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
+                cast_multiplier = multiplier * scale_inv;
             }
-            float amax = fmaxf(fmaxf(amax0, amax1), fmaxf(amax2, amax3));
-            amax = fmaxf(1e-4f, amax * multiplier);
-            const float scale = amax / 448.0f;
-            const int exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
-            const float scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
-            const float cast_multiplier = multiplier * scale_inv;
             alignas(Arch == 89 ? 16 : 1) uint8_t packed[32];
             if constexpr(Arch == 89) {
                 auto* pairs = reinterpret_cast<uint16_t*>(packed);
@@ -1081,10 +1117,12 @@ __forceinline__ __device__ void Config<Mode, Heads, EnableNorm, ExtraFP4, Arch>:
                 #pragma unroll
                 for(int i = 0; i < 32; ++i) fused.out_fp8[out_offset + i] = packed[i];
             }
-            const int sf_index = tile * 8 + in_group;
-            auto* sf_word = fused.out_sf + p.token_idx + int64_t(group) * fused.stride_out_sf_group
-                + int64_t(sf_index / 4) * fused.stride_out_sf_word;
-            reinterpret_cast<uint8_t*>(sf_word)[sf_index % 4] = uint8_t(exponent + 127);
+            if(!fused.per_token_scale) {
+                const int sf_index = tile * 8 + in_group;
+                auto* sf_word = fused.out_sf + p.token_idx + int64_t(group) * fused.stride_out_sf_group
+                    + int64_t(sf_index / 4) * fused.stride_out_sf_word;
+                reinterpret_cast<uint8_t*>(sf_word)[sf_index % 4] = uint8_t(exponent + 127);
+            }
         }
     }
 }

@@ -154,6 +154,12 @@ struct Hs64HasFusedHooks<T, std::void_t<decltype(T::kFusedHs64)>>
     : std::bool_constant<T::kFusedHs64> {};
 
 template<typename T>
+inline constexpr bool kHs64FusedDirectQueries = [] {
+    if constexpr (Hs64HasFusedHooks<T>::value) return T::kFusedDirectQueries;
+    return false;
+}();
+
+template<typename T>
 inline constexpr bool kHs64FusedPackedFp4 = [] {
     if constexpr (Hs64HasFusedHooks<T>::value) return T::kFusedPackedFp4;
     return false;
@@ -5261,7 +5267,8 @@ __forceinline__ __device__ void hs64_attention(
     Tensor smem_valid_indices = make_tensor(make_smem_ptr(plan.smem_valid_indices.data()),
         Shape<_4, Int<T::kValidWords>>{}, Stride<Int<T::kValidWords>, _1>{});
     constexpr bool kStageOutputInRetiredK =
-        (kHs64PrefillGroupedQueries<T> && !ALLOW_EXTRA) || kWorklist<T> != Hs64Worklist::Single;
+        (kHs64PrefillGroupedQueries<T> && !ALLOW_EXTRA) || kWorklist<T> != Hs64Worklist::Single ||
+        kHs64FusedDirectQueries<T>;
     static_assert(!kStageOutputInRetiredK ||
         (offsetof(SharedMemoryPlan, smem_sK) ==
              cosize_v<typename T::SmemLayoutQ> * sizeof(InputT) &&
@@ -5337,6 +5344,16 @@ __forceinline__ __device__ void hs64_attention(
             begin_idx = end_idx = blockIdx.x;
         }
         begin_seqlen = end_seqlen = 0;
+    } else if constexpr (kHs64FusedDirectQueries<T>) {
+        // Each fused-only task owns complete queries, using the generic KV
+        // loader. No split metadata or accumulation buffers are needed.
+        const int grid = static_cast<int>(gridDim.z);
+        const int block = static_cast<int>(blockIdx.z);
+        const int rows = params.b / grid;
+        const int remainder = params.b % grid;
+        begin_idx = block * rows + min(block, remainder);
+        end_idx = begin_idx + rows - 1 + (block < remainder);
+        begin_seqlen = end_seqlen = 0;
     } else if constexpr (kPackedMain<T> != 0) {
         begin_idx = int(blockIdx.z);
         end_idx = kWorklist<T> == Hs64Worklist::Single ? begin_idx : params.b - 1;
@@ -5354,7 +5371,7 @@ __forceinline__ __device__ void hs64_attention(
     if (begin_idx >= params.b)
         return;
     int begin_n_split_idx = 0;
-    if constexpr (!T::kIsPrefill && kPackedMain<T> == 0)
+    if constexpr (!T::kIsPrefill && kPackedMain<T> == 0 && !kHs64FusedDirectQueries<T>)
         begin_n_split_idx = *(tile_scheduler_metadata_ptr + 4);
 
     // Copy the first Q
@@ -5390,7 +5407,9 @@ __forceinline__ __device__ void hs64_attention(
         int seqlen_k;
         if (params.topk_len_ptr) {
             seqlen_k = __ldg(params.topk_len_ptr + length_row);
-            if constexpr (T::kIsPrefill && !T::kGroupPrefillQueries && Hs64HasFusedHooks<T>::value)
+            // Fused prefill reads each row's length in the CTA, including
+            // grouped/persistent queries, without a separate clamp launch.
+            if constexpr (T::kIsPrefill && Hs64HasFusedHooks<T>::value)
                 seqlen_k = min(max(seqlen_k, 0), params.topk);
         } else {
             seqlen_k = params.topk;
@@ -5455,9 +5474,9 @@ __forceinline__ __device__ void hs64_attention(
         int end_block_idx = batch_idx == end_idx
             ? cute::round_up(end_seqlen, kBlockN * 2) / kBlockN
             : total_k / kBlockN;
-        if constexpr (T::kIsPrefill || kPackedMain<T> != 0)
+        if constexpr (T::kIsPrefill || kPackedMain<T> != 0 || kHs64FusedDirectQueries<T>)
             end_block_idx = total_k / kBlockN;
-        const bool is_no_split = T::kIsPrefill || kPackedMain<T> != 0 ||
+        const bool is_no_split = T::kIsPrefill || kPackedMain<T> != 0 || kHs64FusedDirectQueries<T> ||
             (start_block_idx == 0 && end_block_idx == (total_k / kBlockN));
 
 

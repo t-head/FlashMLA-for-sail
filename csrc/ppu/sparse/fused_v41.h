@@ -3,6 +3,14 @@
 #include "params.h"
 #include <cstdint>
 
+#ifndef FLASHMLA_FUSED_OUTPUT_CHANNELWISE
+#define FLASHMLA_FUSED_OUTPUT_CHANNELWISE 0
+#endif
+
+#if FLASHMLA_FUSED_OUTPUT_CHANNELWISE != 0 && FLASHMLA_FUSED_OUTPUT_CHANNELWISE != 1
+#error "FLASHMLA_FUSED_OUTPUT_CHANNELWISE must be 0 or 1"
+#endif
+
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
 enum class FwdMode : uint8_t { Prefill, Decode };
@@ -13,6 +21,7 @@ struct Params {
     int s_q, s_kv, h_q, topk;
     float sm_scale, sm_scale_log2, rms_norm_eps;
     bool enable_q_norm;
+    static constexpr bool per_token_scale = FLASHMLA_FUSED_OUTPUT_CHANNELWISE != 0;
     const void* q;
     const void* kv;
     const int32_t* indices;
@@ -36,7 +45,7 @@ struct Params {
     uint32_t* out_sf;
     float* max_logits;
     float* lse;
-    int64_t stride_out_sf_group, stride_out_sf_word;
+    int64_t stride_out_sf_token, stride_out_sf_group, stride_out_sf_word;
     hggcStream_t stream;
 };
 

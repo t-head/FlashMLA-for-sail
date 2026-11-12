@@ -59,8 +59,8 @@ static void launch_fused_hs64_packed(const FusedHs64Params& params, hggcStream_t
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template<bool Norm, bool ExtraFP4>
-void run_fused_norm_rope_attn_rope_cast_decode_hs64_packed(const Params& p) {
+template<bool ExtraFP4>
+static FusedHs64Params make_fused_hs64_decode_params(const Params& p) {
     FusedHs64Params params{};
     // Fused decode already flattens [B, Sq] and repeats lengths per query.
     params.b = p.s_q;
@@ -103,8 +103,45 @@ void run_fused_norm_rope_attn_rope_cast_decode_hs64_packed(const Params& p) {
     params.out_fp8 = p.out_fp8;
     params.out_sf = p.out_sf;
     params.stride_q_s_q = p.stride_q_s_q;
+    params.stride_out_sf_token = p.stride_out_sf_token;
     params.stride_out_sf_group = p.stride_out_sf_group;
     params.stride_out_sf_word = p.stride_out_sf_word;
+    return params;
+}
+
+// Keep generic KV addressing (kPackedMain == 0); only query ownership differs.
+struct FusedHs64DirectTraits : FusedHs64Traits<false,
+    flashmla::dsa::hs64::Hs64Traits<512, true, 89, true, true>, true> {
+    static constexpr bool kFusedDirectQueries = true;
+    static constexpr bool kDeferPrefillSink = true;
+    static_assert(kPrefillSinkOffset + 64 * sizeof(float) <= offsetof(SharedMemoryPlan, smem_sP));
+};
+static_assert(flashmla::dsa::hs64::kPackedMain<FusedHs64DirectTraits> == 0);
+static_assert(flashmla::dsa::hs64::kWorklist<FusedHs64DirectTraits> ==
+              flashmla::dsa::hs64::Hs64Worklist::Single);
+static_assert(FusedHs64DirectTraits::kQBarrierThreads == 512);
+
+__global__ void __launch_bounds__(512, 1, 1)
+fused_norm_rope_attn_rope_cast_decode_hs64_direct_kernel(
+    __grid_constant__ const FusedHs64Params params) {
+#if ACOMPUTE_VERSION >= 10500
+    flashmla::dsa::hs64::hs64_attention<FusedHs64DirectTraits, true>(params);
+#endif
+}
+
+void run_fused_norm_rope_attn_rope_cast_decode_hs64_direct(const Params& p, int grid_rows) {
+    using T = FusedHs64DirectTraits;
+    constexpr size_t bytes = sizeof(typename T::SharedMemoryPlan);
+    const FusedHs64Params params = make_fused_hs64_decode_params<true>(p);
+    auto kernel = &fused_norm_rope_attn_rope_cast_decode_hs64_direct_kernel;
+    C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    kernel<<<dim3(1, 1, grid_rows), T::NUM_THREADS, bytes, p.stream>>>(params);
+    CHECK_CUDA_KERNEL_LAUNCH();
+}
+
+template<bool Norm, bool ExtraFP4>
+void run_fused_norm_rope_attn_rope_cast_decode_hs64_packed(const Params& p) {
+    const FusedHs64Params params = make_fused_hs64_decode_params<ExtraFP4>(p);
     using flashmla::dsa::hs64::Hs64Worklist;
     if (p.topk == 256) {
         launch_fused_hs64_packed<Norm, ExtraFP4, 256, Hs64Worklist::Batch>(params, p.stream);

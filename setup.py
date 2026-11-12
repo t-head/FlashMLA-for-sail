@@ -14,6 +14,9 @@ from torch.utils.cpp_extension import (
 DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") == "TRUE"
 ENABLE_C_DECODE_SPARSE = os.getenv("FLASHMLA_C_ENABLE_DECODE_SPARSE", "TRUE") == "TRUE"
 CPP_INFERENCE = 'FLASH_MLA_CPP_INFER_BUILD' in os.environ.keys() and os.environ['FLASH_MLA_CPP_INFER_BUILD'] == "1"
+FUSED_OUTPUT_CHANNELWISE = os.getenv("FLASHMLA_FUSED_OUTPUT_CHANNELWISE", "0")
+if FUSED_OUTPUT_CHANNELWISE not in ("0", "1"):
+    raise ValueError("FLASHMLA_FUSED_OUTPUT_CHANNELWISE must be 0 or 1")
 
 def append_hgcc_threads(hgcc_extra_args):
     hgcc_threads = os.getenv("NVCC_THREADS") or "32"
@@ -69,6 +72,7 @@ def get_features_args():
         features_args.append("-DFLASH_MLA_CPP_INFER_BUILD")
     features_args.append("-DFLASH_MLA_STANDALONE_BUILD")
     features_args.append("-DUSE_TS")
+    features_args.append("-DFLASHMLA_FUSED_OUTPUT_CHANNELWISE=" + FUSED_OUTPUT_CHANNELWISE)
 
     return features_args
 

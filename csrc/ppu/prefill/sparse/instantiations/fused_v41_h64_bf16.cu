@@ -90,18 +90,10 @@ void launch_fused_prefill_hs64(const FusedHs64Params& params, hggcStream_t strea
 template<bool EnableNorm>
 void run_fused_norm_rope_attn_rope_cast_prefill_hs64(const Params& p) {
     TORCH_CHECK(p.mode == FwdMode::Prefill && p.arch == 89 && p.h_q == 64);
-    TORCH_CHECK(p.topk >= 512 && p.topk % 128 == 0 && p.enable_q_norm == EnableNorm);
+    TORCH_CHECK(p.topk >= 128 && p.topk % 128 == 0 && p.enable_q_norm == EnableNorm);
     TORCH_CHECK(p.wv_group_size == 8 && p.n_wv_group == 8);
     if(p.s_q == 0) return;
-    at::Tensor clamped_length;
     const int32_t* topk_length = p.topk_length;
-    if(p.s_q >= 1024 && topk_length) {
-        const auto options = torch::TensorOptions().dtype(torch::kInt32)
-            .device(torch::Device(torch::kCUDA, get_current_device()));
-        clamped_length = torch::from_blob(const_cast<int32_t*>(topk_length), {p.s_q}, options)
-            .clamp(0, p.topk);
-        topk_length = clamped_length.data_ptr<int32_t>();
-    }
     FusedHs64Params params{};
     params.b = p.s_q;
     params.q_orig = 1;
@@ -134,10 +126,10 @@ void run_fused_norm_rope_attn_rope_cast_prefill_hs64(const Params& p) {
     params.out_sf = p.out_sf;
     params.max_logits = p.max_logits;
     params.stride_q_s_q = p.stride_q_s_q;
+    params.stride_out_sf_token = p.stride_out_sf_token;
     params.stride_out_sf_group = p.stride_out_sf_group;
     params.stride_out_sf_word = p.stride_out_sf_word;
-    if (topk_length == nullptr &&
-        ((p.topk == 640 && p.s_q >= 512) || (p.topk == 2048 && p.s_q >= 1024)) &&
+    if (((p.topk <= 1024 && p.s_q >= 512) || (p.topk == 2048 && p.s_q >= 1024)) &&
         get_num_sm(get_current_device()) == 39) {
         if (p.topk == 2048) launch_fused_prefill_hs64_persistent<EnableNorm, true>(params, p.stream);
         else launch_fused_prefill_hs64_persistent<EnableNorm, false>(params, p.stream);

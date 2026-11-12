@@ -82,6 +82,7 @@ __global__ void permute_wv_proj_kernel(const Params params) {
         }
     }
 
+    if (params.scale_factors == nullptr) return;
     const uint64_t input_sf_base = wv_group_idx * params.stride_scale_factors_dim0 + row_idx;
     const uint64_t output_sf_base = wv_group_idx * params.stride_scale_factors_permuted_dim0 + row_idx;
     // One thread owns each packed output word, avoiding subword write races.

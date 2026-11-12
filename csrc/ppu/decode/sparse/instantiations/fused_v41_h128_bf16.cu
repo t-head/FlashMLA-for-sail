@@ -182,6 +182,7 @@ bool run_fused_norm_rope_attn_rope_cast_decode_native_wi(
     c.out_fp8 = params.out_fp8;
     c.out_sf = params.out_sf;
     c.lse = params.lse;
+    c.stride_out_sf_token = params.stride_out_sf_token;
     c.stride_out_sf_group = params.stride_out_sf_group;
     c.stride_out_sf_word = params.stride_out_sf_word;
     c.stream = params.stream;

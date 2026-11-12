@@ -42,7 +42,7 @@ fused_norm_rope_attn_rope_cast_combine_kernel(const Params params) {
             : -INFINITY;
     }
     __syncthreads();
-    if (warp >= valid_rows) return;
+    if (warp >= valid_rows && !params.per_token_scale) return;
     const int head = m_block * kBlockM + warp;
 
     constexpr int kLsePerLane = (kMaxSplits + 31) / 32;
@@ -69,7 +69,8 @@ fused_norm_rope_attn_rope_cast_combine_kernel(const Params params) {
     }
     const float global_lse = (sum_lse == 0.f || sum_lse != sum_lse)
         ? INFINITY : log2f(sum_lse) + max_lse;
-    if (lane == 0) params.lse[int64_t(token) * heads + head] = global_lse / float(M_LOG2E);
+    if (lane == 0 && warp < valid_rows)
+        params.lse[int64_t(token) * heads + head] = global_lse / float(M_LOG2E);
     #pragma unroll
     for (int i = 0; i < kLsePerLane; ++i) {
         const int split = i * 32 + lane;
@@ -92,7 +93,7 @@ fused_norm_rope_attn_rope_cast_combine_kernel(const Params params) {
         }
     }
 
-    if (params.attn_sink != nullptr) {
+    if (params.attn_sink != nullptr && warp < valid_rows) {
         const float sink_log2 = __ldg(params.attn_sink + head) * float(M_LOG2E);
         const float factor = (global_lse != global_lse || global_lse == INFINITY)
             ? 1.0f : 1.0f / (1.0f + exp2f(sink_log2 - global_lse));
@@ -116,6 +117,35 @@ fused_norm_rope_attn_rope_cast_combine_kernel(const Params params) {
     const int in_group = head % 8;
     uint8_t* out = params.out_fp8 + int64_t(token) * heads * 512 + group * (8 * 512)
         + in_group * 32 + lane;
+    if (params.per_token_scale) {
+        float amax = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < kElemsPerLane; ++i) amax = fmaxf(amax, fabsf(result[i]));
+        #pragma unroll
+        for (int offset = 16; offset >= 1; offset /= 2) {
+            amax = fmaxf(amax, __shfl_xor_sync(uint32_t(-1), amax, offset));
+        }
+        // Each warp has finished consuming its split weights before publishing
+        // one head's maximum in the same, now-retired shared row.
+        if (lane == 0) lse_scale[warp][0] = amax;
+        __syncthreads();
+        amax = 0.0f;
+        #pragma unroll
+        for (int row = 0; row < kBlockM; ++row) amax = fmaxf(amax, lse_scale[row][0]);
+        const float scale = fmaxf(1e-4f, amax) / 448.0f;
+        const float scale_inv = __fdividef(1.0f, scale);
+        if (threadIdx.x == 0) {
+            reinterpret_cast<float*>(params.out_sf)[int64_t(token) * params.stride_out_sf_token
+                + int64_t(m_block) * params.stride_out_sf_group] = scale;
+        }
+        if (warp < valid_rows) {
+            #pragma unroll
+            for (int i = 0; i < kElemsPerLane; ++i) {
+                out[i * (8 * 32)] = cutlass::float_e4m3_t::from_float(result[i] * scale_inv).storage;
+            }
+        }
+        return;
+    }
     uint32_t* sf_base = params.out_sf + token + int64_t(group) * params.stride_out_sf_group;
     #pragma unroll
     for (int i = 0; i < kElemsPerLane; ++i) {
