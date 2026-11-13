@@ -91,6 +91,8 @@ struct FusedHs64Traits : Base {
     static __forceinline__ __device__ void prefetch_prefill_rope(
         const FusedParams& fused, int batch_idx, int tidx) {
         if constexpr (T::kCachePrefillRope) {
+            static_assert(kPrefillRopeOffset + 128 * sizeof(float)
+                          <= offsetof(SharedMemoryPlan, smem_sP));
             if (tidx < 64) {
                 const int position = __ldg(fused.token_positions + batch_idx);
                 const float* rope = fused.cos_sin_cache + int64_t(position) * 64;
@@ -145,6 +147,7 @@ struct FusedHs64Traits : Base {
                     *reinterpret_cast<const cute::uint128_t*>(src + (dim / 16) * (64 * 16) + head * 16 + dim % 16),
                     *reinterpret_cast<cute::uint128_t*>(dst + q_offset(head, dim)));
             }
+            prefetch_prefill_rope<T>(fused, batch_idx, tidx);
             cutlass::arch::cpasync_barrier_arrive_noinc(barrier_Q);
             return;
         }
@@ -438,10 +441,10 @@ struct FusedHs64Traits : Base {
                 // In the unpaired PV fragment, columns 448..511 occupy the
                 // last four slots. Reuse each coefficient pair across four rows.
                 const int pair = 8 * (idx_in_warpgroup / 64) + (idx_in_warpgroup & 3);
-                const float cos0 = __ldg(rope + pair);
-                const float sin0 = -__ldg(rope + 32 + pair);
-                const float cos1 = __ldg(rope + pair + 4);
-                const float sin1 = -__ldg(rope + 32 + pair + 4);
+                const float cos0 = rope_coeff<T>(rope, pair);
+                const float sin0 = -rope_coeff<T>(rope, 32 + pair);
+                const float cos1 = rope_coeff<T>(rope, pair + 4);
+                const float sin1 = -rope_coeff<T>(rope, 32 + pair + 4);
                 #pragma unroll
                 for (int mi = 0; mi < 4; ++mi) {
                     const float2 low = apply_rope(
@@ -488,6 +491,10 @@ struct FusedHs64Traits : Base {
         // Wide staging retires all 64 accumulator slots before either scan.
         constexpr bool kCacheProcessedOutput = PerTokenScale && WideOutput && !Norm &&
             !kFusedPackedFp4;
+        constexpr bool kCacheOutputInverse = PerTokenScale && !Norm && Base::kIsPrefill &&
+            T::kPersistentPrefillQueries;
+        static_assert(!kCacheOutputInverse || WideOutput);
+        float output_scale_inv;
         int output_cache_half = 0;
         auto quantize_half = [&](const auto& half, int tile_begin, auto scan_only) {
             if(item < 64 * 8 && head < num_valid_seq_q) {
@@ -500,7 +507,8 @@ struct FusedHs64Traits : Base {
                 if constexpr (WideOutput) {
                     // The swizzle preserves the three low column bits.
                     const int col = (tile & 7) * 32;
-                    constexpr bool kReuseTileOffset = T::kCacheRms || T::kCachePrefillRope;
+                    constexpr bool kReuseTileOffset = T::kCacheRms ||
+                        (T::kCachePrefillRope && !kFusedPackedFp4);
                     const int tile_offset = kReuseTileOffset
                         ? int(half.layout()(make_coord(head, col))) : 0;
                     #pragma unroll
@@ -568,7 +576,10 @@ struct FusedHs64Traits : Base {
                 int exponent = 0;
                 float scale_inv;
                 if constexpr (PerTokenScale) {
-                    scale_inv = __fdividef(1.0f, group_scales[head / 8]);
+                    if constexpr (kCacheOutputInverse && !decltype(scan_only)::value)
+                        scale_inv = output_scale_inv;
+                    else
+                        scale_inv = __fdividef(1.0f, group_scales[head / 8]);
                 } else {
                     const float scale = amax / 448.0f;
                     exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
@@ -689,6 +700,10 @@ struct FusedHs64Traits : Base {
                     }
                 }
                 publish_group_scales(amax);
+                if constexpr (kCacheOutputInverse) {
+                    // The published FP32 scale stays unchanged across both halves.
+                    output_scale_inv = __fdividef(1.0f, group_scales[head / 8]);
+                }
                 if constexpr (kFusedPackedFp4) {
                     const int first_tile = warpgroup_idx * 8;
                     quantize_half(stage, first_tile, std::false_type{});
