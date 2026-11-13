@@ -154,6 +154,12 @@ struct Hs64HasFusedHooks<T, std::void_t<decltype(T::kFusedHs64)>>
     : std::bool_constant<T::kFusedHs64> {};
 
 template<typename T>
+inline constexpr bool kHs64FusedDirectQueries = [] {
+    if constexpr (Hs64HasFusedHooks<T>::value) return T::kFusedDirectQueries;
+    return false;
+}();
+
+template<typename T>
 inline constexpr bool kHs64FusedPackedFp4 = [] {
     if constexpr (Hs64HasFusedHooks<T>::value) return T::kFusedPackedFp4;
     return false;
@@ -5261,7 +5267,8 @@ __forceinline__ __device__ void hs64_attention(
     Tensor smem_valid_indices = make_tensor(make_smem_ptr(plan.smem_valid_indices.data()),
         Shape<_4, Int<T::kValidWords>>{}, Stride<Int<T::kValidWords>, _1>{});
     constexpr bool kStageOutputInRetiredK =
-        (kHs64PrefillGroupedQueries<T> && !ALLOW_EXTRA) || kWorklist<T> != Hs64Worklist::Single;
+        (kHs64PrefillGroupedQueries<T> && !ALLOW_EXTRA) || kWorklist<T> != Hs64Worklist::Single ||
+        kHs64FusedDirectQueries<T>;
     static_assert(!kStageOutputInRetiredK ||
         (offsetof(SharedMemoryPlan, smem_sK) ==
              cosize_v<typename T::SmemLayoutQ> * sizeof(InputT) &&
@@ -5337,6 +5344,16 @@ __forceinline__ __device__ void hs64_attention(
             begin_idx = end_idx = blockIdx.x;
         }
         begin_seqlen = end_seqlen = 0;
+    } else if constexpr (kHs64FusedDirectQueries<T>) {
+        // Each fused-only task owns complete queries, using the generic KV
+        // loader. No split metadata or accumulation buffers are needed.
+        const int grid = static_cast<int>(gridDim.z);
+        const int block = static_cast<int>(blockIdx.z);
+        const int rows = params.b / grid;
+        const int remainder = params.b % grid;
+        begin_idx = block * rows + min(block, remainder);
+        end_idx = begin_idx + rows - 1 + (block < remainder);
+        begin_seqlen = end_seqlen = 0;
     } else if constexpr (kPackedMain<T> != 0) {
         begin_idx = int(blockIdx.z);
         end_idx = kWorklist<T> == Hs64Worklist::Single ? begin_idx : params.b - 1;
@@ -5354,7 +5371,7 @@ __forceinline__ __device__ void hs64_attention(
     if (begin_idx >= params.b)
         return;
     int begin_n_split_idx = 0;
-    if constexpr (!T::kIsPrefill && kPackedMain<T> == 0)
+    if constexpr (!T::kIsPrefill && kPackedMain<T> == 0 && !kHs64FusedDirectQueries<T>)
         begin_n_split_idx = *(tile_scheduler_metadata_ptr + 4);
 
     // Copy the first Q
@@ -5363,6 +5380,8 @@ __forceinline__ __device__ void hs64_attention(
         if constexpr (Hs64HasFusedHooks<T>::value) return T::kDeferPrefillSink;
         return false;
     }();
+    const bool defer_prefill_sink = kDeferPrefillSink &&
+        (T::kIsPrefill || params.attn_sink_ptr != nullptr);
     if constexpr (kDeferPrefillSink) {
         // Every query in the CTA uses the same head logits. The first prolog
         // CTA barrier publishes them before the query loop reaches output.
@@ -5374,6 +5393,12 @@ __forceinline__ __device__ void hs64_attention(
         if constexpr (Hs64HasFusedHooks<T>::value) return T::kSkipNextKPrefetch;
         return false;
     }();
+    constexpr int kFixedPrefillBlocks = [] {
+        if constexpr (Hs64HasFusedHooks<T>::value) return T::kFixedPrefillBlocks;
+        return 0;
+    }();
+    static_assert(kFixedPrefillBlocks == 0 || (T::kIsPrefill && !ALLOW_EXTRA &&
+                  (kFixedPrefillBlocks == 2 || kFixedPrefillBlocks == 4)));
     const bool next_wg0_high_active = !kSkipNextKPrefetch && kHs64PrefillGroupedQueries<T> &&
         T::kHeadDim == 512 &&
         params.topk == 2048 && params.topk_len_ptr == nullptr &&
@@ -5388,9 +5413,13 @@ __forceinline__ __device__ void hs64_attention(
         constexpr int kBlockN = T::kBlockN;
         const int n_split_idx = batch_idx == begin_idx ? begin_n_split_idx : 0;
         int seqlen_k;
-        if (params.topk_len_ptr) {
+        if constexpr (kFixedPrefillBlocks != 0) {
+            seqlen_k = kFixedPrefillBlocks * kBlockN;
+        } else if (params.topk_len_ptr) {
             seqlen_k = __ldg(params.topk_len_ptr + length_row);
-            if constexpr (T::kIsPrefill && !T::kGroupPrefillQueries && Hs64HasFusedHooks<T>::value)
+            // Fused prefill reads each row's length in the CTA, including
+            // grouped/persistent queries, without a separate clamp launch.
+            if constexpr (T::kIsPrefill && Hs64HasFusedHooks<T>::value)
                 seqlen_k = min(max(seqlen_k, 0), params.topk);
         } else {
             seqlen_k = params.topk;
@@ -5451,13 +5480,16 @@ __forceinline__ __device__ void hs64_attention(
             }
         }
         const int total_k = seqlen_kpad + cute::round_up(extra_seqlen_k, kBlockN * 2);
-        const int start_block_idx = batch_idx == begin_idx ? begin_seqlen / kBlockN : 0;
+        const int start_block_idx = kFixedPrefillBlocks != 0 ? 0
+            : (batch_idx == begin_idx ? begin_seqlen / kBlockN : 0);
         int end_block_idx = batch_idx == end_idx
             ? cute::round_up(end_seqlen, kBlockN * 2) / kBlockN
             : total_k / kBlockN;
-        if constexpr (T::kIsPrefill || kPackedMain<T> != 0)
+        if constexpr (kFixedPrefillBlocks != 0)
+            end_block_idx = kFixedPrefillBlocks;
+        else if constexpr (T::kIsPrefill || kPackedMain<T> != 0 || kHs64FusedDirectQueries<T>)
             end_block_idx = total_k / kBlockN;
-        const bool is_no_split = T::kIsPrefill || kPackedMain<T> != 0 ||
+        const bool is_no_split = T::kIsPrefill || kPackedMain<T> != 0 || kHs64FusedDirectQueries<T> ||
             (start_block_idx == 0 && end_block_idx == (total_k / kBlockN));
 
 
@@ -5760,7 +5792,7 @@ __forceinline__ __device__ void hs64_attention(
                 idx_in_warpgroup);
         }
 
-        if constexpr (T::kParkQ5Fragment) {
+        if constexpr (T::kParkQ5Fragment && kFixedPrefillBlocks != 2) {
             // Initial QK still uses raw Q5. The first CTA bar3 publishes
             // this image and retires both WGs' remaining raw-Q readers.
             if (warpgroup_idx == 0 && idx_in_warpgroup < 128) {
@@ -5800,6 +5832,7 @@ __forceinline__ __device__ void hs64_attention(
 
             int first_vi_preload_wg0 = 1 - (start_block_idx / 2) % 2;
             int first_vi_preload_wg1 = 3 - (start_block_idx / 2) % 2;
+            if constexpr (kFixedPrefillBlocks != 2) {
             if constexpr (!ALLOW_EXTRA) {
                 compute_K_addr_bf16<0, false, T>(
                     params, batch_idx, start_block_idx + 2, seqlen_k,
@@ -5827,6 +5860,8 @@ __forceinline__ __device__ void hs64_attention(
                     precomp_ptr1, precomp_valid1, init_load_extra);
             }
 
+            }
+
             // The prolog even block always resides in buf0. Toggle only after a
             // normal iteration has produced and consumed a real next-even high.
             uint32_t even_high_in_scratch = 0;
@@ -5844,6 +5879,10 @@ __forceinline__ __device__ void hs64_attention(
                 precomp_ptr0, precomp_ptr1, precomp_valid0, precomp_valid1, smem_cross_n_reduction);          \
 
             int block_idx = start_block_idx;
+            if constexpr (kFixedPrefillBlocks == 4) {
+                LAUNCH_WG0_SUBROUTINE(T, false, false, false);
+                block_idx = 2;
+            } else {
             if constexpr (kPackedMain<T> != 0) {
                 // +2/+3 is still FP8 only for the first pair of a long main row.
                 if constexpr (kPackedMain<T> == 256) {
@@ -5876,6 +5915,7 @@ __forceinline__ __device__ void hs64_attention(
                     LAUNCH_WG0_SUBROUTINE(T, false, false, true);
                 }
             }
+            }
             // Phase 3: last 2 blocks (no K load/prefetch/compute_addr)
             LAUNCH_WG0_SUBROUTINE(T, false, true, false);
         } else {
@@ -5903,6 +5943,7 @@ __forceinline__ __device__ void hs64_attention(
 
             // Precompute initial addresses for first iteration
 
+            if constexpr (kFixedPrefillBlocks != 2) {
             if constexpr (!ALLOW_EXTRA) {
                 compute_K_addr_bf16<4, false, T>(
                     params, batch_idx, start_block_idx + 3, seqlen_k,
@@ -5928,6 +5969,8 @@ __forceinline__ __device__ void hs64_attention(
                     idx_in_warpgroup, ori_block_max, smem_valid_indices, 0,
                     pre_token_idx0, extra_seqlen_k, precomp_ptr1_wg1,
                     precomp_valid1_wg1, init_load_extra);
+            }
+
             }
 
             // Kept independently in each warpgroup; identical loop control and
@@ -5960,6 +6003,10 @@ __forceinline__ __device__ void hs64_attention(
                 precomp_ptr0_wg1, precomp_ptr1_wg1, precomp_valid0_wg1, precomp_valid1_wg1, smem_cross_n_reduction, preloaded_valid_words);  \
 
             int block_idx = start_block_idx;
+            if constexpr (kFixedPrefillBlocks == 4) {
+                LAUNCH_WG1_SUBROUTINE(T, false, false, false);
+                block_idx = 2;
+            } else {
             if constexpr (kPackedMain<T> != 0) {
                 // +2/+3 is still FP8 only for the first pair of a long main row.
                 if constexpr (kPackedMain<T> == 256) {
@@ -5991,6 +6038,7 @@ __forceinline__ __device__ void hs64_attention(
                 for (; block_idx < end_block_idx - 2; block_idx += 2) {
                     LAUNCH_WG1_SUBROUTINE(T, false, false, true);
                 }
+            }
             }
             // Phase 3: last 2 blocks
             LAUNCH_WG1_SUBROUTINE(T, false, true, false);
@@ -6116,7 +6164,6 @@ __forceinline__ __device__ void hs64_attention(
             }
         }
 
-        const bool defer_prefill_sink = kDeferPrefillSink && params.attn_sink_ptr != nullptr;
         float rL_pv[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         bool target_pv_empty[4] = {false, false, false, false};
         bool target_row0_empty = false, target_row1_empty = false;
@@ -6280,8 +6327,8 @@ __forceinline__ __device__ void hs64_attention(
                 }
             }
 
-            // The deferred sink path prunes after applying its scale.
-            if (!kDeferPrefillSink || params.attn_sink_ptr == nullptr) {
+            // The deferred epilogue prunes after applying its scale, with or without a sink.
+            if (!defer_prefill_sink) {
                 CUTLASS_PRAGMA_UNROLL
                 for (int idx = 0; idx < size(rO); ++idx) {
                     if (rO(idx) != rO(idx)) rO(idx) = 0.0f;

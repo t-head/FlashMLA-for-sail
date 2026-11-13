@@ -10,11 +10,11 @@ struct FusedNativeDecodeParams : Flash_fwd_params {
     core_attn::Params fused;
 };
 
-template<bool Norm>
+template<bool Norm, bool PerTokenScale>
 struct FusedNativeDecodeTraits
     : flashmla::dsa::v41::SparseDecodeV41DirectScopeNarrowNativeFP4WG1PublishFirstRemotePVTraits {
     using Base = flashmla::dsa::v41::SparseDecodeV41DirectScopeNarrowNativeFP4WG1PublishFirstRemotePVTraits;
-    using FusedConfig = Config<FwdMode::Decode, 128, Norm, true, 89>;
+    using FusedConfig = Config<FwdMode::Decode, 128, Norm, true, 89, PerTokenScale>;
     using KernelParams = FusedNativeDecodeParams;
     using Params = TileParams;
     using SharedMemoryPlan = typename Base::SharedMemoryPlan;
@@ -107,10 +107,10 @@ struct FusedNativeDecodeTraits
     }
 };
 
-template<bool Norm>
-bool run_fused_norm_rope_attn_rope_cast_decode_native_wi(
+template<bool Norm, bool PerTokenScale>
+bool run_fused_norm_rope_attn_rope_cast_decode_native_wi_impl(
     const Params& params, const SplitKVParams& split) {
-    using T = FusedNativeDecodeTraits<Norm>;
+    using T = FusedNativeDecodeTraits<Norm, PerTokenScale>;
     FusedNativeDecodeParams p{};
     // The API has flattened tokens: retain b=s_q, never reconstruct an old batch.
     p.b = params.s_q;
@@ -170,6 +170,7 @@ bool run_fused_norm_rope_attn_rope_cast_decode_native_wi(
     flashmla::dsa::v41::launch_sparse_decode_wg_v41_main<T>(p, params.stream);
 
     combine::Params c{};
+    c.per_token_scale = PerTokenScale;
     c.s_q = params.s_q;
     c.h_q = 128;
     c.num_sm_parts = split.num_sm_parts;
@@ -182,11 +183,21 @@ bool run_fused_norm_rope_attn_rope_cast_decode_native_wi(
     c.out_fp8 = params.out_fp8;
     c.out_sf = params.out_sf;
     c.lse = params.lse;
+    c.stride_out_sf_token = params.stride_out_sf_token;
     c.stride_out_sf_group = params.stride_out_sf_group;
     c.stride_out_sf_word = params.stride_out_sf_word;
     c.stream = params.stream;
     combine::run_fused_norm_rope_attn_rope_cast_combine_kernel(c);
     return true;
+}
+
+template<bool Norm>
+bool run_fused_norm_rope_attn_rope_cast_decode_native_wi(
+    const Params& params, const SplitKVParams& split) {
+    if (params.per_token_scale) {
+        return run_fused_norm_rope_attn_rope_cast_decode_native_wi_impl<Norm, true>(params, split);
+    }
+    return run_fused_norm_rope_attn_rope_cast_decode_native_wi_impl<Norm, false>(params, split);
 }
 
 template void run_fused_norm_rope_attn_rope_cast_fwd_kernel<FwdMode::Decode, 128, false, false>(const Params&);

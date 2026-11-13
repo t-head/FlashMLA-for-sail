@@ -1,6 +1,7 @@
 #pragma once
 
 #include "params.h"
+#include "ppu/sparse/fused_v41.h"
 #include <cstdint>
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::combine {
@@ -16,6 +17,8 @@ struct Params {
     uint8_t* out_fp8;
     uint32_t* out_sf;
     float* lse;
+    bool per_token_scale;
+    int64_t stride_out_sf_token;
     int64_t stride_out_sf_group, stride_out_sf_word;
     hggcStream_t stream;
 };

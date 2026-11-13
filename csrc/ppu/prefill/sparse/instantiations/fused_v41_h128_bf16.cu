@@ -4,19 +4,21 @@
 
 #include "api/common.h"
 #include "sparse/fused_v41_wi.cuh"
+#include "decode/sparse/fused_v41_splitkv.cuh"
 #include "prefill/sparse/sparse_prefill_std.cuh"
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
+template<bool PerTokenScale>
 struct FusedH128Params : SparsePrefillParams {
-    Params fused;
+    OutputParams<PerTokenScale> fused;
 };
 
-template<bool Norm>
+template<bool Norm, bool PerTokenScale>
 struct FusedH128PrefillTraits : DSA_Traits<cutlass::bfloat16_t, 512, 89> {
     using Base = DSA_Traits<cutlass::bfloat16_t, 512, 89>;
-    using FusedConfig = Config<FwdMode::Prefill, 128, Norm, false, 89>;
-    using KernelParams = FusedH128Params;
+    using FusedConfig = Config<FwdMode::Prefill, 128, Norm, false, 89, PerTokenScale>;
+    using KernelParams = FusedH128Params<PerTokenScale>;
     static constexpr bool kFusedH128 = true;
     static constexpr bool kFusedNativeDecode = false;
     static constexpr bool kVectorOutputLoad = true;
@@ -58,7 +60,7 @@ struct FusedH128PrefillTraits : DSA_Traits<cutlass::bfloat16_t, 512, 89> {
     }
 
     static __forceinline__ __device__ TileParams make_tile(
-        const FusedH128Params& params, int token) {
+        const FusedH128Params<PerTokenScale>& params, int token) {
         TileParams tile{};
         tile.fused = &params.fused;
         tile.token_idx = token;
@@ -71,42 +73,42 @@ struct FusedH128PrefillTraits : DSA_Traits<cutlass::bfloat16_t, 512, 89> {
 
     template<typename TensorQ>
     static __forceinline__ __device__ void load_q(
-        const FusedH128Params& params, int m_block_idx, TensorQ& q,
+        const FusedH128Params<PerTokenScale>& params, int m_block_idx, TensorQ& q,
         int tidx, int warp_idx, __mbarrier_t* barrier) {
         const TileParams tile = make_tile(params, m_block_idx);
-        FusedConfig::template load_q<FusedH128PrefillTraits<Norm>>(
+        FusedConfig::template load_q<FusedH128PrefillTraits<Norm, PerTokenScale>>(
             tile, m_block_idx, q, tidx, warp_idx, barrier);
     }
 
     template<typename TensorQ>
     static __forceinline__ __device__ int issue_q(
-        const FusedH128Params& params, int m_block_idx, TensorQ& q,
+        const FusedH128Params<PerTokenScale>& params, int m_block_idx, TensorQ& q,
         int tidx, int warp_idx, __mbarrier_t* barrier) {
         const TileParams tile = make_tile(params, m_block_idx);
-        return FusedConfig::template issue_q<FusedH128PrefillTraits<Norm>>(
+        return FusedConfig::template issue_q<FusedH128PrefillTraits<Norm, PerTokenScale>>(
             tile, m_block_idx, q, tidx, warp_idx, barrier);
     }
 
     template<typename TensorQ>
     static __forceinline__ __device__ void finish_q(
-        const FusedH128Params& params, int m_block_idx, TensorQ& q, int tidx, int position) {
+        const FusedH128Params<PerTokenScale>& params, int m_block_idx, TensorQ& q, int tidx, int position) {
         const TileParams tile = make_tile(params, m_block_idx);
-        FusedConfig::template finish_q<FusedH128PrefillTraits<Norm>>(tile, q, tidx, position);
+        FusedConfig::template finish_q<FusedH128PrefillTraits<Norm, PerTokenScale>>(tile, q, tidx, position);
     }
 
     template<typename TensorO>
     static __forceinline__ __device__ void store_output(
-        const FusedH128Params& params, TensorO& output, SharedMemoryPlan& plan,
+        const FusedH128Params<PerTokenScale>& params, TensorO& output, SharedMemoryPlan& plan,
         int warpgroup_idx, int idx_in_warpgroup) {
         const int m_block_idx = blockIdx.x;
         const TileParams tile = make_tile(params, m_block_idx);
-        FusedConfig::template store_output<FusedH128PrefillTraits<Norm>>(
+        FusedConfig::template store_output<FusedH128PrefillTraits<Norm, PerTokenScale>>(
             tile, output, plan, warpgroup_idx, idx_in_warpgroup);
     }
 };
 
-template<bool EnableNorm>
-void run_fused_norm_rope_attn_rope_cast_prefill_h128(const Params& p) {
+template<bool EnableNorm, bool PerTokenScale>
+void run_fused_norm_rope_attn_rope_cast_prefill_h128_impl(const Params& p) {
     TORCH_CHECK(p.mode == FwdMode::Prefill && p.arch == 89 && p.h_q == 128);
     TORCH_CHECK(p.enable_q_norm == EnableNorm);
     TORCH_CHECK(p.wv_group_size == 8 && p.n_wv_group == 16);
@@ -122,7 +124,7 @@ void run_fused_norm_rope_attn_rope_cast_prefill_h128(const Params& p) {
         topk_length = clamped_length.data_ptr<int32_t>();
     }
 
-    FusedH128Params params{};
+    FusedH128Params<PerTokenScale> params{};
     params.s_q = p.s_q;
     params.s_kv = p.s_kv;
     params.h_q = 128;
@@ -146,20 +148,26 @@ void run_fused_norm_rope_attn_rope_cast_prefill_h128(const Params& p) {
     params.max_logits = p.max_logits;
     params.lse = p.lse;
     params.stream = p.stream;
-    params.fused = p;
+    params.fused = OutputParams<PerTokenScale>{p};
     params.fused.topk_length = topk_length;
 
-    using T = FusedH128PrefillTraits<EnableNorm>;
+    using T = FusedH128PrefillTraits<EnableNorm, PerTokenScale>;
     constexpr size_t bytes = std::max(sizeof(typename T::SharedMemoryPlan), sizeof(typename T::SharedMemoryOutPut));
-    auto kernel = &::flash_sparse_prefill_fwd_wg_kernel<T, true, false, FusedH128Params>;
+    auto kernel = &::flash_sparse_prefill_fwd_wg_kernel<T, true, false, FusedH128Params<PerTokenScale>>;
     // Match the ordinary D512 launcher. Each CTA still validates its own row
     // before selecting the unmasked body.
     if (p.topk >= 4 * (2 * T::kBlockN))
-        kernel = &::flash_sparse_prefill_fwd_wg_kernel<T, true, true, FusedH128Params>;
+        kernel = &::flash_sparse_prefill_fwd_wg_kernel<T, true, true, FusedH128Params<PerTokenScale>>;
     C10_CUDA_CHECK(hggcFuncSetAttribute(
         kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     kernel<<<dim3(p.s_q, 1, 1), T::NUM_THREADS, bytes, p.stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
+}
+
+template<bool EnableNorm>
+void run_fused_norm_rope_attn_rope_cast_prefill_h128(const Params& p) {
+    if (p.per_token_scale) run_fused_norm_rope_attn_rope_cast_prefill_h128_impl<EnableNorm, true>(p);
+    else run_fused_norm_rope_attn_rope_cast_prefill_h128_impl<EnableNorm, false>(p);
 }
 
 namespace small_prefill {
@@ -225,15 +233,16 @@ __forceinline__ __device__ uint16_t fp8_pair_from_float(float low, float high) {
 
 }
 
+template<bool PerTokenScale>
 struct FusedSmallPrefillParams : SparsePrefillParams {
-    Params fused;
+    OutputParams<PerTokenScale> fused;
 };
 
-template<bool Norm, bool H8>
+template<bool Norm, bool H8, bool PerTokenScale>
 struct FusedSmallPrefillTraits
     : std::conditional_t<H8, small_prefill::H8BaseTraits, small_prefill::BaseTraits> {
     using Base = std::conditional_t<H8, small_prefill::H8BaseTraits, small_prefill::BaseTraits>;
-    using PrefillParams = FusedSmallPrefillParams;
+    using PrefillParams = FusedSmallPrefillParams<PerTokenScale>;
     static constexpr bool kFusedSmallPrefill = true;
     static constexpr size_t kStdSmemEnd = Base::kSmemSize + 2 * Base::kBlockN * sizeof(bool);
     static constexpr size_t kScratchOffset = (kStdSmemEnd + 15) / 16 * 16;
@@ -383,6 +392,8 @@ struct FusedSmallPrefillTraits
         char* smem, int tidx, int m_block, int64_t s_q_idx, int topk_length) {
         using namespace cute;
         const auto& p = params.fused;
+        constexpr bool kRegisterOutput = H8 && !Norm && PerTokenScale
+            && ACOMPUTE_VERSION >= 10500;
         bool* valid = reinterpret_cast<bool*>(smem + kScratchOffset);
         constexpr int atom_m = KT::USE_MMA_M8 ? 8 : 16;
         constexpr int atom_k_m = KT::USE_MMA_M8 ? 1 : 2;
@@ -397,10 +408,12 @@ struct FusedSmallPrefillTraits
                 const int head = m_block * KT::kBlockM + row;
                 const bool live = topk_length > 0 && (__float_as_uint(lse(mi)) & 0x7f800000u) != 0x7f800000u;
                 valid[row] = live;
-                if (head < (H8 ? 8 : params.h_q)) {
-                    const int64_t index = s_q_idx * params.h_q + head;
-                    p.lse[index] = live ? lse(mi) * CUDART_LN2_F : INFINITY;
-                    p.max_logits[index] = live ? mlogits(mi) * CUDART_LN2_F : -INFINITY;
+                if constexpr (!kRegisterOutput) {
+                    if (head < (H8 ? 8 : params.h_q)) {
+                        const int64_t index = s_q_idx * params.h_q + head;
+                        p.lse[index] = live ? lse(mi) * CUDART_LN2_F : INFINITY;
+                        p.max_logits[index] = live ? mlogits(mi) * CUDART_LN2_F : -INFINITY;
+                    }
                 }
             }
         }
@@ -409,6 +422,96 @@ struct FusedSmallPrefillTraits
         if (!H8 || topk_length == 0) {
             flash::cp_async_wait<0>();
             __syncthreads();
+        }
+
+        if constexpr (kRegisterOutput) {
+            // Adjacent columns stay paired in the native M16 accumulator.
+            // Keep the eight live rows in registers through scale reduction,
+            // then store FP8 pairs directly without an output staging barrier.
+            static_assert(KT::kBlockM == 16 && KT::kHeadDimV == 512
+                          && KT::kNThreads == 256 && KT::AtomLayoutP == 1);
+            typename KT::TiledMma mma;
+            auto coords = mma.get_thread_slice(tidx).partition_C(
+                make_identity_tensor(Shape<Int<KT::kBlockM>, Int<KT::kHeadDimV>>{}));
+            static_assert(decltype(size(coords))::value == decltype(size(acc_o))::value);
+            const int position = __ldg(p.token_positions + s_q_idx);
+            const float* rope = p.cos_sin_cache + int64_t(position) * 64;
+            // Publish the valid-row flags before consuming any accumulator.
+            __syncthreads();
+            float amax = 1e-4f;
+            #pragma unroll
+            for (int i = 0; i < size(acc_o); i += 2) {
+                const int row = get<0>(coords(i));
+                const int col = get<1>(coords(i));
+                if (row < 8) {
+                    float2 values = valid[row] ? float2{acc_o(i), acc_o(i + 1)}
+                                              : float2{0.0f, 0.0f};
+                    if (col >= 448) {
+                        const int pair = (col - 448) / 2;
+                        values = small_prefill::apply_rope(values,
+                            __ldg(rope + pair), -__ldg(rope + 32 + pair));
+                    }
+                    acc_o(i) = values.x;
+                    acc_o(i + 1) = values.y;
+                    amax = fmaxf(amax, fmaxf(fabsf(values.x), fabsf(values.y)));
+                }
+            }
+            amax = __uint_as_float(__reduce_max_sync(0xffffffff, __float_as_uint(amax)));
+            auto* partials = reinterpret_cast<float*>(smem + 4096);
+            if (tidx % 32 == 0) partials[tidx / 32] = amax;
+            __syncthreads();
+            float inverse = 0.0f;
+            if (tidx % 32 == 0) {
+                #pragma unroll
+                for (int warp = 0; warp < KT::kNThreads / 32; ++warp)
+                    amax = fmaxf(amax, partials[warp]);
+                const float scale = amax / 448.0f;
+                inverse = 1.0f / scale;
+                if (tidx == 0)
+                    reinterpret_cast<float*>(p.out_sf)[s_q_idx * p.stride_out_sf_token] = scale;
+            }
+            inverse = __shfl_sync(0xffffffff, inverse, 0);
+#if defined(__HGGC_ARCH__) && ACOMPUTE_VERSION >= 10500
+            using Mma = typename KT::TiledMma;
+            using NativeCLayout = Layout<Shape<Shape<_4, _8>, Shape<_2, _2, _2>>,
+                Stride<Stride<_32, _1>, Stride<_16, _8, _128>>>;
+            static_assert(std::is_same_v<typename Mma::LayoutC_TV, NativeCLayout>);
+            using NativeMma = TiledMMA<typename Mma::Atom,
+                Layout<Shape<_1, _8, _1>>, Tile<_16, _128, _16>>;
+            static_assert(std::is_same_v<Mma, NativeMma>);
+#endif
+            static_assert(decltype(size(acc_o))::value == 32);
+            #pragma unroll
+            for (int i = 0; i < size(acc_o); i += 8) {
+                const uint32_t low = small_prefill::fp8_pair_from_float(
+                    acc_o(i) * inverse, acc_o(i + 1) * inverse);
+                const uint32_t high = small_prefill::fp8_pair_from_float(
+                    acc_o(i + 4) * inverse, acc_o(i + 5) * inverse);
+                const uint32_t low_word = low | (__shfl_xor_sync(0xffffffff, low, 1) << 16);
+                const uint32_t high_word = high | (__shfl_xor_sync(0xffffffff, high, 1) << 16);
+                const uint4 packed{low_word, __shfl_xor_sync(0xffffffff, low_word, 2),
+                    high_word, __shfl_xor_sync(0xffffffff, high_word, 2)};
+                if (tidx % 4 == 0) {
+                    const int row = get<0>(coords(i));
+                    const int col = get<1>(coords(i));
+                    const int offset = (col / 32) * (8 * 32) + row * 32 + col % 32;
+                    *reinterpret_cast<uint4*>(p.out_fp8 + s_q_idx * 4096 + offset) = packed;
+                }
+            }
+            // Publish independent global statistics after every CTA barrier.
+            if (warp < KT::kNWarps0 && warp / KT::AtomLayoutQ == 0 && tidx % 4 == 0) {
+                #pragma unroll
+                for (int mi = 0; mi < size(lse); ++mi) {
+                    const int row = row_lse_base + (mi / atom_k_m) * (atom_m * KT::AtomLayoutQ)
+                        + (mi % atom_k_m) * 8;
+                    if (row < 8) {
+                        const int64_t index = s_q_idx * params.h_q + row;
+                        p.lse[index] = valid[row] ? lse(mi) * CUDART_LN2_F : INFINITY;
+                        p.max_logits[index] = valid[row] ? mlogits(mi) * CUDART_LN2_F : -INFINITY;
+                    }
+                }
+            }
+            return;
         }
 
         Tensor staged = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem)), typename KT::SmemLayoutO{});
@@ -420,6 +523,11 @@ struct FusedSmallPrefillTraits
         cute::copy(copy_c, src, dst);
         __syncthreads();
 
+        if constexpr (PerTokenScale) {
+            splitkv::store_per_token_output<KT, H8, Norm>(
+                p, s_q_idx, m_block * KT::kBlockM, smem, staged, acc_o, valid);
+            return;
+        }
         const int position = __ldg(p.token_positions + s_q_idx);
         const float* rope = p.cos_sin_cache + int64_t(position) * 64;
         if constexpr (H8) {
@@ -522,8 +630,8 @@ struct FusedSmallPrefillTraits
     }
 };
 
-template<bool Norm>
-void run_fused_norm_rope_attn_rope_cast_prefill_small(const Params& p) {
+template<bool Norm, bool PerTokenScale>
+void run_fused_norm_rope_attn_rope_cast_prefill_small_impl(const Params& p) {
     TORCH_CHECK(p.mode == FwdMode::Prefill && p.arch == 89);
     if (p.h_q == 8) {
         TORCH_CHECK(p.topk > 0 && p.topk % small_prefill::BaseTraits::kBlockN == 0,
@@ -547,7 +655,7 @@ void run_fused_norm_rope_attn_rope_cast_prefill_small(const Params& p) {
         topk_length = clamped_length.data_ptr<int32_t>();
     }
 
-    FusedSmallPrefillParams params{};
+    FusedSmallPrefillParams<PerTokenScale> params{};
     params.s_q = p.s_q;
     params.s_kv = p.s_kv;
     params.h_q = p.h_q;
@@ -571,19 +679,25 @@ void run_fused_norm_rope_attn_rope_cast_prefill_small(const Params& p) {
     params.max_logits = p.max_logits;
     params.lse = p.lse;
     params.stream = p.stream;
-    params.fused = p;
+    params.fused = OutputParams<PerTokenScale>{p};
     params.fused.topk_length = topk_length;
 
     const auto launch = [&](auto h8) {
-        using T = FusedSmallPrefillTraits<Norm, decltype(h8)::value>;
+        using T = FusedSmallPrefillTraits<Norm, decltype(h8)::value, PerTokenScale>;
         constexpr size_t bytes = T::kSmallSmemBytes;
-        auto kernel = &flash::flash_sparse_prefill_fwd_kernel<T, true, false, true, false, FusedSmallPrefillParams>;
+        auto kernel = &flash::flash_sparse_prefill_fwd_kernel<T, true, false, true, false, FusedSmallPrefillParams<PerTokenScale>>;
         C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
         kernel<<<dim3(p.s_q * cute::ceil_div(p.h_q, T::kBlockM), 1, 1), T::kNThreads, bytes, p.stream>>>(params);
         CHECK_CUDA_KERNEL_LAUNCH();
     };
     if (p.h_q == 8) launch(std::true_type{});
     else launch(std::false_type{});
+}
+
+template<bool Norm>
+void run_fused_norm_rope_attn_rope_cast_prefill_small(const Params& p) {
+    if (p.per_token_scale) run_fused_norm_rope_attn_rope_cast_prefill_small_impl<Norm, true>(p);
+    else run_fused_norm_rope_attn_rope_cast_prefill_small_impl<Norm, false>(p);
 }
 
 template void run_fused_norm_rope_attn_rope_cast_prefill_small<false>(const Params&);

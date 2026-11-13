@@ -44,10 +44,11 @@ def prefill(
 
     Args (Cast):
         n_wv_group: n_wv_group during o projection
-        num_per_channels: quantization granularity, must be 32
-        use_tma_aligned_col_major_sf: must be True
-        round_sf: must be True
-        use_packed_ue8m0: must be True
+        num_per_channels: 32 for per-32 UE8M0 scales; 4096 for one FP32 scale
+            per token/WV group (SM89). Both formats are supported in the same build.
+        use_tma_aligned_col_major_sf: True for per-32; False for per-token FP32 scales
+        round_sf: True for per-32; False for per-token FP32 scales
+        use_packed_ue8m0: True for per-32; False for per-token FP32 scales
 
     Args (Core Attn):
         q: [s_q, h_q, d_qk], bfloat16
@@ -63,7 +64,7 @@ def prefill(
 
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result (wv_group_size = h_q / n_wv_group)
-        - out_sf: [s_q, n_wv_group, wv_group_size * d_v / (32*4)], int32, scaling factor. Always stored in the per-32 scaled format (num_per_channels is always 32)
+        - out_sf: per-32 uses [s_q, n_wv_group, 32] int32 packed UE8M0; per-token uses contiguous [s_q, n_wv_group, 1] float32 dequantization scales
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float
         If a q token does not attend to any k token, then max_logits is -inf, lse is +inf, out is all zeros.
@@ -124,10 +125,11 @@ def decode(
 
     Args (Cast):
         n_wv_group: n_wv_group during o projection
-        num_per_channels: quantization granularity, must be 32
-        use_tma_aligned_col_major_sf: must be True
-        round_sf: must be True
-        use_packed_ue8m0: must be True
+        num_per_channels: 32 for per-32 UE8M0 scales; 4096 for one FP32 scale
+            per token/WV group (SM89). Both formats are supported in the same build.
+        use_tma_aligned_col_major_sf: True for per-32; False for per-token FP32 scales
+        round_sf: True for per-32; False for per-token FP32 scales
+        use_packed_ue8m0: True for per-32; False for per-token FP32 scales
 
     Args (Core Attn):
         q: [s_q, h_q, d_qk], bfloat16
@@ -146,7 +148,7 @@ def decode(
 
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result (wv_group_size = h_q / n_wv_group)
-        - out_sf: [s_q, n_wv_group, wv_group_size * d_v / (32*4)], int32, scaling factor. Always stored in the per-32 scaled format (num_per_channels is always 32)
+        - out_sf: per-32 uses [s_q, n_wv_group, 32] int32 packed UE8M0; per-token uses contiguous [s_q, n_wv_group, 1] float32 dequantization scales
         - lse: [s_q, h_q], float
     """
     out_fp8, out_sf, lse = _backend.fused_norm_rope_attn_rope_cast_decode(
@@ -191,18 +193,21 @@ def permute_wv_proj(
     """
     Permute the layout of the wv_proj weight and its scale factors into the layout required by
     fused_norm_rope_attn_rope_cast_fwd / fused_norm_rope_attn_rope_cast_decode.
-    Note: the input scale granularity must be 32, and the output scale granularity is always 32.
+    Packed per-32 UE8M0 scales are permuted with the weights. Per-output-channel
+    FP32 scales [n_wv_group, d_proj_out, 1] are preserved because the K permutation
+    does not change their values.
 
     Args:
         weight_and_sf: (wv_proj, wv_sf), where
         - wv_proj: [n_wv_group, d_proj_out, wv_group_size * d_o], fp8_e4m3, the weight in its original layout
             (n_wv_group = wv_proj.size(0) and d_proj_out = wv_proj.size(1))
-        - wv_sf: [n_wv_group, d_proj_out, (wv_group_size * d_o)/32/4], int32, the scale factors in their original layout (DeepGeMM format, i.e. contiguous on the second dim)
+        - wv_sf: packed per-32 [n_wv_group, d_proj_out, (wv_group_size * d_o)/32/4] int32
+            (contiguous on the second dim), or per-channel [n_wv_group, d_proj_out, 1] float32
         wv_group_size: int, the number of O heads per WV group
         d_o: int, the O head dimension
 
     Returns:
         - wv_proj_permuted: the same shape as wv_proj, fp8_e4m3
-        - scale_factors_permuted: [n_wv_group, d_proj_out, (wv_group_size * d_o)/32/4], int32
+        - scale_factors_permuted: the same shape and dtype as wv_sf
     """
     return tuple(_backend.permute_wv_proj(weight_and_sf[0], weight_and_sf[1], wv_group_size, d_o))
