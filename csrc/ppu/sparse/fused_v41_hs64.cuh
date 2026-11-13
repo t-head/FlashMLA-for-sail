@@ -252,7 +252,7 @@ struct FusedHs64Traits : Base {
         const int part = tidx / 64;
         const float* rope = q_rope<T>(fused, batch_idx);
         if constexpr (!Norm && (flashmla::dsa::hs64::kHs64PrefillGroupedQueries<T> ||
-                                kFusedPackedFp4)) {
+                                kFusedPackedFp4 || (PerTokenScale && T::kFusedDirectQueries))) {
             // Split the 64 RoPE dimensions across both warpgroups.
             const int dim = 448 + part * 8;
             auto* chunk = reinterpret_cast<uint4*>(dst + q_offset(row, dim));
@@ -268,6 +268,8 @@ struct FusedHs64Traits : Base {
                 packed[j + 1] = typename T::InputT(x.y);
             }
             *chunk = *reinterpret_cast<const uint4*>(packed);
+            // Direct queries publish both warpgroups' rotated Q before MMA.
+            if constexpr (T::kFusedDirectQueries) __syncthreads();
             return;
         }
         constexpr bool kDualRmsAccum = T::kCacheRms;
@@ -491,8 +493,8 @@ struct FusedHs64Traits : Base {
         // Wide staging retires all 64 accumulator slots before either scan.
         constexpr bool kCacheProcessedOutput = PerTokenScale && WideOutput && !Norm &&
             !kFusedPackedFp4;
-        constexpr bool kCacheOutputInverse = PerTokenScale && !Norm && Base::kIsPrefill &&
-            T::kPersistentPrefillQueries;
+        constexpr bool kCacheOutputInverse = PerTokenScale && !Norm &&
+            ((Base::kIsPrefill && T::kPersistentPrefillQueries) || T::kFusedDirectQueries);
         static_assert(!kCacheOutputInverse || WideOutput);
         float output_scale_inv;
         int output_cache_half = 0;
