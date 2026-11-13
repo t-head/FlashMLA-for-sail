@@ -192,7 +192,10 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
     if constexpr (Heads == 64) {
         constexpr int extra_bytes = ExtraFP4 ? 288 : 528;
         const auto aligned = [](const void* ptr) { return reinterpret_cast<uintptr_t>(ptr) % 16 == 0; };
-        if (p.arch == 89 && sm_count == 39 && p.s_q >= sm_count && p.s_q <= 65535
+        const bool small_complete_query = !EnableNorm && ExtraFP4 && p.per_token_scale
+            && p.s_q > 0 && p.s_q < sm_count && p.topk == 128
+            && !p.topk_length && !p.extra_topk_length;
+        if (p.arch == 89 && sm_count == 39 && (p.s_q >= sm_count || small_complete_query) && p.s_q <= 65535
             && (p.topk == 128 || p.topk == 256) && p.page_block_size == p.topk
             && p.stride_kv_s_kv == int64_t(p.page_block_size) * 528
             && p.extra_topk == 512 && p.extra_page_block_size == 64
