@@ -121,6 +121,8 @@ struct FusedHs64DirectTraits : FusedHs64Traits<false,
         flashmla::dsa::hs64::Hs64Traits<512, true, 89, true, true>, true, false, PerTokenScale>;
     using SharedMemoryPlan = typename Base::SharedMemoryPlan;
     static constexpr bool kFusedDirectQueries = true;
+    // Consecutive owned queries alternate the existing two RoPE slots.
+    static constexpr bool kCachePrefillRope = PerTokenScale;
     static constexpr bool kDeferPrefillSink = true;
     static_assert(Base::kPrefillSinkOffset + 64 * sizeof(float) <= offsetof(SharedMemoryPlan, smem_sP));
 };
