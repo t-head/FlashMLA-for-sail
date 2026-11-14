@@ -194,6 +194,8 @@ __forceinline__ __device__ void store_per_token_output(
     constexpr int kThreadsPerGroup = KT::kNThreads / kGroups;
     constexpr int kWarpsPerGroup = kThreadsPerGroup / 32;
     constexpr int kWarps = KT::kNThreads / 32;
+    constexpr bool kCooperativeScale = H8 && !EnableNorm && P::per_token_scale
+        && ACOMPUTE_VERSION >= 10500;
     constexpr size_t kStageBytes = cute::cosize(typename KT::SmemLayoutO{}) * sizeof(float);
     static_assert(KT::kBlockM % 8 == 0 && KT::kHeadDimV == 512);
     static_assert(KT::kNThreads % kGroups == 0 && kThreadsPerGroup % 32 == 0);
@@ -216,9 +218,16 @@ __forceinline__ __device__ void store_per_token_output(
                 if (tidx % 32 == 0) partials[tidx / 32] = amax;
                 __syncthreads();
             }
+            if constexpr (kCooperativeScale) {
+                static_assert(H8 && kWarpsPerGroup == 8);
+                const int lane = tidx % 32;
+                const float partial = lane < kWarpsPerGroup
+                    ? fmaxf(1e-4f, partials[group * kWarpsPerGroup + lane]) : 1e-4f;
+                amax = __uint_as_float(__reduce_max_sync(0xffffffff, __float_as_uint(partial)));
+            }
             float inverse = 0.0f;
             if (tidx % 32 == 0) {
-                if constexpr (kWarpsPerGroup > 1) {
+                if constexpr (kWarpsPerGroup > 1 && !kCooperativeScale) {
                     amax = 1e-4f;
                     #pragma unroll
                     for (int warp = 0; warp < kWarpsPerGroup; ++warp)
