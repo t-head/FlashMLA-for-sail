@@ -155,7 +155,8 @@ static void run_fused_hs64_packed_output(const OutputParams<PerTokenScale>& p) {
     using flashmla::dsa::hs64::Hs64Worklist;
     if (p.topk == 256) {
         launch_fused_hs64_packed<Norm, ExtraFP4, 256, Hs64Worklist::Batch>(params, p.stream);
-    } else if (p.s_q >= (ExtraFP4 && (Norm || PerTokenScale) ? 6 : 8) * 39) {
+    } else if (p.s_q >= (ExtraFP4 && !Norm && PerTokenScale ? 2 :
+                         (ExtraFP4 && (Norm || PerTokenScale) ? 6 : 8)) * 39) {
         launch_fused_hs64_packed<Norm, ExtraFP4, 128, Hs64Worklist::Flat>(params, p.stream);
     } else {
         launch_fused_hs64_packed<Norm, ExtraFP4, 128, Hs64Worklist::Single>(params, p.stream);
