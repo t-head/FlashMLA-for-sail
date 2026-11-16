@@ -5415,11 +5415,15 @@ __forceinline__ __device__ void hs64_attention(
         int seqlen_k;
         if constexpr (kFixedPrefillBlocks != 0) {
             seqlen_k = kFixedPrefillBlocks * kBlockN;
+            if (params.topk_len_ptr) {
+                // Keep the fixed tile count while masking each query's tail.
+                seqlen_k = min(max(__ldg(params.topk_len_ptr + length_row), 0), seqlen_k);
+            }
         } else if (params.topk_len_ptr) {
             seqlen_k = __ldg(params.topk_len_ptr + length_row);
-            // Fused prefill reads each row's length in the CTA, including
-            // grouped/persistent queries, without a separate clamp launch.
-            if constexpr (T::kIsPrefill && Hs64HasFusedHooks<T>::value)
+            // Fused complete-query paths clamp lengths inside their CTA.
+            if constexpr ((T::kIsPrefill && Hs64HasFusedHooks<T>::value) ||
+                          kHs64FusedDirectQueries<T>)
                 seqlen_k = min(max(seqlen_k, 0), params.topk);
         } else {
             seqlen_k = params.topk;
@@ -5476,6 +5480,8 @@ __forceinline__ __device__ void hs64_attention(
                 }
                 if constexpr (kPackedMain<T> != 0)
                     extra_seqlen_k = min(max(extra_seqlen_k, 0), 512);
+                else if constexpr (kHs64FusedDirectQueries<T>)
+                    extra_seqlen_k = min(max(extra_seqlen_k, 0), params.extra_topk);
                 ori_block_max = cute::ceil_div(seqlen_kpad, kBlockN);
             }
         }

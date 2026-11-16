@@ -30,71 +30,50 @@ struct FusedHs64Fixed256PrefillTraits : FusedHs64PersistentPrefillTraits<false, 
     static constexpr int kFixedPrefillBlocks = 4;
 };
 
-template<bool Norm, bool Group, bool WideOutput, bool PerTokenScale>
+template<typename T, bool Fixed128Body = false>
 __global__ void __launch_bounds__(512, 1, 1)
-fused_norm_rope_attn_rope_cast_prefill_hs64_kernel(__grid_constant__ const FusedHs64Params<PerTokenScale> params) {
+fused_norm_rope_attn_rope_cast_prefill_hs64_wi_kernel(
+    __grid_constant__ const typename T::FusedParams params) {
 #if ACOMPUTE_VERSION >= 10500
-    using T = FusedHs64PrefillTraits<Norm, Group, WideOutput, PerTokenScale>;
-    const Flash_fwd_mla_params& base = params;
-    flashmla::dsa::hs64::hs64_attention<T, false>(base, params.max_logits);
-#endif
-}
-
-// Reuse the existing isolated entry for the short fixed256 body only.
-// The original2048 fallback uses the existing equivalent three-bool entry.
-template<bool Isolated256, bool PerTokenScale>
-__global__ void __launch_bounds__(512, 1, 1)
-fused_norm_rope_attn_rope_cast_prefill_hs64_fixed256_kernel(__grid_constant__ const FusedHs64Params<PerTokenScale> params) {
-#if ACOMPUTE_VERSION >= 10500
-    static_assert(Isolated256);
-    using T = FusedHs64Fixed256PrefillTraits<PerTokenScale>;
-    FusedHs64Params<PerTokenScale> fixed = params;
-    fixed.q_orig = 1;
-    fixed.seqlen_q = fixed.h_q = fixed.ngroups = T::kBlockM;
-    fixed.h = fixed.h_h_k_ratio = 1;
-    fixed.d = T::kHeadDim;
-    fixed.d_v = T::kHeadDimV;
-    fixed.extra_topk = -1;
-    fixed.page_block_size = 1;
-    fixed.q_row_stride = fixed.k_row_stride = T::kHeadDim;
-    fixed.o_batch_stride = fixed.o_row_stride = 0;
-    fixed.topk = 256;
-    fixed.topk_len_ptr = nullptr;
-    const Flash_fwd_mla_params& short_base = fixed;
-    flashmla::dsa::hs64::hs64_attention<T, false>(short_base, fixed.max_logits);
-#endif
-}
-
-template<bool Norm, bool SkipNextKPrefetch, bool PerTokenScale>
-__global__ void __launch_bounds__(512, 1, 1)
-fused_norm_rope_attn_rope_cast_prefill_hs64_persistent_kernel(__grid_constant__ const FusedHs64Params<PerTokenScale> params) {
-#if ACOMPUTE_VERSION >= 10500
-    using T = FusedHs64PersistentPrefillTraits<Norm, SkipNextKPrefetch, PerTokenScale>;
-    // Expose the same fixed geometry as the native H64 prefill wrapper.
-    FusedHs64Params<PerTokenScale> fixed = params;
-    fixed.q_orig = 1;
-    fixed.seqlen_q = fixed.h_q = fixed.ngroups = T::kBlockM;
-    fixed.h = fixed.h_h_k_ratio = 1;
-    fixed.d = T::kHeadDim;
-    fixed.d_v = T::kHeadDimV;
-    fixed.extra_topk = -1;
-    fixed.page_block_size = 1;
-    fixed.q_row_stride = fixed.k_row_stride = T::kHeadDim;
-    fixed.o_batch_stride = fixed.o_row_stride = 0;
-    if constexpr (!Norm && !SkipNextKPrefetch) {
-        // A CTA chooses this compact body once, before its query loop.
-        // Keep the existing kernel entry and all explicit-length routes.
-        if (fixed.topk == 128 && fixed.topk_len_ptr == nullptr) {
-            fixed.topk = 128;
+    if constexpr (T::kPersistentPrefillQueries) {
+        // Resident queries retain the native launcher's fixed geometry.
+        typename T::FusedParams fixed = params;
+        fixed.q_orig = 1;
+        fixed.seqlen_q = fixed.h_q = fixed.ngroups = T::kBlockM;
+        fixed.h = fixed.h_h_k_ratio = 1;
+        fixed.d = T::kHeadDim;
+        fixed.d_v = T::kHeadDimV;
+        fixed.extra_topk = -1;
+        fixed.page_block_size = 1;
+        fixed.q_row_stride = fixed.k_row_stride = T::kHeadDim;
+        fixed.o_batch_stride = fixed.o_row_stride = 0;
+        if constexpr (T::kFixedPrefillBlocks == 4) {
+            fixed.topk = 256;
             fixed.topk_len_ptr = nullptr;
-            const Flash_fwd_mla_params& short_base = fixed;
-            flashmla::dsa::hs64::hs64_attention<FusedHs64Fixed128PrefillTraits<PerTokenScale>, false>(
-                short_base, fixed.max_logits);
-            return;
+        } else if constexpr (Fixed128Body) {
+            // Keep the null-length call separate so its masks remain constant.
+            if (fixed.topk == 128 && fixed.topk_len_ptr == nullptr) {
+                fixed.topk = 128;
+                fixed.topk_len_ptr = nullptr;
+                const Flash_fwd_mla_params& short_base = fixed;
+                flashmla::dsa::hs64::hs64_attention<FusedHs64Fixed128PrefillTraits<T::kPerTokenScale>, false>(
+                    short_base, fixed.max_logits);
+                return;
+            }
+            if (fixed.topk == 128) {
+                fixed.topk = 128;
+                const Flash_fwd_mla_params& short_base = fixed;
+                flashmla::dsa::hs64::hs64_attention<FusedHs64Fixed128PrefillTraits<T::kPerTokenScale>, false>(
+                    short_base, fixed.max_logits);
+                return;
+            }
         }
+        const Flash_fwd_mla_params& base = fixed;
+        flashmla::dsa::hs64::hs64_attention<T, false>(base, fixed.max_logits);
+    } else {
+        const Flash_fwd_mla_params& base = params;
+        flashmla::dsa::hs64::hs64_attention<T, false>(base, params.max_logits);
     }
-    const Flash_fwd_mla_params& base = fixed;
-    flashmla::dsa::hs64::hs64_attention<T, false>(base, fixed.max_logits);
 #endif
 }
 
@@ -102,7 +81,7 @@ template<bool Norm, bool SkipNextKPrefetch, bool PerTokenScale>
 void launch_fused_prefill_hs64_persistent(const FusedHs64Params<PerTokenScale>& params, hggcStream_t stream) {
     using T = FusedHs64PersistentPrefillTraits<Norm, SkipNextKPrefetch, PerTokenScale>;
     constexpr size_t bytes = sizeof(typename T::SharedMemoryPlan);
-    auto kernel = &fused_norm_rope_attn_rope_cast_prefill_hs64_persistent_kernel<Norm, SkipNextKPrefetch, PerTokenScale>;
+    auto kernel = &fused_norm_rope_attn_rope_cast_prefill_hs64_wi_kernel<T, !Norm && !SkipNextKPrefetch>;
     C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     const int grid_q = std::min(params.b, get_num_sm(get_current_device()));
     kernel<<<dim3(grid_q, 1, 1), T::NUM_THREADS, bytes, stream>>>(params);
@@ -115,8 +94,8 @@ void launch_fused_prefill_hs64(const FusedHs64Params<PerTokenScale>& params, hgg
     using T = FusedHs64PrefillTraits<Norm, Group, WideOutput, PerTokenScale>;
     constexpr size_t bytes = sizeof(typename T::SharedMemoryPlan);
     auto kernel = [] {
-        if constexpr (Isolated256) return &fused_norm_rope_attn_rope_cast_prefill_hs64_fixed256_kernel<true, PerTokenScale>;
-        else return &fused_norm_rope_attn_rope_cast_prefill_hs64_kernel<Norm, Group, WideOutput, PerTokenScale>;
+        if constexpr (Isolated256) return &fused_norm_rope_attn_rope_cast_prefill_hs64_wi_kernel<FusedHs64Fixed256PrefillTraits<PerTokenScale>>;
+        else return &fused_norm_rope_attn_rope_cast_prefill_hs64_wi_kernel<T>;
     }();
     C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     const int grid_q = [&] {

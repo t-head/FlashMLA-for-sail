@@ -1175,7 +1175,7 @@ __forceinline__ __device__ TileParams make_tile(const Params& fused, int token) 
 
 template<typename T>
 __global__ void __launch_bounds__(T::NUM_THREADS, 1, 1)
-fused_norm_rope_attn_rope_cast_fwd_kernel(__grid_constant__ const typename T::KernelParams params) {
+fused_norm_rope_attn_rope_cast_wi_kernel(__grid_constant__ const typename T::KernelParams params) {
     const int token = blockIdx.x;
     const TileParams tile = make_tile<T>(params, token);
     fused_wi::tile_body<T>(tile, 0);
@@ -1189,7 +1189,7 @@ void launch(const Params& params) {
     if constexpr(Mode == FwdMode::Prefill && Arch == 89) {
         if(params.topk_length == nullptr) {
             using V = NativePrefillConfig<Heads, EnableNorm, Arch, PerTokenScale>;
-            auto native_kernel = &fused_norm_rope_attn_rope_cast_fwd_kernel<V>;
+            auto native_kernel = &fused_norm_rope_attn_rope_cast_wi_kernel<V>;
             C10_CUDA_CHECK(hggcFuncSetAttribute(native_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
             native_kernel<<<dim3(params.s_q, 1, 1), V::NUM_THREADS, bytes, params.stream>>>(kernel_params);
             CHECK_CUDA_KERNEL_LAUNCH();
@@ -1199,14 +1199,14 @@ void launch(const Params& params) {
     if constexpr(Mode == FwdMode::Decode && Arch == 89 && Heads == 128) {
         if(params.extra_topk > 0) {
             using V = VectorDecodeConfig<Heads, EnableNorm, ExtraFP4, Arch, PerTokenScale>;
-            auto vector_kernel = &fused_norm_rope_attn_rope_cast_fwd_kernel<V>;
+            auto vector_kernel = &fused_norm_rope_attn_rope_cast_wi_kernel<V>;
             C10_CUDA_CHECK(hggcFuncSetAttribute(vector_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
             vector_kernel<<<dim3(params.s_q, 1, 1), V::NUM_THREADS, bytes, params.stream>>>(kernel_params);
             CHECK_CUDA_KERNEL_LAUNCH();
             return;
         }
     }
-    auto kernel = &fused_norm_rope_attn_rope_cast_fwd_kernel<T>;
+    auto kernel = &fused_norm_rope_attn_rope_cast_wi_kernel<T>;
     C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     kernel<<<dim3(params.s_q, 1, 1), T::NUM_THREADS, bytes, params.stream>>>(kernel_params);
     CHECK_CUDA_KERNEL_LAUNCH();
@@ -1223,8 +1223,12 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const Params& params) {
         launch<Mode, Heads, EnableNorm, ExtraFP4, 80, false>(params);
     } else {
         TORCH_CHECK(params.arch == 89, "Fused WI requires SM80 or SM89");
-        if (params.per_token_scale) launch<Mode, Heads, EnableNorm, ExtraFP4, 89, true>(params);
-        else launch<Mode, Heads, EnableNorm, ExtraFP4, 89, false>(params);
+        if constexpr (Mode == FwdMode::Prefill && Heads == 128) {
+            run_fused_norm_rope_attn_rope_cast_prefill_h128<EnableNorm>(params);
+        } else {
+            if (params.per_token_scale) launch<Mode, Heads, EnableNorm, ExtraFP4, 89, true>(params);
+            else launch<Mode, Heads, EnableNorm, ExtraFP4, 89, false>(params);
+        }
     }
 }
 
