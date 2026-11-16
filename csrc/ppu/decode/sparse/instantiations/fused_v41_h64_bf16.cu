@@ -10,6 +10,10 @@ struct FusedHs64PackedTraits
         flashmla::dsa::hs64::Hs64PackedFp8ExtraWorklist<MainCapacity, Worklist>>,
         ExtraFP4 || (!Norm && MainCapacity == 128 &&
             Worklist != flashmla::dsa::hs64::Hs64Worklist::Batch), false, PerTokenScale> {
+    // Flat uses 39 CTAs, so its next query always selects the other RoPE slot.
+    static constexpr bool kCachePrefillRope =
+        !Norm && ExtraFP4 && MainCapacity == 128 && PerTokenScale &&
+        Worklist == flashmla::dsa::hs64::Hs64Worklist::Flat;
     static constexpr bool kFp8LeaderPrefetch =
         !Norm && !ExtraFP4 && MainCapacity == 128 && Worklist == flashmla::dsa::hs64::Hs64Worklist::Flat;
 };
@@ -117,6 +121,8 @@ struct FusedHs64DirectTraits : FusedHs64Traits<false,
         flashmla::dsa::hs64::Hs64Traits<512, true, 89, true, true>, true, false, PerTokenScale>;
     using SharedMemoryPlan = typename Base::SharedMemoryPlan;
     static constexpr bool kFusedDirectQueries = true;
+    // Consecutive owned queries alternate the existing two RoPE slots.
+    static constexpr bool kCachePrefillRope = PerTokenScale;
     static constexpr bool kDeferPrefillSink = true;
     static_assert(Base::kPrefillSinkOffset + 64 * sizeof(float) <= offsetof(SharedMemoryPlan, smem_sP));
 };
@@ -149,7 +155,8 @@ static void run_fused_hs64_packed_output(const OutputParams<PerTokenScale>& p) {
     using flashmla::dsa::hs64::Hs64Worklist;
     if (p.topk == 256) {
         launch_fused_hs64_packed<Norm, ExtraFP4, 256, Hs64Worklist::Batch>(params, p.stream);
-    } else if (p.s_q >= (Norm && ExtraFP4 ? 6 : 8) * 39) {
+    } else if (p.s_q >= (ExtraFP4 && !Norm && PerTokenScale ? 2 :
+                         (ExtraFP4 && (Norm || PerTokenScale) ? 6 : 8)) * 39) {
         launch_fused_hs64_packed<Norm, ExtraFP4, 128, Hs64Worklist::Flat>(params, p.stream);
     } else {
         launch_fused_hs64_packed<Norm, ExtraFP4, 128, Hs64Worklist::Single>(params, p.stream);
