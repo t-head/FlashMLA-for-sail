@@ -172,6 +172,13 @@ static void run_fused_prefill_hs64_output(const OutputParams<PerTokenScale>& p) 
     params.stride_out_sf_token = p.stride_out_sf_token;
     params.stride_out_sf_group = p.stride_out_sf_group;
     params.stride_out_sf_word = p.stride_out_sf_word;
+    if constexpr (!EnableNorm) {
+        if (p.topk == 640 && p.s_q > 39 && p.s_q < 512 && topk_length == nullptr &&
+            get_num_sm(get_current_device()) == 39) {
+            launch_fused_prefill_hs64_persistent<false, false>(params, p.stream);
+            return;
+        }
+    }
     if (((p.topk <= 1024 && p.s_q >= 512) || (p.topk == 2048 && p.s_q >= 1024)) &&
         get_num_sm(get_current_device()) == 39) {
         if constexpr (!EnableNorm && PerTokenScale) {

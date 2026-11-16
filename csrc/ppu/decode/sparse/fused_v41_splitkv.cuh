@@ -78,6 +78,24 @@ __forceinline__ __device__ void load_q(
     #pragma unroll
     for (int k = 0; k < kChunks / kParts; ++k) {
         const int chunk = part + k * kParts;
+        if constexpr (h8 && !P::kEnableNorm && ExtraFP4 && P::per_token_scale
+                      && ACOMPUTE_VERSION >= 10500) {
+            if (!p.tile_scheduler_metadata_ptr && chunk < 28) {
+                // The existing Q commit and wait_group<1> in compute_attn
+                // retire these copies before the Q register load.
+                const Element* source = reinterpret_cast<const Element*>(p.q_ptr)
+                    + int64_t(token) * p.stride_q_token + (live ? head : 0) * 16
+                    + int64_t(chunk) * (p.real_heads * 16);
+                const auto* g = reinterpret_cast<const cute::uint128_t*>(source);
+                PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
+                    g[0], *reinterpret_cast<cute::uint128_t*>(
+                        dst + native_offset<kBlockM>(row, chunk * 16)), live);
+                PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>::copy(
+                    g[1], *reinterpret_cast<cute::uint128_t*>(
+                        dst + native_offset<kBlockM>(row, chunk * 16 + 8)), live);
+                continue;
+            }
+        }
         uint4 raw[2]{};
         if (live) {
             const uint4* g = reinterpret_cast<const uint4*>(
@@ -176,6 +194,8 @@ __forceinline__ __device__ void store_per_token_output(
     constexpr int kThreadsPerGroup = KT::kNThreads / kGroups;
     constexpr int kWarpsPerGroup = kThreadsPerGroup / 32;
     constexpr int kWarps = KT::kNThreads / 32;
+    constexpr bool kCooperativeScale = H8 && !EnableNorm && P::per_token_scale
+        && ACOMPUTE_VERSION >= 10500;
     constexpr size_t kStageBytes = cute::cosize(typename KT::SmemLayoutO{}) * sizeof(float);
     static_assert(KT::kBlockM % 8 == 0 && KT::kHeadDimV == 512);
     static_assert(KT::kNThreads % kGroups == 0 && kThreadsPerGroup % 32 == 0);
@@ -198,9 +218,16 @@ __forceinline__ __device__ void store_per_token_output(
                 if (tidx % 32 == 0) partials[tidx / 32] = amax;
                 __syncthreads();
             }
+            if constexpr (kCooperativeScale) {
+                static_assert(H8 && kWarpsPerGroup == 8);
+                const int lane = tidx % 32;
+                const float partial = lane < kWarpsPerGroup
+                    ? fmaxf(1e-4f, partials[group * kWarpsPerGroup + lane]) : 1e-4f;
+                amax = __uint_as_float(__reduce_max_sync(0xffffffff, __float_as_uint(partial)));
+            }
             float inverse = 0.0f;
             if (tidx % 32 == 0) {
-                if constexpr (kWarpsPerGroup > 1) {
+                if constexpr (kWarpsPerGroup > 1 && !kCooperativeScale) {
                     amax = 1e-4f;
                     #pragma unroll
                     for (int warp = 0; warp < kWarpsPerGroup; ++warp)
@@ -682,12 +709,34 @@ fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
             const int remainder = params.b % params.num_sm_parts;
             const int begin = partition_idx * rows + cute::min(partition_idx, remainder);
             const int end = begin + rows + int(partition_idx < remainder);
+            if constexpr (!EnableNorm && ExtraFP4 && PerTokenScale) {
+                // The H8 complete-query launcher fixes these dimensions and
+                // capacities. Expose them to the shared core without changing
+                // either cache's physical page strides or validity checks.
+                auto fixed = params;
+                fixed.q_orig = fixed.h = fixed.h_h_k_ratio = 1;
+                fixed.seqlen_q = fixed.h_q = fixed.ngroups = fixed.real_heads = 8;
+                fixed.d = fixed.d_v = 512;
+                fixed.q_row_stride = 512;
+                fixed.k_row_stride = 528;
+                fixed.extra_k_row_stride = 288;
+                fixed.topk = kMainTopk;
+                fixed.extra_topk = kExtraTopk;
+                #pragma unroll 1
+                for (int token = begin; token < end; ++token) {
+                    flash::compute_attn_fp8_sparse_splitkv<KT, true, ExtraFP4>(
+                        fixed, token, 0, 0, 0, 0, (kMainTopk + kExtraTopk) / kBlockN,
+                        true, kMainTopk, kMainTopk / kBlockN, kExtraTopk);
+                    __syncthreads();
+                }
+            } else {
             #pragma unroll 1
             for (int token = begin; token < end; ++token) {
                 flash::compute_attn_fp8_sparse_splitkv<KT, true, ExtraFP4>(
                     params, token, 0, 0, 0, 0, (kMainTopk + kExtraTopk) / kBlockN,
                     true, kMainTopk, kMainTopk / kBlockN, kExtraTopk);
                 __syncthreads();
+            }
             }
             return;
         }
