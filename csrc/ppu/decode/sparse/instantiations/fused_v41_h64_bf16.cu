@@ -99,7 +99,8 @@ static FusedHs64Params<PerTokenScale> make_fused_hs64_decode_params(const Output
     params.extra_indices_ptr = const_cast<int32_t*>(p.extra_indices);
     params.extra_indices_batch_stride = p.stride_extra_indices_s_q;
     params.extra_topk_len_ptr = const_cast<int32_t*>(p.extra_topk_length);
-    params.extra_topk = p.extra_topk;
+    // An absent extra stream must also disable the generic loader's lookahead.
+    params.extra_topk = p.extra_kv ? p.extra_topk : -1;
     params.attn_sink_ptr = const_cast<float*>(p.attn_sink);
     params.o_ptr = p.out_fp8;
     // The shared HS64 body forms its BF16 output view; the hook stores FP8.
