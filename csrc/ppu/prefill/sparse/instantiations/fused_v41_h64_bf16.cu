@@ -87,9 +87,45 @@ void launch_fused_prefill_hs64(const FusedHs64Params& params, hggcStream_t strea
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
+// SM80 uses native unpaired Q/K operands and its original HS64 schedule.
+// The fused raw-Q copy needs 256 arrivals, unlike the native AIU loader's 32.
+struct FusedHs64Sm80PrefillTraits
+    : FusedHs64Traits<false, flashmla::dsa::hs64::Hs64PrefillTraits<512, 80, false, false>, true> {
+    static constexpr int kQBarrierThreads = 256;
+};
+
+__global__ void __launch_bounds__(512, 1, 1)
+fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_kernel(
+    __grid_constant__ const FusedHs64Params params) {
+#if ACOMPUTE_VERSION == 10000
+    using T = FusedHs64Sm80PrefillTraits;
+    FusedHs64Params fixed = params;
+    fixed.q_orig = 1;
+    fixed.seqlen_q = fixed.h_q = fixed.ngroups = T::kBlockM;
+    fixed.h = fixed.h_h_k_ratio = 1;
+    fixed.d = T::kHeadDim;
+    fixed.d_v = T::kHeadDimV;
+    fixed.extra_topk = -1;
+    fixed.page_block_size = 1;
+    fixed.q_row_stride = fixed.k_row_stride = T::kHeadDim;
+    fixed.o_batch_stride = fixed.o_row_stride = 0;
+    const Flash_fwd_mla_params& base = fixed;
+    flashmla::dsa::hs64::hs64_attention<T, false>(base, fixed.max_logits);
+#endif
+}
+
+void launch_fused_prefill_hs64_sm80(const FusedHs64Params& params, hggcStream_t stream) {
+    using T = FusedHs64Sm80PrefillTraits;
+    constexpr size_t bytes = sizeof(typename T::SharedMemoryPlan);
+    auto kernel = &fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_kernel;
+    C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    kernel<<<dim3(params.b, 1, 1), T::NUM_THREADS, bytes, stream>>>(params);
+    CHECK_CUDA_KERNEL_LAUNCH();
+}
+
 template<bool EnableNorm>
 void run_fused_norm_rope_attn_rope_cast_prefill_hs64(const Params& p) {
-    TORCH_CHECK(p.mode == FwdMode::Prefill && p.arch == 89 && p.h_q == 64);
+    TORCH_CHECK(p.mode == FwdMode::Prefill && (p.arch == 89 || (p.arch == 80 && !EnableNorm)) && p.h_q == 64);
     TORCH_CHECK(p.topk >= 128 && p.topk % 128 == 0 && p.enable_q_norm == EnableNorm);
     TORCH_CHECK(p.wv_group_size == 8 && p.n_wv_group == 8);
     if(p.s_q == 0) return;
@@ -129,6 +165,10 @@ void run_fused_norm_rope_attn_rope_cast_prefill_hs64(const Params& p) {
     params.stride_out_sf_token = p.stride_out_sf_token;
     params.stride_out_sf_group = p.stride_out_sf_group;
     params.stride_out_sf_word = p.stride_out_sf_word;
+    if (p.arch == 80) {
+        launch_fused_prefill_hs64_sm80(params, p.stream);
+        return;
+    }
     if (((p.topk <= 1024 && p.s_q >= 512) || (p.topk == 2048 && p.s_q >= 1024)) &&
         get_num_sm(get_current_device()) == 39) {
         if (p.topk == 2048) launch_fused_prefill_hs64_persistent<EnableNorm, true>(params, p.stream);

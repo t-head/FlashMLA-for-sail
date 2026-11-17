@@ -6,6 +6,7 @@
 #include <cute/tensor.hpp>
 
 #include <cutlass/numeric_types.h>
+#include <cutlass/numeric_conversion.h>
 #include <cutlass/arch/memory.h>
 
 #include "utils.h"
@@ -113,6 +114,46 @@ __device__ __forceinline__ void fp8_to_bf16(Tensor0 src, Tensor1 dst, float scal
 
 
 
+template<typename Tensor0, typename Tensor1>
+__device__ __forceinline__ void int8_to_bf16(Tensor0 src, Tensor1 dst, float scale) {
+    auto words = recast<uint32_t>(src);
+    auto output = recast<__ppu_bfloat162>(dst);
+    const __ppu_bfloat162 scale2 = __float2bfloat162_rn(scale);
+#if ACOMPUTE_VERSION == 10000
+    #pragma unroll
+    for (int i = 0; i < size(words); ++i) {
+        // BF16 encodes every integer in [128, 255] exactly. Keep each signed
+        // byte's low seven bits as the mantissa, then subtract 128 or 256.
+        // The subtraction is exact for all 256 signed INT8 values.
+        const uint32_t packed01 = __byte_perm(words[i], 0x43434343u, 0x5140);
+        const uint32_t packed23 = __byte_perm(words[i], 0x43434343u, 0x5342);
+        const uint32_t value01 = packed01 & 0xff7fff7fu;
+        const uint32_t value23 = packed23 & 0xff7fff7fu;
+        const uint32_t bias01 = (packed01 & 0x00800080u) | 0x43004300u;
+        const uint32_t bias23 = (packed23 & 0x00800080u) | 0x43004300u;
+        const __ppu_bfloat162 pair01 = __hsub2(
+            *reinterpret_cast<const __ppu_bfloat162*>(&value01),
+            *reinterpret_cast<const __ppu_bfloat162*>(&bias01));
+        const __ppu_bfloat162 pair23 = __hsub2(
+            *reinterpret_cast<const __ppu_bfloat162*>(&value23),
+            *reinterpret_cast<const __ppu_bfloat162*>(&bias23));
+        output[2 * i] = __hmul2(pair01, scale2);
+        output[2 * i + 1] = __hmul2(pair23, scale2);
+    }
+#else
+    using Converter = cutlass::NumericArrayConverter<cutlass::bfloat16_t, int8_t, 4>;
+    #pragma unroll
+    for (int i = 0; i < size(words); ++i) {
+        typename Converter::source_type input;
+        *reinterpret_cast<uint32_t*>(&input) = words[i];
+        const auto values = Converter::convert(input);
+        const auto* pairs = reinterpret_cast<const __ppu_bfloat162*>(&values);
+        output[2 * i] = __hmul2(pairs[0], scale2);
+        output[2 * i + 1] = __hmul2(pairs[1], scale2);
+    }
+#endif
+}
+
 static constexpr int kFp4LutReplicas = 32;
 static constexpr int kFp4LutEntries = 256 * kFp4LutReplicas;
 
@@ -124,8 +165,11 @@ __device__ __forceinline__ uint16_t fp4_e2m1_to_bf16_bits(uint8_t code) {
 }
 
 __device__ __forceinline__ uint32_t fp4_pair_to_bf16x2_bits(uint8_t pair) {
-    return uint32_t(fp4_e2m1_to_bf16_bits(pair & 0xF))
-        | (uint32_t(fp4_e2m1_to_bf16_bits(pair >> 4)) << 16);
+    using Converter = cutlass::NumericArrayConverter<cutlass::bfloat16_t, cutlass::int4b_t, 2>;
+    typename Converter::source_type input;
+    *reinterpret_cast<uint8_t*>(&input) = pair;
+    const auto values = Converter::convert(input);
+    return *reinterpret_cast<const uint32_t*>(&values);
 }
 
 __device__ __forceinline__ uint4 fp4_word_to_bf16x2_bits(uint32_t word) {
@@ -140,6 +184,20 @@ __device__ __forceinline__ uint4 fp4_word_to_bf16x2_bits(uint32_t word) {
                  __byte_perm(low1, high1, 0x5140), __byte_perm(low1, high1, 0x7362)};
 }
 
+__device__ __forceinline__ float fp4_scale_to_float(uint8_t code) {
+#if ACOMPUTE_VERSION == 10000
+    const uint32_t magnitude = code & 0x7fu;
+    if (magnitude != 0x7fu) {
+        const float biased = __uint_as_float(0x3c000000u + (magnitude << 20));
+        const float value = fminf(fmaf(biased, 2.0f, -0.015625f), biased);
+        return __uint_as_float(__float_as_uint(value) | ((uint32_t(code) & 0x80u) << 24));
+    }
+#endif
+    __hg_fp8_e4m3 scale;
+    scale.__x = code;
+    return float(scale);
+}
+
 template <bool RegisterDecode = false, typename Tensor0>
 __device__ __forceinline__ void fp4x16_to_bf16(
         uint64_t packed, Tensor0 dst, float scale, const uint32_t* lut) {
@@ -148,7 +206,12 @@ __device__ __forceinline__ void fp4x16_to_bf16(
     if constexpr (RegisterDecode) {
         #pragma unroll
         for (int half = 0; half < 2; ++half) {
-            const uint4 values = fp4_word_to_bf16x2_bits(uint32_t(packed >> (half * 32)));
+            using Converter = cutlass::NumericArrayConverter<cutlass::bfloat16_t, cutlass::int4b_t, 8>;
+            typename Converter::source_type input;
+            *reinterpret_cast<uint32_t*>(&input) = uint32_t(packed >> (half * 32));
+            const auto converted = Converter::convert(input);
+            uint4 values;
+            __builtin_memcpy(&values, &converted, sizeof(values));
             dst_bf16x2[half * 4 + 0] = __hmul2(*reinterpret_cast<const __ppu_bfloat162*>(&values.x), scale_bf16x2);
             dst_bf16x2[half * 4 + 1] = __hmul2(*reinterpret_cast<const __ppu_bfloat162*>(&values.y), scale_bf16x2);
             dst_bf16x2[half * 4 + 2] = __hmul2(*reinterpret_cast<const __ppu_bfloat162*>(&values.z), scale_bf16x2);
@@ -616,7 +679,7 @@ struct KVCacheG2SFP8 {
                         const int scale_byte = (w % 2) * 4 + ((tidx % kSmemThreadsPerRowNope) / 2);
                         fp8_e8m0 scale_value;
                         scale_value.__x = static_cast<uint8_t>(scale_word >> (scale_byte * 8));
-                        fp8_to_bf16(tKrK_fp8_w(_, _, w), tKrK_bf16_w(_, _, w), float(scale_value));
+                        int8_to_bf16(tKrK_fp8_w(_, _, w), tKrK_bf16_w(_, _, w), float(scale_value));
                         cute::copy(r2s_wide, tKrK_bf16_w(_, _, w), tKsK_bf16_w(_, _, w));
                     });
                 } else {
@@ -624,7 +687,7 @@ struct KVCacheG2SFP8 {
                     #pragma unroll
                     for (int w = kWideTiles - 1; w >= 0; --w) {
                         int scale_idx = w * 4 + ((tidx % kSmemThreadsPerRowNope) / 2);
-                        fp8_to_bf16(tKrK_fp8_w(_, _, w), tKrK_bf16_w(_, _, w), float(fp8_scale[scale_idx]));
+                        int8_to_bf16(tKrK_fp8_w(_, _, w), tKrK_bf16_w(_, _, w), float(fp8_scale[scale_idx]));
                         cute::copy(r2s_wide, tKrK_bf16_w(_, _, w), tKsK_bf16_w(_, _, w));
                     }
                 }
@@ -717,8 +780,7 @@ struct KVCacheG2SFP4 {
             const uint8_t scale3 = sscale[token * kScalesPerToken + 3 * kThreadsPerRow + lane_in_row];
             __syncthreads();
             const auto store_tile = [&](uint64_t packed, uint8_t scale, auto tile) {
-                const __hg_fp8_e4m3 scale_e4m3 = *reinterpret_cast<const __hg_fp8_e4m3*>(&scale);
-                fp4x16_to_bf16<RegisterDecode>(packed, tKrK_bf16(_, _, tile), float(scale_e4m3), lut);
+                fp4x16_to_bf16<RegisterDecode>(packed, tKrK_bf16(_, _, tile), fp4_scale_to_float(scale), lut);
                 cute::copy(r2s_wide, tKrK_bf16(_, _, tile), tKsK_bf16(_, _, tile));
             };
             store_tile(packed0, scale0, Int<0>{});
@@ -736,8 +798,7 @@ struct KVCacheG2SFP4 {
             __syncthreads();  // staging read done before in-place bf16 write clobbers it
             #pragma unroll
             for (int w = 0; w < kWideTiles; ++w) {
-                __hg_fp8_e4m3 scale_e4m3 = *reinterpret_cast<const __hg_fp8_e4m3*>(&scale_raw[w]);
-                fp4x16_to_bf16<RegisterDecode>(packed[w], tKrK_bf16(_, _, w), float(scale_e4m3), lut);
+                fp4x16_to_bf16<RegisterDecode>(packed[w], tKrK_bf16(_, _, w), fp4_scale_to_float(scale_raw[w]), lut);
                 cute::copy(r2s_wide, tKrK_bf16(_, _, w), tKsK_bf16(_, _, w));
             }
         }

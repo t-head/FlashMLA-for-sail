@@ -173,6 +173,7 @@ bool run_fused_norm_rope_attn_rope_cast_decode_native_wi(
     c.s_q = params.s_q;
     c.h_q = 128;
     c.num_sm_parts = split.num_sm_parts;
+    c.arch = params.arch;
     c.num_splits = split.num_splits;
     c.lse_accum = split.lse_accum;
     c.o_accum = split.o_accum;

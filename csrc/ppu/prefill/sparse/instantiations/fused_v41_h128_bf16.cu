@@ -175,6 +175,13 @@ using H8BaseTraits = Flash_fwd_kernel_traits<
     true, false, 1, 1, 32, 2, 2, false, false,
     Flash_kernel_traits<false, cutlass::bfloat16_t>>;
 
+// N64 needs 64 independent gather rows: eight threads per row, 512 total.
+// Keep four QK warps and use all sixteen warps for the PV columns.
+using H8WideM8Traits = Flash_fwd_kernel_traits<
+    512, 8, 64, 16, false, false, cutlass::bfloat16_t, 512,
+    true, true, 1, 1, 64, 2, 4, false, false,
+    Flash_kernel_traits<true, cutlass::bfloat16_t>>;
+
 template<typename KT>
 constexpr bool vector_q_layout() {
     typename KT::SmemLayoutAtomQ atom{};
@@ -218,10 +225,17 @@ __forceinline__ __device__ float2 apply_rope(float2 x, float c, float s) {
 }
 
 __forceinline__ __device__ uint16_t fp8_pair_from_float(float low, float high) {
+#if ACOMPUTE_VERSION >= 10500
     uint16_t result;
     asm volatile("ppu.cvt.rtte.satfinite.e4m3x2.f32 %0, %1, %2;"
         : "=h"(result) : "f"(high), "f"(low));
     return result;
+#elif ACOMPUTE_VERSION == 10000
+    return splitkv::fp8_pair_from_float(low, high);
+#else
+    return uint16_t(cutlass::float_e4m3_t::from_float(low).storage)
+        | (uint16_t(cutlass::float_e4m3_t::from_float(high).storage) << 8);
+#endif
 }
 
 }
@@ -230,10 +244,10 @@ struct FusedSmallPrefillParams : SparsePrefillParams {
     Params fused;
 };
 
-template<bool Norm, bool H8>
+template<bool Norm, bool H8, bool Thin = false>
 struct FusedSmallPrefillTraits
-    : std::conditional_t<H8, small_prefill::H8BaseTraits, small_prefill::BaseTraits> {
-    using Base = std::conditional_t<H8, small_prefill::H8BaseTraits, small_prefill::BaseTraits>;
+    : std::conditional_t<Thin, small_prefill::H8WideM8Traits, std::conditional_t<H8, small_prefill::H8BaseTraits, small_prefill::BaseTraits>> {
+    using Base = std::conditional_t<Thin, small_prefill::H8WideM8Traits, std::conditional_t<H8, small_prefill::H8BaseTraits, small_prefill::BaseTraits>>;
     using PrefillParams = FusedSmallPrefillParams;
     static constexpr bool kFusedSmallPrefill = true;
     static constexpr size_t kStdSmemEnd = Base::kSmemSize + 2 * Base::kBlockN * sizeof(bool);
@@ -244,21 +258,29 @@ struct FusedSmallPrefillTraits
     static constexpr size_t kSmallSmemBytes = std::max(
         kScratchOffset + (H8 && !Norm ? Base::kBlockM * sizeof(bool) : kScratchBytes), kStageBytes);
 
-    static_assert(Base::kBlockM == 16 && Base::kBlockN == (H8 ? 32 : 64)
-                  && Base::kNThreads == (H8 ? 256 : 512));
+    static_assert(!Thin || (H8 && !Norm));
+    static_assert(Base::kBlockM == (Thin ? 8 : 16) && Base::kBlockN == (H8 && !Thin ? 32 : 64)
+                  && Base::kNThreads == (H8 && !Thin ? 256 : 512));
     static_assert(!Base::Is_Q_in_regs && !Base::Share_Q_K_smem && !Base::QKV_FP8);
     static_assert(Base::AtomLayoutQ == 1 && Base::AtomLayoutP == 1
-                  && Base::kNWarps0 == (H8 ? 2 : 4));
+                  && Base::kNWarps0 == (H8 && !Thin ? 2 : 4));
     static_assert(Base::kHeadDim == 512 && Base::kHeadDimV == 512);
     static_assert(std::is_same_v<typename Base::SmemLayoutQ,
-        decltype(cute::tile_to_shape(typename Base::SmemLayoutAtomQ{}, cute::Shape<cute::_16, cute::_512>{}))>);
+        decltype(cute::tile_to_shape(typename Base::SmemLayoutAtomQ{}, cute::Shape<cute::Int<Base::kBlockM>, cute::_512>{}))>);
     static_assert(small_prefill::vector_q_layout<Base>());
     static_assert(small_prefill::unique_stat_rows<Base>());
     static_assert(cute::cosize(typename Base::SmemLayoutO{}) * sizeof(float) == kStageBytes);
-    static_assert(kStdSmemEnd == (H8 ? 83584 : 150720) && kScratchOffset == kStdSmemEnd);
-    static_assert(kStageBytes == 32 * 1024 && kStageBytes <= Base::kSmemQSize + Base::kSmemKVSize / 2);
-    static_assert(kScratchOffset >= kStageBytes && kSmallSmemBytes == (H8 ? (Norm ? 83904 : 83600) : 152832));
-    static_assert(Base::kBlockM * kQParts % Base::kNThreads == 0);
+    static_assert((Thin || kStdSmemEnd == (H8 ? 83584 : 150720)) && kScratchOffset == kStdSmemEnd);
+    static_assert(kStageBytes == (Thin ? 16 : 32) * 1024 && kStageBytes <= Base::kSmemQSize + Base::kSmemKVSize / 2);
+    static_assert(kScratchOffset >= kStageBytes && (Thin || kSmallSmemBytes == (H8 ? (Norm ? 83904 : 83600) : 152832)));
+    // Thin has 256 Q chunks and 512 threads; the upper half is idle only
+    // during Q loading and joins every subsequent CTA barrier.
+    static_assert(Base::kBlockM * kQParts % Base::kNThreads == 0
+                  || (Thin && Base::kBlockM * kQParts < Base::kNThreads));
+    static_assert(!Thin || (Base::kNThreads / 8 == Base::kBlockN
+                          && Base::kNWarps == 16 && Base::kNWarps0 == 4));
+    static_assert(!Thin || (kStdSmemEnd == 140960 && kScratchOffset == 140960
+                          && kSmallSmemBytes == 140968));
     static_assert(kSmallSmemBytes <= 256 * 1024);
 
     template<typename KT, typename TensorQ>
@@ -301,7 +323,9 @@ struct FusedSmallPrefillTraits
                         sum = fmaf(float(elements[j + 1]), float(elements[j + 1]), sum);
                     }
                 }
-                const int offset = cute::Swizzle<KT::kSwizzle, 3, 3>{}(q.layout()(row, dim));
+                const int offset = ACOMPUTE_VERSION == 10000
+                    ? splitkv::native_offset<KT::kBlockM>(row, dim)
+                    : cute::Swizzle<KT::kSwizzle, 3, 3>{}(q.layout()(row, dim));
                 if (dim < 448 || (!H8 && head >= params.h_q)) {
                     *reinterpret_cast<uint4*>(dst + offset) = raw;
                 } else {
@@ -318,8 +342,10 @@ struct FusedSmallPrefillTraits
                     }
                     *reinterpret_cast<uint4*>(dst + offset) = *reinterpret_cast<const uint4*>(packed);
                 }
-                if constexpr (H8) {
-                    const int dummy_offset = cute::Swizzle<KT::kSwizzle, 3, 3>{}(q.layout()(row + 8, dim));
+                if constexpr (H8 && !Thin) {
+                    const int dummy_offset = ACOMPUTE_VERSION == 10000
+                        ? splitkv::native_offset<KT::kBlockM>(row + 8, dim)
+                        : cute::Swizzle<KT::kSwizzle, 3, 3>{}(q.layout()(row + 8, dim));
                     *reinterpret_cast<uint4*>(dst + dummy_offset) = uint4{};
                 }
             }
@@ -626,7 +652,7 @@ struct FusedSmallPrefillTraits
 
 template<bool Norm>
 void run_fused_norm_rope_attn_rope_cast_prefill_small(const Params& p) {
-    TORCH_CHECK(p.mode == FwdMode::Prefill && p.arch == 89);
+    TORCH_CHECK(p.mode == FwdMode::Prefill && (p.arch == 89 || (p.arch == 80 && p.h_q == 8)));
     if (p.h_q == 8) {
         TORCH_CHECK(p.topk > 0 && p.topk % small_prefill::BaseTraits::kBlockN == 0,
                     "H8 fused prefill requires a positive top-k divisible by 64");
@@ -676,16 +702,31 @@ void run_fused_norm_rope_attn_rope_cast_prefill_small(const Params& p) {
     params.fused = p;
     params.fused.topk_length = topk_length;
 
-    const auto launch = [&](auto h8) {
-        using T = FusedSmallPrefillTraits<Norm, decltype(h8)::value>;
+    const auto launch = [&](auto h8, auto thin) {
+        using T = FusedSmallPrefillTraits<Norm, decltype(h8)::value, decltype(thin)::value>;
         constexpr size_t bytes = T::kSmallSmemBytes;
         auto kernel = &flash::flash_sparse_prefill_fwd_kernel<T, true, false, true, false, FusedSmallPrefillParams>;
-        C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        static std::mutex attr_mutex;
+        static std::set<int> configured_devices;
+        const int device = get_current_device();
+        {
+            std::lock_guard<std::mutex> lock(attr_mutex);
+            if (configured_devices.find(device) == configured_devices.end()) {
+                C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
+                configured_devices.insert(device);
+            }
+        }
         kernel<<<dim3(p.s_q * cute::ceil_div(p.h_q, T::kBlockM), 1, 1), T::kNThreads, bytes, p.stream>>>(params);
         CHECK_CUDA_KERNEL_LAUNCH();
     };
-    if (p.h_q == 8) launch(std::true_type{});
-    else launch(std::false_type{});
+    if constexpr (!Norm && !Params::per_token_scale) {
+        if (p.arch == 80 && p.h_q == 8 && p.s_q <= 16) {
+            launch(std::true_type{}, std::true_type{});
+            return;
+        }
+    }
+    if (p.h_q == 8) launch(std::true_type{}, std::false_type{});
+    else launch(std::false_type{}, std::false_type{});
 }
 
 template void run_fused_norm_rope_attn_rope_cast_prefill_small<false>(const Params&);

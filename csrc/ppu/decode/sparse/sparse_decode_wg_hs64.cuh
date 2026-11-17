@@ -5386,7 +5386,8 @@ __forceinline__ __device__ void hs64_attention(
         T::cache_prefill_sink(params, tidx);
     }
     constexpr bool kWaitQBeforePrologBarrier =
-        kHs64PrefillGroupedQueries<T> || kHs64FusedPackedFp4<T>;
+        kHs64PrefillGroupedQueries<T> || kHs64FusedPackedFp4<T>
+        || (Hs64HasFusedHooks<T>::value && T::kIsPrefill && T::kArch == 80);
     constexpr bool kSkipNextKPrefetch = [] {
         if constexpr (Hs64HasFusedHooks<T>::value) return T::kSkipNextKPrefetch;
         return false;

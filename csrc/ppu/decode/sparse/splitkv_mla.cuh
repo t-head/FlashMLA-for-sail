@@ -42,7 +42,7 @@ template<typename P>
 struct is_fused_splitkv_norm<P, std::void_t<decltype(P::kEnableNorm)>>
     : std::bool_constant<is_fused_splitkv<P>::value && P::kEnableNorm> {};
 
-template<typename Kernel_traits, bool IsV41FP8, bool IsExtraFP4, bool CheckKvCapacity = false, typename Params>
+template<typename Kernel_traits, bool IsV41FP8, bool IsExtraFP4, bool CheckKvCapacity = false, bool AbsoluteSplitIndex = false, typename Params>
 __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     const Params &params, const int batch_id, const int bidh, const int m_block,
     const int n_split_idx, const int n_block_min, const int n_block_max, const bool NoSplit,
@@ -607,7 +607,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
             flash::store<Kernel_traits, false, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
         }
     } else {
-        flash::store<Kernel_traits, true, true, true, kFusedSplitKV>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+        flash::store<Kernel_traits, true, true, true, kFusedSplitKV, AbsoluteSplitIndex>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
     }
 }
 

@@ -30,7 +30,7 @@ def prefill(
     """
     A fused kernel for Q Norm + Q RoPE + Core Attn (sparse attention) + O RoPE + O cast to FP8, for DeepSeek-V4.1
     Only support PPU sm80 / sm89 architectures.
-    H8 is supported on SM89 with positive topk divisible by 64 and 16-byte-aligned KV rows.
+    H8 requires positive topk divisible by 64 and 16-byte-aligned KV rows.
 
     Args (Norm):
         enable_q_norm: bool, whether to apply Q RMSNorm
@@ -45,7 +45,7 @@ def prefill(
     Args (Cast):
         n_wv_group: n_wv_group during o projection
         num_per_channels: must match the build macro FLASHMLA_FUSED_OUTPUT_CHANNELWISE:
-            0 (default) requires 32; 1 requires 4096 (one FP32 scale per token/WV group, SM89)
+            0 (default) requires 32; 1 requires 4096 (one FP32 scale per token/WV group)
         use_tma_aligned_col_major_sf: True for per-32; False for per-token FP32 scales
         round_sf: True for per-32; False for per-token FP32 scales
         use_packed_ue8m0: True for per-32; False for per-token FP32 scales
@@ -109,7 +109,6 @@ def decode(
     """
     Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4.1
     Only support PPU sm80 / sm89 architectures.
-    H8 is supported on SM89.
 
     The batch size is always 1, and the batch dimension is not included in any tensor shape below.
 
@@ -126,7 +125,7 @@ def decode(
     Args (Cast):
         n_wv_group: n_wv_group during o projection
         num_per_channels: must match the build macro FLASHMLA_FUSED_OUTPUT_CHANNELWISE:
-            0 (default) requires 32; 1 requires 4096 (one FP32 scale per token/WV group, SM89)
+            0 (default) requires 32; 1 requires 4096 (one FP32 scale per token/WV group)
         use_tma_aligned_col_major_sf: True for per-32; False for per-token FP32 scales
         round_sf: True for per-32; False for per-token FP32 scales
         use_packed_ue8m0: True for per-32; False for per-token FP32 scales

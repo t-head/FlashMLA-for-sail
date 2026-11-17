@@ -4,6 +4,7 @@
 #include <type_traits>
 #include "api/common.h"
 #include "fused_v41_wi.cuh"
+#include "decode/sparse/fused_v41_splitkv.cuh"
 #include "decode/sparse/sparse_decode_wg_hs64.cuh"
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
@@ -39,7 +40,7 @@ struct FusedHs64Traits : Base {
     static_assert(!kFusedPackedFp4 ||
                   (WideOutput && !Base::kIsPrefill && !Base::kHasExtraKTile && !Base::kParkQ5Fragment));
     static constexpr int kQBarrierThreads = Base::kIsPrefill ? Base::kQBarrierThreads : Base::NUM_THREADS;
-    static constexpr size_t kNormScratchOffset = Base::kIsPrefill ? 200192
+    static constexpr size_t kNormScratchOffset = Base::kIsPrefill && Base::kParkQ5Fragment ? 200192
         : offsetof(SharedMemoryPlan, smem_cross_n_reduction)
             + sizeof(((SharedMemoryPlan*)nullptr)->smem_cross_n_reduction);
     static constexpr size_t kNormOffset = kNormScratchOffset + 512 * sizeof(float);
@@ -47,19 +48,20 @@ struct FusedHs64Traits : Base {
     static constexpr size_t kPrefillRopeOffset = kNormEnd;
     static constexpr size_t kPrefillSinkOffset = kPrefillRopeOffset + 128 * sizeof(float);
     static_assert(sizeof(SharedMemoryPlan) == 262144);
-    static_assert(!Base::kIsPrefill || offsetof(SharedMemoryPlan, barriers_K1)
+    static_assert(!Base::kParkQ5Fragment || offsetof(SharedMemoryPlan, barriers_K1)
         + sizeof(((SharedMemoryPlan*)nullptr)->barriers_K1) <= kNormScratchOffset);
     static_assert(kNormEnd <= offsetof(SharedMemoryPlan, smem_sP));
     static_assert(!Base::kIsPrefill || kPrefillSinkOffset + 64 * sizeof(float)
                   <= offsetof(SharedMemoryPlan, smem_sP));
     static_assert(offsetof(SharedMemoryPlan, smem_sQ) == 0);
     static_assert(offsetof(SharedMemoryPlan, smem_sK) == 65536);
-    static_assert(!Base::kIsPrefill || offsetof(SharedMemoryPlan, smem_valid_indices) == 199168);
+    static_assert(!Base::kIsPrefill || offsetof(SharedMemoryPlan, smem_valid_indices) ==
+        (Base::kParkQ5Fragment ? 199168 : 221184));
     static_assert(offsetof(SharedMemoryPlan, smem_sP) == 204800);
     static_assert(offsetof(SharedMemoryPlan, smem_even_high) == 229376);
     static_assert(cosize_v<SmemLayoutO_Half64x256> * sizeof(float) == 65536);
     static_assert(Base::kBlockM == 64 && Base::kBlockN == 64 && Base::NUM_THREADS == 512);
-    static_assert(Base::kUsePairedCubes == Base::kIsPrefill && Base::kUsePv2x4);
+    static_assert(Base::kUsePairedCubes == (Base::kIsPrefill && Base::kArch == 89) && Base::kUsePv2x4);
 
     static __forceinline__ __device__ int q_offset(int row, int dim) {
         if constexpr (Base::kUsePairedCubes) return paired_q_offset<64>(row, dim);
@@ -162,7 +164,7 @@ struct FusedHs64Traits : Base {
                     const int dim = dim_begin + (kCoalesceQ ? i * 4 : i);
                     PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>::copy(
                         *reinterpret_cast<const cute::uint128_t*>(src + (dim / 16) * (64 * 16) + copy_row * 16 + dim % 16),
-                        *reinterpret_cast<cute::uint128_t*>(dst + paired_q_offset<64>(copy_row, dim)));
+                        *reinterpret_cast<cute::uint128_t*>(dst + q_offset(copy_row, dim)));
                 }
                 prefetch_prefill_rope<T>(fused, batch_idx, tidx);
                 cutlass::arch::cpasync_barrier_arrive_noinc(barrier_Q);
@@ -204,8 +206,8 @@ struct FusedHs64Traits : Base {
             }
             #pragma unroll
             for(int half = 0; half < 2; ++half) {
-                const int q_offset = paired_q_offset<64>(row, dim + half * 8);
-                *reinterpret_cast<uint4*>(dst + q_offset) = reinterpret_cast<const uint4*>(packed)[half];
+                const int offset = q_offset(row, dim + half * 8);
+                *reinterpret_cast<uint4*>(dst + offset) = reinterpret_cast<const uint4*>(packed)[half];
             }
         }
         if constexpr (T::kCacheRms) {
@@ -244,7 +246,7 @@ struct FusedHs64Traits : Base {
         const int part = tidx / 64;
         const float* rope = q_rope<T>(fused, batch_idx);
         if constexpr (!Norm && (flashmla::dsa::hs64::kHs64PrefillGroupedQueries<T> ||
-                                kFusedPackedFp4)) {
+                                kFusedPackedFp4 || (Base::kIsPrefill && Base::kArch == 80))) {
             // Split the 64 RoPE dimensions across both warpgroups.
             const int dim = 448 + part * 8;
             auto* chunk = reinterpret_cast<uint4*>(dst + q_offset(row, dim));
@@ -260,6 +262,8 @@ struct FusedHs64Traits : Base {
                 packed[j + 1] = typename T::InputT(x.y);
             }
             *chunk = *reinterpret_cast<const uint4*>(packed);
+            // The SM80 fused path finishes Q before the existing prolog CTA
+            // barrier, which publishes the prepared Q together with both K banks.
             return;
         }
         constexpr bool kDualRmsAccum = T::kCacheRms;
@@ -393,7 +397,12 @@ struct FusedHs64Traits : Base {
         static_assert(decltype(size<0>(rowcol))::value == 4);
         static_assert(decltype(size<1>(rowcol))::value == 16);
         const bool deferred_sink = T::kDeferPrefillSink && params.attn_sink_ptr != nullptr;
-        if (!deferred_sink) {
+        // The SM80 prefill caller already applies the sink scale and sets
+        // all four rNorm entries to 1 before reaching this no-split hook.
+        constexpr bool kSinkNormalizedInCaller =
+            Base::kIsPrefill && Base::kArch == 80 && !Norm;
+        if (!deferred_sink &&
+            (!kSinkNormalizedInCaller || params.attn_sink_ptr == nullptr)) {
             #pragma unroll
             for(int mi = 0; mi < 4; ++mi) {
                 #pragma unroll
@@ -576,7 +585,9 @@ struct FusedHs64Traits : Base {
                 auto* pairs = reinterpret_cast<uint16_t*>(packed);
                 #pragma unroll
                 for(int i = 0; i < 32; i += 2) {
-                    pairs[i / 2] = fp8_pair_from_float(values[i] * scale_inv, values[i + 1] * scale_inv);
+                    // Reuse the existing SM80 software converter and SM89 pair instruction.
+                    pairs[i / 2] = splitkv::fp8_pair_from_float(
+                        values[i] * scale_inv, values[i + 1] * scale_inv);
                 }
                 const int group = head / 8;
                 const int in_group = head & 7;
@@ -590,7 +601,20 @@ struct FusedHs64Traits : Base {
                     const int sf_index = tile * 8 + in_group;
                     auto* sf_word = fused.out_sf + batch_idx + int64_t(group) * fused.stride_out_sf_group
                         + int64_t(sf_index / 4) * fused.stride_out_sf_word;
-                    reinterpret_cast<uint8_t*>(sf_word)[sf_index % 4] = uint8_t(exponent + 127);
+                    if constexpr (Base::kIsPrefill && T::kArch == 80) {
+                        if (num_valid_seq_q == 64) {
+                            const uint32_t encoded = uint8_t(exponent + 127);
+                            const uint32_t pair = encoded
+                                | (__shfl_down_sync(0xffffffff, encoded, 1, 4) << 8);
+                            const uint32_t word = pair
+                                | (__shfl_down_sync(0xffffffff, pair, 2, 4) << 16);
+                            if ((head & 3) == 0) *sf_word = word;
+                        } else {
+                            reinterpret_cast<uint8_t*>(sf_word)[sf_index % 4] = uint8_t(exponent + 127);
+                        }
+                    } else {
+                        reinterpret_cast<uint8_t*>(sf_word)[sf_index % 4] = uint8_t(exponent + 127);
+                    }
                 }
             }
             return 0.0f;

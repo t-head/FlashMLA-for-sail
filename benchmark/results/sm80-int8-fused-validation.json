@@ -1,0 +1,262 @@
+{
+  "base_commit": "575892e429513a299ce8b70a57a3be7c5237b5f3",
+  "selected_experiment": "stage90",
+  "scope": "SM80 INT8 main + packed INT4 extra Decode; original BF16 Prefill; Q norm off, block32/macro0",
+  "validated_binary_sha256": "b2537a471466d653600883e5ab2751ad5d01074d4fe04ee481109c6e26ec2682",
+  "generated_source_manifest_sha256": "91760fcb076bba80b61982ce5a6ca68568299c286db042b6b35b93a7cfef4966",
+  "raw_evidence_archive_sha256": "3e61f10ead06e7d87049f296c4f19addfb6c3b7c4a59e5a8ea1461e95ea39f8a",
+  "cases": 124,
+  "precision_boolean_checks": 966,
+  "evidence_files_verified": 1418,
+  "strict_target": "fused / no_fused_main < 1.05",
+  "main_target_pass": 80,
+  "remaining": 44,
+  "faster_than_no_fused_full": 124,
+  "families": [
+    {
+      "heads": 64,
+      "phase": "Decode",
+      "total": 39,
+      "valid": 39,
+      "failed": 0,
+      "below_full": 39,
+      "pass_main": 37,
+      "median_delta_full_pct": -8.861284679872483,
+      "median_delta_main_pct": 0.5253483143282889,
+      "median_tfu_pct": {
+        "fused": 25.448337523100335,
+        "no_fused_full": 23.298942858371394,
+        "no_fused_main": 25.620212886919262
+      }
+    },
+    {
+      "heads": 64,
+      "phase": "Prefill",
+      "total": 37,
+      "valid": 37,
+      "failed": 0,
+      "below_full": 37,
+      "pass_main": 0,
+      "median_delta_full_pct": -6.626275075460308,
+      "median_delta_main_pct": 10.624841093874338,
+      "median_tfu_pct": {
+        "fused": 36.2320691239026,
+        "no_fused_full": 33.9065070905828,
+        "no_fused_main": 40.042560858121654
+      }
+    },
+    {
+      "heads": 8,
+      "phase": "Decode",
+      "total": 36,
+      "valid": 36,
+      "failed": 0,
+      "below_full": 36,
+      "pass_main": 33,
+      "median_delta_full_pct": -17.101892111197586,
+      "median_delta_main_pct": -14.746821282546374,
+      "median_tfu_pct": {
+        "fused": 7.369750494553212,
+        "no_fused_full": 5.866633388077062,
+        "no_fused_main": 6.2371955207762975
+      }
+    },
+    {
+      "heads": 8,
+      "phase": "Prefill",
+      "total": 12,
+      "valid": 12,
+      "failed": 0,
+      "below_full": 12,
+      "pass_main": 10,
+      "median_delta_full_pct": -37.03680621609372,
+      "median_delta_main_pct": -32.55329161420431,
+      "median_tfu_pct": {
+        "fused": 12.736603462114482,
+        "no_fused_full": 8.137370072677875,
+        "no_fused_main": 8.586388349224187
+      }
+    }
+  ],
+  "csv_sha256": {
+    "sm80-int8-fused-all124.csv": "a7db76c2ccebc64b8a8a3bb717c076f7e8201ae978677dab72da0f07357bcc4d",
+    "sm80-int8-fused-remaining44.csv": "6811c703fcaae0c302e71daf6883386c0442672f49e4e165f9e50de9e4ac9c4c"
+  },
+  "source_files": [
+    {
+      "path": "csrc/utils.h",
+      "native_sha256": "3924db186a4fe9f4fc9fb89c0b8b3998cba86c055ac51792b4cf86d1f0743221",
+      "validated_generated_sha256": "fdb8fbcc10f6bf99919422a3b796b1d787be95bd2a7475a7ab919dcfe320b9ac"
+    },
+    {
+      "path": "csrc/ppuxx/decode/combine/fused_v41.h",
+      "native_sha256": "2bea2278e5d6a44d9170eb678fcc58b6719863413ac3dee8e72c4a0c258f9c68",
+      "validated_generated_sha256": "1d3089e8920211f73db21365e7e053e943c5f25ce52117fe75fd0fbe289ef051"
+    },
+    {
+      "path": "csrc/ppuxx/decode/combine/fused_v41.cu",
+      "native_sha256": "d30a21ed6d11bfd6fe057a9f77bc87e70da9de4e5e0c777df73ba5df38e35abe",
+      "validated_generated_sha256": "d30a21ed6d11bfd6fe057a9f77bc87e70da9de4e5e0c777df73ba5df38e35abe"
+    },
+    {
+      "path": "csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp",
+      "native_sha256": "404d969fe93bea0fd41bac68afcfd92f56e37aba77d3bbcb84911c0070975976",
+      "validated_generated_sha256": "fc9d2ffd6bc8c98f60a9f8b39636e60b8da5a46bc41fc42b9b825a74b677c0ae"
+    },
+    {
+      "path": "csrc/ppu/prefill/sparse/sparse_prefill_std.cuh",
+      "native_sha256": "18256ae804b1e9f0d561fd121cd55db28094eca8f17bae879b984db74f1fb2f8",
+      "validated_generated_sha256": "f1b2c62630cf93406c11cef7acba31a92b649c26d6cfe970b750bbff62d8f9df"
+    },
+    {
+      "path": "csrc/ppu/prefill/sparse/instantiations/fused_v41_h64_bf16.cu",
+      "native_sha256": "a339a640a2d00b50911921573093aaad5ba9ecb2b590ba010dea4cfe388c4bfa",
+      "validated_generated_sha256": "1ec83b1080714b5bfc8939768b073ad72f02de3f8c562c37c1aa8b2bb603af27"
+    },
+    {
+      "path": "csrc/ppu/prefill/sparse/instantiations/fused_v41_h128_bf16.cu",
+      "native_sha256": "4a046d69fad34f8eb5926e58781ce893178edcc9847c8ccacd90684cee6ec0b9",
+      "validated_generated_sha256": "6757a559f72a790bd3a181005be006e99940b614d0f7efa3c7dda9cf5ec909d6"
+    },
+    {
+      "path": "csrc/ppu/decode/sparse/splitkv_mla.cuh",
+      "native_sha256": "81c2bc1b6b518cd6c144774603a050c7d297370f09358cf6430e4e3570898010",
+      "validated_generated_sha256": "3d64578cfd25464b2293d89321ae49deacda4a44971a947ff5d0e38ed291ba39"
+    },
+    {
+      "path": "csrc/ppu/decode/sparse/sparse_decode_wg_hs64.cuh",
+      "native_sha256": "951d6e0ba4819fee8fe1c60fc7fa3703c8e420a1a943d92a3fc7e69c5153c55f",
+      "validated_generated_sha256": "9406dbfb4049b0b96e745e7bcbdb09617f76b6d2444faef6c56a647f77b4cd12"
+    },
+    {
+      "path": "csrc/ppu/decode/sparse/fused_v41_splitkv.cuh",
+      "native_sha256": "19f835e3c8c89027676296e96b00e596162a408c81e1f621bde75ad6a4aa2aeb",
+      "validated_generated_sha256": "bb67c9b33ba98a3690ee9efe3bec0ccca951b4fcd31e7712e724eef8aef58d84"
+    },
+    {
+      "path": "csrc/ppu/decode/sparse/instantiations/fused_v41_h128_bf16.cu",
+      "native_sha256": "634f8a77008af512087b06b38fb4dfad41f092d83fc39e60e8ec082162fa14fe",
+      "validated_generated_sha256": "634f8a77008af512087b06b38fb4dfad41f092d83fc39e60e8ec082162fa14fe"
+    },
+    {
+      "path": "csrc/ppu/sparse/fused_v41_wi.cuh",
+      "native_sha256": "457eb579e2b4a52aadabd6a312a54051569f17a6979c70a5b754dc1214e14463",
+      "validated_generated_sha256": "c0ddd88f52a1d25fe6fce10b5f03583c0260e79f07358802b14cb2c595f81309"
+    },
+    {
+      "path": "csrc/ppu/sparse/fused_v41_hs64.cuh",
+      "native_sha256": "73e8ba0cd3da3cd6faeec25596c1f1d3bd92d1d876c5d8d313fac766c62d4b9c",
+      "validated_generated_sha256": "73e8ba0cd3da3cd6faeec25596c1f1d3bd92d1d876c5d8d313fac766c62d4b9c"
+    },
+    {
+      "path": "csrc/kerutils/include/kerutils/device/ppu/dequant.cuh",
+      "native_sha256": "5276a9262a4ca3a1bb5265538eda863aaf1d7b0203660a0ae5d259e2e0525e53",
+      "validated_generated_sha256": "f1ee15e6bdfe2654af65ae7b01decf4e752388513ad67c4b51be8892c1fd2071"
+    },
+    {
+      "path": "tests/fused_norm_rope_attn_rope_cast/test-fused-norm-rope-attn-rope-cast.py",
+      "native_sha256": "cd31eff7fe7dd111cc06d51e9aca39e70ed6563d018d9a8a936be4460117cce1",
+      "validated_generated_sha256": "cd31eff7fe7dd111cc06d51e9aca39e70ed6563d018d9a8a936be4460117cce1"
+    },
+    {
+      "path": "flash_mla/fused_norm_rope_attn_rope_cast.py",
+      "native_sha256": "e091cfd2067ff214b8d701aa8fbfd5207aff3000281d63fa740212d42dc01ddc",
+      "validated_generated_sha256": "e091cfd2067ff214b8d701aa8fbfd5207aff3000281d63fa740212d42dc01ddc"
+    }
+  ],
+  "native_source_audit_sha256": "af25745a3d7a1a8f1076ae5344ba15aff0068be182f3cbe6293ceaad68c979ec",
+  "sdk_name_mapping": {
+    "forward_ordered_pairs": [
+      [
+        "__ppu_bfloat",
+        "__nv_bfloat"
+      ],
+      [
+        "__hg_fp",
+        "__nv_fp"
+      ],
+      [
+        "hggc",
+        "cuda"
+      ],
+      [
+        "hgcc",
+        "nvcc"
+      ],
+      [
+        "HGGC",
+        "CUDA"
+      ],
+      [
+        "HGresult",
+        "CUresult"
+      ],
+      [
+        "HGfunction",
+        "CUfunction"
+      ],
+      [
+        "HGlaunch",
+        "CUlaunch"
+      ],
+      [
+        "HGAD_",
+        "CUAD_"
+      ],
+      [
+        "hgGet",
+        "cuGet"
+      ],
+      [
+        "hgLaunch",
+        "cuLaunch"
+      ],
+      [
+        "HG driver",
+        "CUDA driver"
+      ],
+      [
+        "hgtx",
+        "nvtx"
+      ],
+      [
+        "HGTX",
+        "NVTX"
+      ],
+      [
+        "hgToolsExt",
+        "nvToolsExt"
+      ],
+      [
+        "-arch=ppu_10",
+        "-gencode=arch=compute_80a,code=sm_80a"
+      ],
+      [
+        "-arch=ppu_15",
+        "-gencode=arch=compute_89,code=sm_89"
+      ]
+    ],
+    "protected_literals": [
+      "hgrt/hggc_extend_device_functions.h",
+      "__HGGC_ARCH__",
+      "__HGGCCC_VER_MAJOR__",
+      "__HGGCCC_VER_MINOR__",
+      "__HGGCCC_VER_BUILD__"
+    ],
+    "reverse_policy": "Preserve exact baseline bytes for unchanged lines; reverse only SDK identifiers in inserted/replaced lines; prove forward byte equality.",
+    "origin": "Independent explicit mapping of observed base575/frozen90 spelling differences; verified by full-file byte equality, not claimed to be the original historical generator."
+  },
+  "native_hggc_rebuild_performed": false,
+  "scope_limitations": [
+    "Shared KV dequantization uses INT8/INT4 semantics; original SM89 FP8/E2M1 compatibility is not claimed.",
+    "No channelwise/macro1 or Q-normalization-on acceptance is claimed.",
+    "No diagnostic ACU timing is used for acceptance."
+  ],
+  "independent_numeric_recomputations": 744,
+  "dependency_audit": {
+    "actlize_commit": "0146d9e9462e38da4f455df1f71eae96465c45ff",
+    "source_files_verified": 613,
+    "semantic_changes": 0,
+    "audit_sha256": "6d0906072db81d06775a0870f50f83d6890fede6fe8cdcc3627d2af7947226e2"
+  }
+}

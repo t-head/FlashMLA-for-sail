@@ -530,15 +530,18 @@ __forceinline__ __device__ float2 apply_rope(float2 x, float c, float s) {
 
 template<int Rows>
 __forceinline__ __device__ int native_offset(int row, int dim) {
+#if ACOMPUTE_VERSION == 10000
+    // All callers address nonnegative rows/dimensions. Keep this permutation
+    // unsigned so power-of-two divisions do not emit signed remainder fixes.
+    const uint32_t r = uint32_t(row), d = uint32_t(dim);
+    const uint32_t tile = d >> 6, col = d & 63u, slice = col >> 4;
+    const uint32_t rotation = (((slice & 1u) << 1) + ((slice & 2u) >> 1)) * 2u;
+    const uint32_t vec = (((r & 3u) * 2u + ((col & 15u) >> 3)) ^ ((r >> 2) & 1u));
+    return int(tile * Rows * 64u + slice * Rows * 16u + (r >> 2) * 64u
+        + ((vec + rotation) & 7u) * 8u + (col & 7u));
+#else
     const int tile = dim / 64;
     const int col = dim % 64;
-#if ACOMPUTE_VERSION == 10000
-    const int slice = col / 16;
-    const int rotation = (((slice & 1) << 1) + ((slice & 2) >> 1)) * 2;
-    const int vec = (((row % 4) * 2 + (col % 16) / 8) ^ ((row / 4) & 1));
-    return tile * Rows * 64 + slice * Rows * 16 + (row / 4) * 64
-        + ((vec + rotation) % 8) * 8 + col % 8;
-#else
     return tile * Rows * 64 + row * 64 + (col ^ ((row & 7) << 3));
 #endif
 }
