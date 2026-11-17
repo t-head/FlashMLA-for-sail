@@ -1,5 +1,4 @@
 #include "sparse/fused_v41_hs64.cuh"
-#include "decode/sparse/fused_v41_splitkv.cuh"
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
@@ -32,18 +31,18 @@ inline constexpr Hs64Worklist kWorklist<fused_norm_rope_attn_rope_cast_fwd::core
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
-template<bool Norm, bool ExtraFP4, int MainCapacity, flashmla::dsa::hs64::Hs64Worklist Worklist, bool PerTokenScale>
+template<typename T>
 __global__ void __launch_bounds__(512, 1, 1)
-fused_norm_rope_attn_rope_cast_decode_hs64_packed_kernel(__grid_constant__ const FusedHs64Params<PerTokenScale> params) {
+fused_norm_rope_attn_rope_cast_decode_hs64_wi_kernel(
+    __grid_constant__ const typename T::FusedParams params) {
 #if ACOMPUTE_VERSION >= 10500
-    using T = FusedHs64PackedTraits<Norm, ExtraFP4, MainCapacity, Worklist, PerTokenScale>;
     if constexpr (T::kFusedPackedFp4) {
         // The packed launcher flattens queries and fixes these capacities.
-        FusedHs64Params<PerTokenScale> fixed = params;
+        typename T::FusedParams fixed = params;
         fixed.q_orig = 1;
         fixed.seqlen_q = fixed.ngroups = T::kBlockM;
         fixed.h = 1;
-        fixed.topk = MainCapacity;
+        fixed.topk = flashmla::dsa::hs64::kPackedMain<T>;
         fixed.extra_topk = 512;
         flashmla::dsa::hs64::hs64_attention<T, true>(fixed);
     } else {
@@ -52,15 +51,21 @@ fused_norm_rope_attn_rope_cast_decode_hs64_packed_kernel(__grid_constant__ const
 #endif
 }
 
+template<typename T>
+static void launch_fused_hs64_wi(
+    const typename T::FusedParams& params, int grid_rows, hggcStream_t stream) {
+    constexpr size_t bytes = sizeof(typename T::SharedMemoryPlan);
+    auto kernel = &fused_norm_rope_attn_rope_cast_decode_hs64_wi_kernel<T>;
+    C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    kernel<<<dim3(1, 1, grid_rows), T::NUM_THREADS, bytes, stream>>>(params);
+    CHECK_CUDA_KERNEL_LAUNCH();
+}
+
 template<bool Norm, bool ExtraFP4, int MainCapacity, flashmla::dsa::hs64::Hs64Worklist Worklist, bool PerTokenScale>
 static void launch_fused_hs64_packed(const FusedHs64Params<PerTokenScale>& params, hggcStream_t stream) {
     using T = FusedHs64PackedTraits<Norm, ExtraFP4, MainCapacity, Worklist, PerTokenScale>;
-    constexpr size_t bytes = sizeof(typename T::SharedMemoryPlan);
-    auto kernel = &fused_norm_rope_attn_rope_cast_decode_hs64_packed_kernel<Norm, ExtraFP4, MainCapacity, Worklist, PerTokenScale>;
-    C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     const int grid_rows = Worklist == flashmla::dsa::hs64::Hs64Worklist::Single ? params.b : 39;
-    kernel<<<dim3(1, 1, grid_rows), T::NUM_THREADS, bytes, stream>>>(params);
-    CHECK_CUDA_KERNEL_LAUNCH();
+    launch_fused_hs64_wi<T>(params, grid_rows, stream);
 }
 
 template<bool ExtraFP4, bool PerTokenScale>
@@ -127,26 +132,13 @@ struct FusedHs64DirectTraits : FusedHs64Traits<false,
     static_assert(Base::kPrefillSinkOffset + 64 * sizeof(float) <= offsetof(SharedMemoryPlan, smem_sP));
 };
 template<bool PerTokenScale>
-__global__ void __launch_bounds__(512, 1, 1)
-fused_norm_rope_attn_rope_cast_decode_hs64_direct_kernel(
-    __grid_constant__ const FusedHs64Params<PerTokenScale> params) {
-#if ACOMPUTE_VERSION >= 10500
-    flashmla::dsa::hs64::hs64_attention<FusedHs64DirectTraits<PerTokenScale>, true>(params);
-#endif
-}
-
-template<bool PerTokenScale>
 static void run_fused_hs64_direct_output(const OutputParams<PerTokenScale>& p, int grid_rows) {
     using T = FusedHs64DirectTraits<PerTokenScale>;
     static_assert(flashmla::dsa::hs64::kPackedMain<T> == 0);
     static_assert(flashmla::dsa::hs64::kWorklist<T> == flashmla::dsa::hs64::Hs64Worklist::Single);
     static_assert(T::kQBarrierThreads == 512);
-    constexpr size_t bytes = sizeof(typename T::SharedMemoryPlan);
     const FusedHs64Params<PerTokenScale> params = make_fused_hs64_decode_params<true>(p);
-    auto kernel = &fused_norm_rope_attn_rope_cast_decode_hs64_direct_kernel<PerTokenScale>;
-    C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
-    kernel<<<dim3(1, 1, grid_rows), T::NUM_THREADS, bytes, p.stream>>>(params);
-    CHECK_CUDA_KERNEL_LAUNCH();
+    launch_fused_hs64_wi<T>(params, grid_rows, p.stream);
 }
 
 template<bool Norm, bool ExtraFP4, bool PerTokenScale>
@@ -181,12 +173,8 @@ void run_fused_norm_rope_attn_rope_cast_decode_hs64_packed(const Params& p) {
 }
 
 template void run_fused_norm_rope_attn_rope_cast_decode_hs64_packed<false, false>(const Params&);
-template void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<64, false, false>(const Params&, const SplitKVParams&);
 template void run_fused_norm_rope_attn_rope_cast_decode_hs64_packed<true, false>(const Params&);
-template void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<64, true, false>(const Params&, const SplitKVParams&);
 template void run_fused_norm_rope_attn_rope_cast_decode_hs64_packed<false, true>(const Params&);
-template void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<64, false, true>(const Params&, const SplitKVParams&);
 template void run_fused_norm_rope_attn_rope_cast_decode_hs64_packed<true, true>(const Params&);
-template void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<64, true, true>(const Params&, const SplitKVParams&);
 
 } // namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn

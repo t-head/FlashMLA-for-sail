@@ -203,10 +203,9 @@ def bench_fused(fn, num_runs):
         return any(re.search(pattern, name) for name in names)
 
     main_symbols = (
-        "fused_norm_rope_attn_rope_cast_fwd_kernel",
-        "fused_norm_rope_attn_rope_cast_decode_hs64_packed_kernel",
-        "fused_norm_rope_attn_rope_cast_decode_hs64_direct_kernel",
-        "fused_norm_rope_attn_rope_cast_prefill_hs64_kernel",
+        "fused_norm_rope_attn_rope_cast_wi_kernel",
+        "fused_norm_rope_attn_rope_cast_decode_hs64_wi_kernel",
+        "fused_norm_rope_attn_rope_cast_prefill_hs64_wi_kernel",
         "flash_sparse_prefill_fwd_wg_kernel",
         "flash_sparse_prefill_fwd_kernel",
         "flash_sparse_decode_wg_kernel",
@@ -217,6 +216,8 @@ def bench_fused(fn, num_runs):
     combine = "fused_norm_rope_attn_rope_cast_combine_kernel"
     if len(matched) == 1 and not has_symbol(split):
         return result.get_kernel_time(matched[0])
+    if not matched and has_symbol(split) and not has_symbol(combine):
+        return result.get_kernel_time(split)
     if not matched and has_symbol(split) and has_symbol(combine):
         return result.get_e2e_time(split, combine)
     raise ValueError(f"Unexpected fused kernel set: {names}")
