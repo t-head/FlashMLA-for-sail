@@ -533,10 +533,8 @@ sparse_attn_decode_interface(
         // HS64 advances by 128 tokens, but the cached metadata (Phase 1 above)
         // uses sparse_decode_metadata_block_size_n(ngroups, is_fp8), which is
         // 64 whenever is_fp8 is true -- i.e. exactly the case HS64 requires
-        // (is_v41_fp8 is only ever set inside `if (is_fp8)`). HS64 also scales
-        // num_sm_parts down by q_orig for very small batches. So the cached
-        // schedule is the wrong (num_sm_parts, block_size_n) pair for HS64 and
-        // cannot simply be handed over.
+        // (is_v41_fp8 is only ever set inside `if (is_fp8)`). The cached
+        // 64-token schedule cannot simply be handed over to HS64.
         //
         // Previously this branch rebuilt that 128-token schedule on EVERY call,
         // i.e. once per layer, even though all layers sharing one
@@ -547,8 +545,6 @@ sparse_attn_decode_interface(
         // schedule once and write it back into the caller's tensors, so the
         // next layer finds it already present.
         //
-        // Alignment of the num_sm_parts rule with block_size_n = 128: the
-        // divisor is applied to the CURRENT params.num_sm_parts, and because
         // FlashMLASchedMeta.config pins b / s_q / h_q / page_block_size / h_k /
         // causal / is_fp8_kvcache / qkv_fp8 / topk / extra_* for every reuse
         // (flash_mla_interface.py:194-206), num_sm_parts is a pure function of
@@ -569,9 +565,6 @@ sparse_attn_decode_interface(
             hs64_num_splits_t = *hs64_num_splits;
             params.num_sm_parts = hs64_metadata.size(0);
         } else {
-            if (params.b <= 4 && params.q_orig <= params.num_sm_parts) {
-                params.num_sm_parts /= params.q_orig;
-            }
             // Keep cached FP8 metadata at 64 tokens; HS64 consumes a private 128-token schedule.
             const auto metadata_options = q.options().dtype(torch::kInt32);
             hs64_metadata = torch::empty(
