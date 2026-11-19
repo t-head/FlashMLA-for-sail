@@ -63,14 +63,18 @@ inline bool sparse_decode_hs64_addressing_supported(const Flash_fwd_params &p) {
                  p.extra_k_batch_stride)));
 }
 
+// Non-packed V4.1 HS64 paths exchange uint32 token offsets in these row units
+// (528 = 33 x 16, 288 = 9 x 32 bytes); packed paths keep 8-byte/4-byte units.
+constexpr int kHs64V41Fp8RowUnitBytes = 16;
+constexpr int kHs64V41Fp4RowUnitBytes = 32;
+
 inline bool sparse_decode_hs64_v41_cache_range_supported(
         int num_blocks, int page_size, int data_bytes_per_token,
         int address_unit_bytes, Flash_fwd_params::index_t page_stride_bytes) {
     if (num_blocks <= 0 || page_size <= 0 || page_stride_bytes < 0 ||
         address_unit_bytes <= 0 || page_stride_bytes % address_unit_bytes != 0) return false;
-    // The two copy waves exchange uint32 offsets measured in 8-byte FP8 or
-    // 4-byte FP4 units. Avoid truncating a page offset before the lane adds
-    // its within-token address.
+    // The two copy waves exchange uint32 offsets measured in address_unit_bytes.
+    // Avoid truncating a page offset before the lane adds its within-token address.
     const uint64_t limit = (uint64_t{1} << 32) * address_unit_bytes;
     const uint64_t row_bytes = uint64_t(page_size) * data_bytes_per_token;
     return row_bytes <= limit &&
@@ -87,13 +91,14 @@ inline bool sparse_decode_hs64_v41_supported(
            pow2(p.page_block_size) &&
            p.indices_row_stride >= 0 && p.indices_row_stride <= max_index_stride &&
            sparse_decode_hs64_v41_cache_range_supported(
-               p.num_blocks, p.page_block_size, 528, 8, p.k_batch_stride) &&
+               p.num_blocks, p.page_block_size, 528, kHs64V41Fp8RowUnitBytes, p.k_batch_stride) &&
            (p.extra_topk < 0 ||
             (pow2(p.extra_page_block_size) &&
              p.extra_indices_row_stride >= 0 && p.extra_indices_row_stride <= max_index_stride &&
              sparse_decode_hs64_v41_cache_range_supported(
                 p.extra_num_blocks, p.extra_page_block_size,
-                extra_fp4 ? 288 : 528, extra_fp4 ? 4 : 8,
+                extra_fp4 ? 288 : 528,
+                extra_fp4 ? kHs64V41Fp4RowUnitBytes : kHs64V41Fp8RowUnitBytes,
                 p.extra_k_batch_stride)));
 }
 

@@ -2822,6 +2822,13 @@ __forceinline__ __device__ void compute_K_addr_bf16(
         ? (USE_EXTRA && T::kExtraFP4 ? 288 : 528) : T::kBytesPerToken;
     constexpr int kAddressUnitBytes = T::kV41FP8
         ? (USE_EXTRA && T::kExtraFP4 ? 4 : 8) : 16;
+    // Non-packed V4.1 offsets use the row units of the host range check; packed
+    // offsets and in-token lane steps keep kAddressUnitBytes.
+    constexpr int kRowUnitBytes = T::kV41FP8 && kPackedMain<T> == 0
+        ? (USE_EXTRA && T::kExtraFP4 ? kHs64V41Fp4RowUnitBytes : kHs64V41Fp8RowUnitBytes)
+        : kAddressUnitBytes;
+    static_assert(!T::kV41FP8 ||
+                  (kBytesPerToken % kRowUnitBytes == 0 && kRowUnitBytes % kAddressUnitBytes == 0));
 
     // Use if constexpr to force compile-time branch elimination (PPU compiler doesn't optimize ternary with template params)
     int effective_block, page_block_size, valid_len;
@@ -2916,7 +2923,7 @@ __forceinline__ __device__ void compute_K_addr_bf16(
             // the decode page split or its packed-page runtime branch.
             meta_atom = static_cast<unsigned int>(
                 static_cast<size_t>(t_idx) * k_stride_elems * sizeof(InputT)
-                / kAddressUnitBytes);
+                / kRowUnitBytes);
         } else {
             const bool linear_pages = !T::kV41FP8 && (page_block_size > 0)
                 & ((static_cast<unsigned>(page_block_size)
@@ -2934,7 +2941,7 @@ __forceinline__ __device__ void compute_K_addr_bf16(
                     static_cast<size_t>(page_idx) * k_stride_elems
                     + static_cast<size_t>(off_in_page) * (kBytesPerToken / sizeof(InputT));
                 meta_atom = static_cast<unsigned int>(
-                    row_elem_offset * sizeof(InputT) / kAddressUnitBytes);
+                    row_elem_offset * sizeof(InputT) / kRowUnitBytes);
             }
         }
     }
@@ -2946,11 +2953,12 @@ __forceinline__ __device__ void compute_K_addr_bf16(
     is_valid[0] = (atom0 != kInvalidAtom);
     is_valid[1] = (atom1 != kInvalidAtom);
     const size_t lane_atom = static_cast<size_t>(lane & 7);
+    constexpr size_t kAtomScale = kRowUnitBytes / kAddressUnitBytes;
     token_ptr[0] = k_base_ptr
-        + (is_valid[0] ? (static_cast<size_t>(atom0) + lane_atom)
+        + (is_valid[0] ? (static_cast<size_t>(atom0) * kAtomScale + lane_atom)
                        : lane_atom) * (kAddressUnitBytes / sizeof(InputT));
     token_ptr[1] = k_base_ptr
-        + (is_valid[1] ? (static_cast<size_t>(atom1) + lane_atom)
+        + (is_valid[1] ? (static_cast<size_t>(atom1) * kAtomScale + lane_atom)
                        : lane_atom) * (kAddressUnitBytes / sizeof(InputT));
 
     if constexpr (T::kV41FP8) {
@@ -2965,7 +2973,7 @@ __forceinline__ __device__ void compute_K_addr_bf16(
             // payload once using the original metadata address.
             if (meta_valid && (lane & 3) == 0) {
                 char* row = reinterpret_cast<char*>(k_base_ptr)
-                    + static_cast<size_t>(meta_atom) * kAddressUnitBytes;
+                    + static_cast<size_t>(meta_atom) * kRowUnitBytes;
                 CUTLASS_PRAGMA_UNROLL
                 for (int tile = 0; tile < T::kNumKTiles;
                      tile += kPrefetchTileStep) {

@@ -218,9 +218,11 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
             && p.topk == 128 && p.extra_topk == 512
             && pow2(p.page_block_size) && pow2(p.extra_page_block_size)
             && flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
-                p.num_blocks, p.page_block_size, 528, 8, p.stride_kv_s_kv)
+                p.num_blocks, p.page_block_size, 528,
+                flashmla::dsa::kHs64V41Fp8RowUnitBytes, p.stride_kv_s_kv)
             && flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
-                p.extra_num_blocks, p.extra_page_block_size, 288, 4, p.stride_extra_kv_block)
+                p.extra_num_blocks, p.extra_page_block_size, 288,
+                flashmla::dsa::kHs64V41Fp4RowUnitBytes, p.stride_extra_kv_block)
             && aligned(p.q) && p.stride_q_s_q % 8 == 0 && aligned(p.kv) && aligned(p.extra_kv)) {
             // Reuse native H64 attention with complete-query tasks and generic
             // cache addressing and in-kernel length clamps. The packed layout
