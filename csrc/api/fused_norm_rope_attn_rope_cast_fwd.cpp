@@ -211,17 +211,20 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
             return;
         }
     }
-    if constexpr (Heads == 64 && !EnableNorm && ExtraFP4) {
+    if constexpr (Heads == 64 && !EnableNorm) {
         const auto aligned = [](const void* ptr) { return reinterpret_cast<uintptr_t>(ptr) % 16 == 0; };
         const auto pow2 = [](int size) { return size > 0 && (size & (size - 1)) == 0; };
+        const bool pure_swa = p.per_token_scale && !p.extra_kv
+            && p.extra_topk == 0 && !p.extra_topk_length;
         if (p.arch == 89 && sm_count == 39 && p.s_q >= sm_count && p.s_q <= 65535
-            && p.topk == 128 && p.extra_topk == 512
-            && pow2(p.page_block_size) && pow2(p.extra_page_block_size)
+            && p.topk == 128 && (pure_swa || (ExtraFP4 && p.extra_topk == 512))
+            && pow2(p.page_block_size) && (pure_swa || pow2(p.extra_page_block_size))
             && flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
                 p.num_blocks, p.page_block_size, 528, 8, p.stride_kv_s_kv)
-            && flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
-                p.extra_num_blocks, p.extra_page_block_size, 288, 4, p.stride_extra_kv_block)
-            && aligned(p.q) && p.stride_q_s_q % 8 == 0 && aligned(p.kv) && aligned(p.extra_kv)) {
+            && (pure_swa || flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
+                p.extra_num_blocks, p.extra_page_block_size, 288, 4, p.stride_extra_kv_block))
+            && aligned(p.q) && p.stride_q_s_q % 8 == 0 && aligned(p.kv)
+            && (pure_swa || aligned(p.extra_kv))) {
             // Reuse native H64 attention with complete-query tasks and generic
             // cache addressing and in-kernel length clamps. The packed layout
             // gate above keeps priority.
