@@ -489,6 +489,18 @@ sparse_attn_decode_interface(
         extra_indices->size(0) == batch_size && extra_indices->size(1) == seqlen_q_ori &&
         extra_indices->stride(-1) == 1 && dense_vector(attn_sink, ngroups)
         ? v41_h8_direct_parts(params) : 0;
+    // Contiguous token rows can use 128-token pages without moving cache bytes.
+    const bool page_alias = !enable_batch_invariant && is_v41_fp8 && is_sm89_or_newer() && ngroups == 64 &&
+        !topk_length && !extra_topk_length && params.page_block_size == 256 && params.topk == 128 &&
+        params.extra_topk == 512 && params.extra_page_block_size == 64 &&
+        params.k_batch_stride == 256 * 528 && params.v_batch_stride == params.k_batch_stride &&
+        params.num_blocks > 0 && params.num_blocks <= std::numeric_limits<int>::max() / 2;
+    if (page_alias) {
+        params.num_blocks *= 2;
+        params.page_block_size = 128;
+        params.k_batch_stride /= 2;
+        params.v_batch_stride /= 2;
+    }
     const bool packed_h64 = !enable_batch_invariant && is_v41_fp8 && is_extra_fp4 &&
         kv.device() == q.device() && extra_kv->device() == q.device() && out.device() == q.device() &&
         indices.device() == q.device() && extra_indices && extra_indices->device() == q.device() &&
@@ -508,6 +520,12 @@ sparse_attn_decode_interface(
         dense_vector(topk_length, batch_size) && dense_vector(extra_topk_length, batch_size) &&
         dense_vector(attn_sink, ngroups) &&
         use_v41_packed_fp8_extra_h64(params);
+    if (page_alias && !packed_h64 && !packed_fp8_extra_h64) {
+        params.num_blocks /= 2;
+        params.page_block_size = 256;
+        params.k_batch_stride *= 2;
+        params.v_batch_stride *= 2;
+    }
     at::Tensor hs64_metadata, hs64_num_splits_t;
     if (!packed_h64 && !packed_fp8_extra_h64 && is_v41_fp8 &&
         flashmla::dsa::sparse_decode_hs64_v41_supported(params, is_extra_fp4) &&
