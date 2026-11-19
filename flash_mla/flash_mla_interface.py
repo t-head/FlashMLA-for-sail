@@ -37,6 +37,14 @@ class FlashMLASchedMeta:
     tile_scheduler_metadata: Optional[torch.Tensor] = None   # (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
     num_splits: Optional[torch.Tensor] = None                # (batch_size + 1), dtype torch.int32.
 
+    # HS64 carries its own 128-token schedule, computed with a different
+    # (num_sm_parts, block_size_n) pair than tile_scheduler_metadata above
+    # (see dense_decode_fwd / sparse_decode.h). It is cached here for the same
+    # reason as the main schedule: every layer sharing this scheduler object
+    # passes identical arguments, so the schedule only has to be built once.
+    hs64_tile_scheduler_metadata: Optional[torch.Tensor] = None
+    hs64_num_splits: Optional[torch.Tensor] = None
+
 # def get_mla_metadata(
 #     cache_seqlens: torch.Tensor,
 #     num_heads_per_head_k: int,
@@ -209,7 +217,8 @@ def flash_mla_with_kvcache(
     if topk is not None:
         # Sparse decode path
         assert causal == False, "causal must be `false` if sparse attention is enabled."
-        out, softmax_lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd(
+        (out, softmax_lse, new_tile_scheduler_metadata, new_num_splits,
+         new_hs64_tile_scheduler_metadata, new_hs64_num_splits) = flash_mla_cuda.sparse_decode_fwd(
             q,
             k_cache,
             head_dim_v,
@@ -223,8 +232,12 @@ def flash_mla_with_kvcache(
             extra_topk_length,
             softmax_scale,
             out,
-            enable_batch_invariant
+            enable_batch_invariant,
+            sched_meta.hs64_tile_scheduler_metadata,
+            sched_meta.hs64_num_splits
         )
+        sched_meta.hs64_tile_scheduler_metadata = new_hs64_tile_scheduler_metadata
+        sched_meta.hs64_num_splits = new_hs64_num_splits
     else:
         # Dense decode path
         assert not enable_batch_invariant, "enable_batch_invariant is only supported for sparse attention."

@@ -118,7 +118,8 @@ static bool use_v41_packed_fp8_extra_h64(const Flash_fwd_params &p) {
            affine(p.extra_indices_batch_stride, p.extra_indices_row_stride, sq);
 }
 
-static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>,
+                  std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_interface(
     at::Tensor &q,                               // batch_size x seqlen_q_ori x num_heads_ori x head_size
     const at::Tensor &kv,                        // num_blocks x page_block_size x num_heads_k x head_size
@@ -133,7 +134,15 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &extra_topk_length,   // batch_size
     const float softmax_scale,
     const std::optional<at::Tensor> &out_,                // batch_size x seqlen_q_ori x num_heads_ori x head_size_v
-    const bool enable_batch_invariant
+    const bool enable_batch_invariant,
+    // HS64-specific scheduler cache, carried on the Python-side
+    // FlashMLASchedMeta object alongside tile_scheduler_metadata/num_splits.
+    // In:  the tensors produced by a previous call sharing this scheduler
+    //      object (std::nullopt on the first layer).
+    // Out: the 128-token HS64 schedule and its num_splits, so the next layer
+    //      reuses them instead of recomputing (see the HS64 branch below).
+    std::optional<at::Tensor> &hs64_tile_scheduler_metadata,
+    std::optional<at::Tensor> &hs64_num_splits
 ) {
     // Packed caches include scale/RoPE storage beyond D. Only the flat,
     // dimension-matched encoding dispatches to the quantized compute backend.
@@ -142,7 +151,8 @@ sparse_attn_decode_interface(
         auto result = flashmla::quantized_attention::paged_attention(q, kv, head_size_v,
             indices, softmax_scale, attn_sink, topk_length, extra_kv, extra_indices,
             extra_topk_length, out_, enable_batch_invariant);
-        return {result[0], result[1], tile_scheduler_metadata, num_splits};
+        return {result[0], result[1], tile_scheduler_metadata, num_splits,
+                hs64_tile_scheduler_metadata, hs64_num_splits};
     }
 
     bool is_fp8 = (kv.dtype() == torch::kFloat8_e4m3fn ||
@@ -498,33 +508,78 @@ sparse_attn_decode_interface(
         dense_vector(topk_length, batch_size) && dense_vector(extra_topk_length, batch_size) &&
         dense_vector(attn_sink, ngroups) &&
         use_v41_packed_fp8_extra_h64(params);
-    at::Tensor hs64_metadata, hs64_num_splits;
+    at::Tensor hs64_metadata, hs64_num_splits_t;
     if (!packed_h64 && !packed_fp8_extra_h64 && is_v41_fp8 &&
         flashmla::dsa::sparse_decode_hs64_v41_supported(params, is_extra_fp4) &&
         is_sm89_or_newer()) {
-        if (params.b <= 4 && params.q_orig <= params.num_sm_parts) {
-            params.num_sm_parts /= params.q_orig;
+        // HS64 advances by 128 tokens, but the cached metadata (Phase 1 above)
+        // uses sparse_decode_metadata_block_size_n(ngroups, is_fp8), which is
+        // 64 whenever is_fp8 is true -- i.e. exactly the case HS64 requires
+        // (is_v41_fp8 is only ever set inside `if (is_fp8)`). HS64 also scales
+        // num_sm_parts down by q_orig for very small batches. So the cached
+        // schedule is the wrong (num_sm_parts, block_size_n) pair for HS64 and
+        // cannot simply be handed over.
+        //
+        // Previously this branch rebuilt that 128-token schedule on EVERY call,
+        // i.e. once per layer, even though all layers sharing one
+        // FlashMLASchedMeta pass identical arguments. The Python layer already
+        // caches per scheduler object and hands the same object back to us on
+        // every layer (flash_mla_interface.py: numpy-free `sched_meta` reuse +
+        // write-back at :245). We reuse that contract here: build the HS64
+        // schedule once and write it back into the caller's tensors, so the
+        // next layer finds it already present.
+        //
+        // Alignment of the num_sm_parts rule with block_size_n = 128: the
+        // divisor is applied to the CURRENT params.num_sm_parts, and because
+        // FlashMLASchedMeta.config pins b / s_q / h_q / page_block_size / h_k /
+        // causal / is_fp8_kvcache / qkv_fp8 / topk / extra_* for every reuse
+        // (flash_mla_interface.py:194-206), num_sm_parts is a pure function of
+        // those pinned values. It is therefore stable across layers sharing one
+        // scheduler object, and a single cached pair is sufficient.
+        const bool hs64_uses_cached =
+            hs64_tile_scheduler_metadata.has_value() &&
+            hs64_num_splits.has_value() &&
+            hs64_tile_scheduler_metadata->defined() &&
+            hs64_num_splits->defined() &&
+            hs64_tile_scheduler_metadata->dim() == 2 &&
+            hs64_tile_scheduler_metadata->size(1) == TileSchedulerMetaDataSize &&
+            hs64_num_splits->numel() == params.b + 1;
+
+        if (hs64_uses_cached) {
+            // Reuse: adopt the cached tensors and the num_sm_parts they encode.
+            hs64_metadata = *hs64_tile_scheduler_metadata;
+            hs64_num_splits_t = *hs64_num_splits;
+            params.num_sm_parts = hs64_metadata.size(0);
+        } else {
+            if (params.b <= 4 && params.q_orig <= params.num_sm_parts) {
+                params.num_sm_parts /= params.q_orig;
+            }
+            // Keep cached FP8 metadata at 64 tokens; HS64 consumes a private 128-token schedule.
+            const auto metadata_options = q.options().dtype(torch::kInt32);
+            hs64_metadata = torch::empty(
+                {params.num_sm_parts, TileSchedulerMetaDataSize}, metadata_options);
+            hs64_num_splits_t = torch::empty({params.b + 1}, metadata_options);
+            Mla_metadata_params hs64_meta_params = {};
+            hs64_meta_params.seqlens_k_ptr = nullptr;
+            hs64_meta_params.tile_scheduler_metadata_ptr = hs64_metadata.data_ptr<int>();
+            hs64_meta_params.num_splits_ptr = hs64_num_splits_t.data_ptr<int>();
+            hs64_meta_params.batch_size = params.b;
+            hs64_meta_params.block_size_n = 128;
+            hs64_meta_params.fixed_overhead_num_blocks = 5;
+            hs64_meta_params.num_sm_parts = params.num_sm_parts;
+            hs64_meta_params.topk = params.topk;
+            hs64_meta_params.extra_topk = params.extra_topk >= 0 ? params.extra_topk : 0;
+            hs64_meta_params.topk_length = params.topk_len_ptr;
+            hs64_meta_params.extra_topk_length = params.extra_topk_len_ptr;
+            get_mla_metadata_func(hs64_meta_params, stream);
         }
-        // Keep cached FP8 metadata at 64 tokens; HS64 consumes a private 128-token schedule.
-        const auto metadata_options = q.options().dtype(torch::kInt32);
-        hs64_metadata = torch::empty(
-            {params.num_sm_parts, TileSchedulerMetaDataSize}, metadata_options);
-        hs64_num_splits = torch::empty({params.b + 1}, metadata_options);
-        Mla_metadata_params hs64_meta_params = {};
-        hs64_meta_params.seqlens_k_ptr = nullptr;
-        hs64_meta_params.tile_scheduler_metadata_ptr = hs64_metadata.data_ptr<int>();
-        hs64_meta_params.num_splits_ptr = hs64_num_splits.data_ptr<int>();
-        hs64_meta_params.batch_size = params.b;
-        hs64_meta_params.block_size_n = 128;
-        hs64_meta_params.fixed_overhead_num_blocks = 5;
-        hs64_meta_params.num_sm_parts = params.num_sm_parts;
-        hs64_meta_params.topk = params.topk;
-        hs64_meta_params.extra_topk = params.extra_topk >= 0 ? params.extra_topk : 0;
-        hs64_meta_params.topk_length = params.topk_len_ptr;
-        hs64_meta_params.extra_topk_length = params.extra_topk_len_ptr;
-        get_mla_metadata_func(hs64_meta_params, stream);
         params.tile_scheduler_metadata_ptr = hs64_metadata.data_ptr<int>();
-        params.num_splits_ptr = hs64_num_splits.data_ptr<int>();
+        params.num_splits_ptr = hs64_num_splits_t.data_ptr<int>();
+        // Publish the HS64 schedule back to the caller so every later layer on
+        // the same FlashMLASchedMeta reuses it (see the cache note above).
+        // Harmless on the reuse path: both already alias the cached tensors.
+        hs64_tile_scheduler_metadata = hs64_metadata;
+        hs64_num_splits = hs64_num_splits_t;
     }
 
     // splitkv
@@ -574,7 +629,8 @@ sparse_attn_decode_interface(
     softmax_lse = softmax_lse.view({batch_size, num_heads_k, seqlen_q_ori, ngroups}).transpose(2, 3)
             .reshape({batch_size, num_heads_ori, seqlen_q_ori});
 
-    return std::make_tuple(out, softmax_lse, tile_scheduler_metadata, num_splits);
+    return std::make_tuple(out, softmax_lse, tile_scheduler_metadata, num_splits,
+                           hs64_tile_scheduler_metadata, hs64_num_splits);
 }
 
 #endif // FLASHMLA_C_ENABLE_DECODE_SPARSE
