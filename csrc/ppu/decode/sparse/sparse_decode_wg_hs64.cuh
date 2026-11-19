@@ -2960,7 +2960,10 @@ __forceinline__ __device__ void compute_K_addr_bf16(
         constexpr int kTileBytes = USE_EXTRA && T::kExtraFP4 ? 32 : 64;
         constexpr int kPrefetchTileStep = USE_EXTRA && T::kExtraFP4 ? 4 : 2;
         constexpr bool kPackedFp4ScaleHint = USE_EXTRA && kHs64FusedPackedFp4<T>;
-        if constexpr (T::kExtraFP4 || kHs64Fp8LeaderPrefetch<T>) {
+        constexpr bool kFp8LeaderPrefetch = kHs64Fp8LeaderPrefetch<T> ||
+            std::is_same_v<T, Hs64PackedFp8ExtraDecode> ||
+            std::is_same_v<T, Hs64PackedExtraStep<Hs64PackedFp8ExtraDecode>>;
+        if constexpr (T::kExtraFP4 || kFp8LeaderPrefetch) {
             // Four lanes share each metadata token. Its leader hints the
             // payload once using the original metadata address.
             if (meta_valid && (lane & 3) == 0) {
@@ -2971,7 +2974,7 @@ __forceinline__ __device__ void compute_K_addr_bf16(
                      tile += kPrefetchTileStep) {
                     __ppu_prefetch_nonebulk_L2(row + tile * kTileBytes);
                 }
-                if constexpr (kHs64Fp8LeaderPrefetch<T>) {
+                if constexpr (kFp8LeaderPrefetch) {
                     // The final line contains the scales and any unaligned payload tail.
                     __ppu_prefetch_nonebulk_L2(row + 512);
                 }
@@ -3401,7 +3404,7 @@ __forceinline__ __device__ void hs64_store_v41_fp8_tile(
     *reinterpret_cast<uint4*>(&dst(token, dst_dim + 8)) = output1;
 }
 
-template<typename TensorDst>
+template<bool kSharedStore = false, typename TensorDst>
 __forceinline__ __device__ void hs64_store_v41_fp8_from_stage(
     TensorDst &dst, int token, int lane, int tile, int dst_tile,
     uint4 packed, uint8_t raw, bool valid) {
@@ -3433,8 +3436,47 @@ __forceinline__ __device__ void hs64_store_v41_fp8_from_stage(
                            output_words[2], output_words[3]};
     const uint4 output1 = {output_words[4], output_words[5],
                            output_words[6], output_words[7]};
-    *reinterpret_cast<uint4*>(&dst(token, dst_dim)) = output0;
-    *reinterpret_cast<uint4*>(&dst(token, dst_dim + 8)) = output1;
+    if constexpr (kSharedStore) {
+        // A runtime-selected bank pointer would otherwise lower to generic stores.
+        cutlass::arch::shared_store<16>(cute::cast_smem_ptr_to_uint(&dst(token, dst_dim)), &output0);
+        cutlass::arch::shared_store<16>(cute::cast_smem_ptr_to_uint(&dst(token, dst_dim + 8)), &output1);
+    } else {
+        *reinterpret_cast<uint4*>(&dst(token, dst_dim)) = output0;
+        *reinterpret_cast<uint4*>(&dst(token, dst_dim + 8)) = output1;
+    }
+}
+
+template<int S, int E, bool MergeHigh, typename TensorDst, typename TensorHigh>
+__forceinline__ __device__ void hs64_store_v41_fp8_preloaded(
+    TensorDst &dst, TensorHigh *high, int token, int lane,
+    const uint8_t *data, const uint8_t *scales, bool valid) {
+    constexpr int LastTile = MergeHigh ? 8 : E;
+    static_assert(S % 4 == 0 && E % 4 == 0 && S < E && E <= 8);
+    uint4 packed[LastTile - S]{};
+    uint2 scale_words[2]{};
+    if (valid) {
+        #pragma unroll
+        for (int group = S / 4; group < LastTile / 4; ++group)
+            scale_words[group] = __ldg(reinterpret_cast<const uint2*>(scales + group * 8));
+        #pragma unroll
+        for (int tile = S; tile < LastTile; ++tile)
+            packed[tile - S] = __ldg(reinterpret_cast<const uint4*>(data + tile * 64));
+    }
+    #pragma unroll
+    for (int tile = S; tile < E; ++tile) {
+        const uint32_t word = tile % 4 < 2 ? scale_words[tile / 4].x : scale_words[tile / 4].y;
+        const uint8_t raw = static_cast<uint8_t>(word >> (8 * ((tile % 2) * 2 + lane / 4)));
+        hs64_store_v41_fp8_from_stage(dst, token, lane, tile, tile, packed[tile - S], raw, valid);
+    }
+    if constexpr (MergeHigh) {
+        #pragma unroll
+        for (int tile = 4; tile < 8; ++tile) {
+            const uint32_t word = tile % 4 < 2 ? scale_words[tile / 4].x : scale_words[tile / 4].y;
+            const uint8_t raw = static_cast<uint8_t>(word >> (8 * ((tile % 2) * 2 + lane / 4)));
+            hs64_store_v41_fp8_from_stage(*high, token, lane, tile, tile - 4,
+                                          packed[tile - S], raw, valid);
+        }
+    }
 }
 
 // Decode eight E2M1 nibbles with shared signs in BF16x2 order.
@@ -3452,7 +3494,7 @@ __forceinline__ __device__ uint4 hs64_fp4_word_shared_sign(uint32_t word) {
     __byte_perm(low1,high1,0x5140),__byte_perm(low1,high1,0x7362)};
 }
 
-template<typename TensorDst>
+template<bool kSharedStore = false, typename TensorDst>
 __forceinline__ __device__ void hs64_store_v41_fp4_tile(
     TensorDst &dst, int token, int lane, int tile, int dst_tile,
     uint64_t packed, uint8_t scale_raw, bool valid) {
@@ -3484,8 +3526,13 @@ __forceinline__ __device__ void hs64_store_v41_fp4_tile(
                            output_words[2], output_words[3]};
     const uint4 output1 = {output_words[4], output_words[5],
                            output_words[6], output_words[7]};
-    *reinterpret_cast<uint4*>(&dst(token, dst_dim)) = output0;
-    *reinterpret_cast<uint4*>(&dst(token, dst_dim + 8)) = output1;
+    if constexpr (kSharedStore) {
+        cutlass::arch::shared_store<16>(cute::cast_smem_ptr_to_uint(&dst(token, dst_dim)), &output0);
+        cutlass::arch::shared_store<16>(cute::cast_smem_ptr_to_uint(&dst(token, dst_dim + 8)), &output1);
+    } else {
+        *reinterpret_cast<uint4*>(&dst(token, dst_dim)) = output0;
+        *reinterpret_cast<uint4*>(&dst(token, dst_dim + 8)) = output1;
+    }
 }
 
 template<int S, int E, bool MERGE_EVEN_HIGH,
@@ -3534,13 +3581,6 @@ __forceinline__ __device__ uint64_t hs64_load_quant_shared_u64(const void *ptr) 
     asm volatile("ppu.ld.shared.v2.u32 {%0, %1}, [%2];\n"
         : "=r"(value.x), "=r"(value.y) : "r"(address) : "memory");
     return uint64_t(value.x) | (uint64_t(value.y) << 32);
-}
-__forceinline__ __device__ uint8_t hs64_load_quant_shared_u8(const void *ptr) {
-    const uint32_t address = cute::cast_smem_ptr_to_uint(ptr);
-    uint32_t value;
-    asm volatile("ppu.ld.shared.u8 %0, [%1];\n"
-        : "=r"(value) : "r"(address) : "memory");
-    return static_cast<uint8_t>(value);
 }
 
 // Stage into the inactive even-high bank while WG0 consumes current low V.
@@ -3591,29 +3631,37 @@ __forceinline__ __device__ void hs64_finish_v41_fp4_even(
     const int row = tidx >> 3;
     const int token = row + pass * T::kGmemTokPerPass;
     const int data_offset = pass * 4096 + (row >> 4) * 8192 + (row & 15) * 256;
+    const int scale_offset = 16384 + pass * 4096 + row * 32;
     // Low output does not alias either stage plane.
+    uint64_t packed_low[4];
     #pragma unroll
     for (int tile = 0; tile < 4; ++tile) {
-        const uint64_t packed = hs64_load_quant_shared_u64(
+        packed_low[tile] = hs64_load_quant_shared_u64(
             stage + data_offset + tile * 32 + wide_lane * 8);
-        const uint8_t raw = hs64_load_quant_shared_u8(&stage[16384 + pass * 4096 + row * 32 + tile * 4 + wide_lane]);
-        hs64_store_v41_fp4_tile(low, token, lane, tile, tile, packed, raw, valid[pass]);
+    }
+    const uint4 scales_low = hs64_load_quant_shared_u128(stage + scale_offset);
+    const uint32_t low_words[4] = {scales_low.x, scales_low.y, scales_low.z, scales_low.w};
+    #pragma unroll
+    for (int tile = 0; tile < 4; ++tile) {
+        const uint8_t raw = static_cast<uint8_t>(low_words[tile] >> (8 * wide_lane));
+        hs64_store_v41_fp4_tile(low, token, lane, tile, tile, packed_low[tile], raw, valid[pass]);
     }
     uint64_t packed_high[4];
-    uint8_t raw_high[4];
     #pragma unroll
     for (int tile = 4; tile < 8; ++tile) {
         packed_high[tile - 4] = hs64_load_quant_shared_u64(
             stage + data_offset + tile * 32 + wide_lane * 8);
-        raw_high[tile - 4] = hs64_load_quant_shared_u8(&stage[16384 + pass * 4096 + row * 32 + tile * 4 + wide_lane]);
     }
+    const uint4 scales_high = hs64_load_quant_shared_u128(stage + scale_offset + 16);
+    const uint32_t high_words[4] = {scales_high.x, scales_high.y, scales_high.z, scales_high.w};
     // Owners from BOTH original passes have now captured all remaining
     // packed data and scales before any thread overwrites the high bank.
     hs64_shared_exchange_sync<T>(6, 256);
     #pragma unroll
     for (int tile = 4; tile < 8; ++tile) {
-        hs64_store_v41_fp4_tile(high, token, lane, tile, tile - 4,
-            packed_high[tile - 4], raw_high[tile - 4], valid[pass]);
+        const uint8_t raw = static_cast<uint8_t>(high_words[tile - 4] >> (8 * wide_lane));
+        hs64_store_v41_fp4_tile<true>(high, token, lane, tile, tile - 4,
+            packed_high[tile - 4], raw, valid[pass]);
     }
     // Publish the expanded high bank to all readers.
     hs64_shared_exchange_sync<T>(6, 256);
@@ -3667,12 +3715,17 @@ __forceinline__ __device__ void hs64_finish_v41_fp8_even_low(
     const int row = tidx >> 3;
     const int token = row + pass * T::kGmemTokPerPass;
     // Low output is disjoint from both staging banks.
+    uint4 packed[4];
     #pragma unroll
     for (int tile = 0; tile < 4; ++tile) {
-        const uint4 packed = hs64_load_quant_shared_u128(stage + (tile >> 1) * 8192
+        packed[tile] = hs64_load_quant_shared_u128(stage + (tile >> 1) * 8192
             + pass * 4096 + row * 128 + (tile & 1) * 64 + wide_lane * 16);
-        const uint8_t raw = hs64_load_quant_shared_u8(&scale_stage[pass * 512 + row * 16 + tile * 2 + (wide_lane >> 1)]);
-        hs64_store_v41_fp8_from_stage(low, token, lane, tile, tile, packed, raw, valid[pass]);
+    }
+    const uint64_t scales = hs64_load_quant_shared_u64(scale_stage + pass * 512 + row * 16);
+    #pragma unroll
+    for (int tile = 0; tile < 4; ++tile) {
+        const uint8_t raw = static_cast<uint8_t>(scales >> (8 * (tile * 2 + (wide_lane >> 1))));
+        hs64_store_v41_fp8_from_stage(low, token, lane, tile, tile, packed[tile], raw, valid[pass]);
     }
 }
 
@@ -3689,23 +3742,82 @@ __forceinline__ __device__ void hs64_finish_v41_fp8_even_high(
     const int row = tidx >> 3;
     const int token = row + pass * T::kGmemTokPerPass;
     uint4 packed_high[4];
-    uint8_t raw_high[4];
     #pragma unroll
     for (int tile = 4; tile < 8; ++tile) {
         packed_high[tile - 4] = hs64_load_quant_shared_u128(stage + (tile >> 1) * 8192
             + pass * 4096 + row * 128 + (tile & 1) * 64 + wide_lane * 16);
-        raw_high[tile - 4] = hs64_load_quant_shared_u8(&scale_stage[pass * 512 + row * 16 + tile * 2 + (wide_lane >> 1)]);
     }
+    const uint64_t scales = hs64_load_quant_shared_u64(scale_stage + pass * 512 + row * 16 + 8);
     // All owners (both passes) drain high input before in-place expansion.
     hs64_shared_exchange_sync<T>(6, 256);
     #pragma unroll
     for (int tile = 4; tile < 8; ++tile) {
-        hs64_store_v41_fp8_from_stage(high, token, lane, tile, tile - 4,
-            packed_high[tile - 4], raw_high[tile - 4], valid[pass]);
+        const uint8_t raw = static_cast<uint8_t>(
+            scales >> (8 * ((tile - 4) * 2 + (wide_lane >> 1))));
+        hs64_store_v41_fp8_from_stage<true>(high, token, lane, tile, tile - 4,
+            packed_high[tile - 4], raw, valid[pass]);
     }
     // Publish the expanded high bank to all readers.
     hs64_shared_exchange_sync<T>(6, 256);
     __pipeline_commit();
+}
+
+// Odd FP8 halves are staged in the raw Q6/Q7 cubes, which D512 caches in registers.
+// Each owner later converts only the bytes it copied, so no exchange is required.
+template<typename T, int S>
+__forceinline__ __device__ void hs64_stage_v41_fp8_odd(
+    uint8_t *stage, uint8_t *scale_stage, int tidx,
+    typename T::InputT* (&token_ptr)[T::kGmemPasses],
+    bool (&valid)[T::kGmemPasses]) {
+    static_assert(T::kV41FP8 && !T::kExtraFP4 && !T::kHasExtraKTile && T::kArch == 89 &&
+                  T::kGmemPasses == 2 && T::kGmemThrPerTok == 8 && (S == 0 || S == 4));
+    const int pass = (tidx >> 2) & 1;
+    const int wide = tidx & 3;
+    const int row = tidx >> 3;
+    const bool own_valid = valid[pass];
+    const auto *data = reinterpret_cast<const uint8_t*>(token_ptr[pass]) - (tidx & 7) * 8;
+    #pragma unroll
+    for (int group = 0; group < 2; ++group) {
+        #pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            const int within = part * 64 + wide * 16;
+            __ppu_pipeline_memcpy_async_zfill(
+                stage + group * 8192 + pass * 4096 + row * 128 + within,
+                data + (S / 2 + group) * 128 + within, 16, own_valid ? 0 : 16, 1);
+        }
+    }
+    if constexpr (S == 4) {
+        // The high half is staged first; its scale row also serves the low half.
+        __ppu_pipeline_memcpy_async_zfill(scale_stage + pass * 512 + row * 16 + wide * 4,
+            data + 512 + wide * 4, 4, own_valid ? 0 : 4, 1);
+    }
+    __pipeline_commit();
+}
+
+template<typename T, int S, typename TensorDst>
+__forceinline__ __device__ void hs64_finish_v41_fp8_odd(
+    const uint8_t *stage, const uint8_t *scale_stage, TensorDst &dst, int tidx,
+    bool (&valid)[T::kGmemPasses]) {
+    static_assert(T::kV41FP8 && !T::kExtraFP4 && T::kGmemPasses == 2 && (S == 0 || S == 4));
+    const int pass = (tidx & 4) ? 1 : 0;
+    const int wide_lane = tidx & 3;
+    const int lane = wide_lane * 2;
+    const int row = tidx >> 3;
+    const int token = row + pass * T::kGmemTokPerPass;
+    uint4 packed[4];
+    #pragma unroll
+    for (int tile = 0; tile < 4; ++tile) {
+        packed[tile] = hs64_load_quant_shared_u128(stage + (tile >> 1) * 8192
+            + pass * 4096 + row * 128 + (tile & 1) * 64 + wide_lane * 16);
+    }
+    const uint64_t scales = hs64_load_quant_shared_u64(
+        scale_stage + pass * 512 + row * 16 + S * 2);
+    #pragma unroll
+    for (int tile = 0; tile < 4; ++tile) {
+        const uint8_t raw = static_cast<uint8_t>(scales >> (8 * (tile * 2 + (wide_lane >> 1))));
+        hs64_store_v41_fp8_from_stage(dst, token, lane, S + tile, S + tile,
+                                      packed[tile], raw, valid[pass]);
+    }
 }
 
 // Cache only the next odd FP4 high half in registers until bar3 releases its destination.
@@ -3811,18 +3923,8 @@ __forceinline__ __device__ void issue_K_load_bf16(
                     }
                 }
             } else {
-                #pragma unroll
-                for (int tile = S; tile < E; ++tile) {
-                    hs64_store_v41_fp8_tile(sK_buf, token, lane, tile, tile,
-                                            data, scale, valid);
-                }
-                if constexpr (MERGE_EVEN_HIGH) {
-                    #pragma unroll
-                    for (int tile = 4; tile < 8; ++tile) {
-                        hs64_store_v41_fp8_tile(*even_high, token, lane,
-                            tile, tile - 4, data, scale, valid);
-                    }
-                }
+                hs64_store_v41_fp8_preloaded<S, E, MERGE_EVEN_HIGH>(
+                    sK_buf, even_high, token, lane, data, scale, valid);
             }
         }
     } else {
@@ -4096,6 +4198,43 @@ __forceinline__ __device__ void load_K_tiles_bf16(
             params, sK_buf, batch_idx, block_idx_kv, seqlen_k, barriers_K,
             tidx, ori_block_max, token_ptr, is_valid, pre_token_idx,
             next_block_idx, end_block_idx, extra_seqlen_k);
+    }
+}
+
+// Both caches of this codec use 528-byte FP8 rows. The prologue keeps all
+// eight tiles in flight and keeps the split high/low completion signals.
+template<bool kLowLocal, typename T, typename TensorSK, typename TensorVI>
+__forceinline__ __device__ void hs64_load_packed_fp8_prolog(
+    const Flash_fwd_mla_params &params, TensorSK &sK_buf, int batch_idx,
+    int block_idx_kv, int seqlen_k, __mbarrier_t *barrier_low, int tidx,
+    int ori_block_max, TensorVI &smem_valid_indices, int vi_buf,
+    int *pre_token_idx, int next_block_idx, int end_block_idx, int extra_seqlen_k) {
+    static_assert(T::kV41FP8 && !T::kExtraFP4 && kPackedMain<T> != 0 &&
+                  !T::kHasExtraKTile && T::kGmemPasses == 2 && T::kGmemThrPerTok == 8);
+    typename T::InputT* token_ptr[T::kGmemPasses];
+    bool is_valid[T::kGmemPasses];
+    compute_K_addr_bf16_dynamic<0, T>(
+        params, batch_idx, block_idx_kv, seqlen_k, tidx, ori_block_max,
+        smem_valid_indices, vi_buf, pre_token_idx, extra_seqlen_k, token_ptr, is_valid,
+        ori_block_max >= 0 && block_idx_kv >= ori_block_max);
+    const int pass = (tidx & 4) ? 1 : 0;
+    const int wide_lane = tidx & 3;
+    const uint8_t *row = reinterpret_cast<const uint8_t*>(token_ptr[pass]) - (tidx & 7) * 8;
+    hs64_store_v41_fp8_preloaded<0, 8, false>(
+        sK_buf, static_cast<TensorSK*>(nullptr), (tidx >> 3) + pass * T::kGmemTokPerPass,
+        wide_lane * 2, row + wide_lane * 16, row + 512, is_valid[pass]);
+    __pipeline_commit();
+    if constexpr (kLowLocal) {
+        __pipeline_commit();
+    } else {
+        cutlass::arch::cpasync_barrier_arrive_noinc(barrier_low);
+    }
+    if (ori_block_max >= 0 && next_block_idx >= ori_block_max) {
+        hs64_prefetch_next_indices<true, T>(params, batch_idx, tidx, ori_block_max,
+            pre_token_idx, next_block_idx, end_block_idx);
+    } else {
+        hs64_prefetch_next_indices<false, T>(params, batch_idx, tidx, ori_block_max,
+            pre_token_idx, next_block_idx, end_block_idx);
     }
 }
 
@@ -4842,6 +4981,13 @@ __forceinline__ __device__ void wg1_subroutine(
 ) {
     constexpr bool kEarlyNextOddAddr = T::kIsPrefill && T::kArch == 89 &&
         T::kHasExtraKTile && !T::kMultiPrefillHeadTiles && kHs64LocalOddLow<T>;
+    constexpr bool kStageOddFp8 = T::kV41FP8 && !T::kExtraFP4 && !T::kHasExtraKTile &&
+        T::kArch == 89 && kPackedExtraStep<T> && !IS_BLK0_LAST && !IS_BLK1_LAST;
+    static_assert(!kStageOddFp8 || cosize_v<typename T::SmemLayoutQ> * sizeof(typename T::InputT) == 65536);
+    [[maybe_unused]] uint8_t *odd_stage = reinterpret_cast<uint8_t*>(cute::raw_pointer_cast(
+        local_tile(sQ, Shape<Int<T::kBlockM>, _64>{}, Coord<_0, Int<6>>{}).data()));
+    [[maybe_unused]] uint8_t *odd_scale_stage = reinterpret_cast<uint8_t*>(cute::raw_pointer_cast(
+        local_tile(sQ, Shape<Int<T::kBlockM>, _64>{}, Coord<_0, Int<4>>{}).data())) + 1024;
     int start_token_idx = block_idx * T::kBlockN;
     int nxt_block0 = block_idx+2;
     int nxt_block1 = block_idx+3;
@@ -4883,6 +5029,12 @@ __forceinline__ __device__ void wg1_subroutine(
 
     // Wait for WG0's sScale0/sM update after precomputing cur_max.
     { hs64_shared_exchange_sync<T>(1, T::NUM_THREADS); }  // sScale0Ready
+
+    if constexpr (kStageOddFp8) {
+        // bar1 follows both WGs' raw Q6/Q7 register loads.
+        hs64_stage_v41_fp8_odd<T, 4>(odd_stage, odd_scale_stage, idx_in_warpgroup,
+                                     precomp_ptr0, precomp_valid0);
+    }
 
     if constexpr (T::kIsCrossCut) {
         wg1_bunch_0_pre_crosscut_finish<T>(
@@ -4973,7 +5125,13 @@ __forceinline__ __device__ void wg1_subroutine(
     // Sync with WG0: ensures WG0 doesn't overwrite sP0 before we read it.
     { hs64_shared_exchange_sync<T>(3, T::NUM_THREADS); }  // sP0Ready
 
-    if constexpr (T::kIsCrossCut && T::kUseQkWeave &&
+    if constexpr (kStageOddFp8) {
+        __pipeline_wait_prior(0);
+        hs64_finish_v41_fp8_odd<T, 4>(odd_stage, odd_scale_stage, cur_sK0,
+                                      idx_in_warpgroup, precomp_valid0);
+        hs64_stage_v41_fp8_odd<T, 0>(odd_stage, odd_scale_stage, idx_in_warpgroup,
+                                     precomp_ptr0, precomp_valid0);
+    } else if constexpr (T::kIsCrossCut && T::kUseQkWeave &&
                   !IS_BLK0_LAST && !IS_BLK1_LAST && !T::kHasExtraKTile) {
         // bar3 already drains WG1's old local buf1-high reads. Reload the
         // disjoint high half here, avoiding a pre-bar async-copy fence.
@@ -5044,13 +5202,22 @@ __forceinline__ __device__ void wg1_subroutine(
             hs64_shared_exchange_sync<T>(4, T::NUM_THREADS);
         else
             __ppu_barrier_sync(4, T::NUM_THREADS, 15u);
-        issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
-                         T::kV41FP8, true, false, (T::kHasExtraKTile || T::kV41FP8)>(
+        if constexpr (kStageOddFp8) {
+            __pipeline_wait_prior(0);
+            hs64_finish_v41_fp8_odd<T, 0>(odd_stage, odd_scale_stage, cur_sK0,
+                                          idx_in_warpgroup, precomp_valid0);
+            hs64_prefetch_next_indices<NEXT_EXTRA, T>(params, batch_idx,
+                idx_in_warpgroup, ori_block_max, pre_token_idx,
+                nxt_block1 + 2, end_block_idx);
+        } else {
+            issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
+                             T::kV41FP8, true, false, (T::kHasExtraKTile || T::kV41FP8)>(
 
-            params, cur_sK0, batch_idx, nxt_block1, seqlen_k,
-            &barriers_K1[0], idx_in_warpgroup, ori_block_max,
-            precomp_ptr0, precomp_valid0, pre_token_idx,
-            nxt_block1 + 2, end_block_idx, extra_seqlen_k);
+                params, cur_sK0, batch_idx, nxt_block1, seqlen_k,
+                &barriers_K1[0], idx_in_warpgroup, ori_block_max,
+                precomp_ptr0, precomp_valid0, pre_token_idx,
+                nxt_block1 + 2, end_block_idx, extra_seqlen_k);
+        }
     }
 
     if constexpr (kEarlyNextOddAddr && !IS_BLK0_LAST && !IS_BLK1_LAST) {
@@ -5595,6 +5762,8 @@ __forceinline__ __device__ void hs64_attention(
         int prolog_vi_wg0 = (start_block_idx / 2) % 2;       // 0 or 1
         int prolog_vi_wg1 = 2 + (start_block_idx / 2) % 2;    // 2 or 3
         constexpr int kNumTiles = T::kNumKTiles;
+        constexpr bool kMergedPackedFp8Prolog = T::kV41FP8 && !T::kExtraFP4 &&
+            kPackedMain<T> != 0 && !T::kHasExtraKTile;
         {
             if (warpgroup_idx == 0) {
                 if (start_block_idx < end_block_idx) {
@@ -5614,6 +5783,13 @@ __forceinline__ __device__ void hs64_attention(
                         }
                         load_K_tiles_bf16<
                             0, T::kStage1KTiles, false, T, true, true>(
+                            params, cur_sK0, batch_idx, start_block_idx,
+                            seqlen_k, &barriers_K0[0], idx_in_warpgroup,
+                            ori_block_max, smem_valid_indices, prolog_vi_wg0,
+                            pre_token_idx0, start_block_idx + 2,
+                            end_block_idx, extra_seqlen_k);
+                    } else if constexpr (kMergedPackedFp8Prolog) {
+                        hs64_load_packed_fp8_prolog<true, T>(
                             params, cur_sK0, batch_idx, start_block_idx,
                             seqlen_k, &barriers_K0[0], idx_in_warpgroup,
                             ori_block_max, smem_valid_indices, prolog_vi_wg0,
@@ -5652,6 +5828,13 @@ __forceinline__ __device__ void hs64_attention(
                             end_block_idx, extra_seqlen_k);
                         load_K_tiles_bf16<
                             0, T::kStage1KTiles, false, T>(
+                            params, cur_sK1, batch_idx, start_block_idx + 1,
+                            seqlen_k, &barriers_K1[0], idx_in_warpgroup,
+                            ori_block_max, smem_valid_indices, prolog_vi_wg1,
+                            pre_token_idx1, start_block_idx + 3,
+                            end_block_idx, extra_seqlen_k);
+                    } else if constexpr (kMergedPackedFp8Prolog) {
+                        hs64_load_packed_fp8_prolog<false, T>(
                             params, cur_sK1, batch_idx, start_block_idx + 1,
                             seqlen_k, &barriers_K1[0], idx_in_warpgroup,
                             ori_block_max, smem_valid_indices, prolog_vi_wg1,
