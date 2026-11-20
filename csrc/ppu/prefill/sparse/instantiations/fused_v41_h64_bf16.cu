@@ -1,5 +1,9 @@
 #include "sparse/fused_v41_hs64.cuh"
 
+#if !FLASHMLA_FUSED_OUTPUT_CHANNELWISE
+#include <hggc.h>
+#endif
+
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
 template<bool Norm, bool Group, bool WideOutput>
@@ -92,14 +96,57 @@ void launch_fused_prefill_hs64(const FusedHs64Params& params, hggcStream_t strea
 struct FusedHs64Sm80PrefillTraits
     : FusedHs64Traits<false, flashmla::dsa::hs64::Hs64PrefillTraits<512, 80, false, false>, true> {
     static constexpr int kQBarrierThreads = 256;
+    // Compute one sink scale per head and publish it with staged output.
+    static constexpr bool kDeferPrefillSink = !Params::per_token_scale;
 };
 
-__global__ void __launch_bounds__(512, 1, 1)
-fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_kernel(
-    __grid_constant__ const FusedHs64Params params) {
+struct FusedHs64Sm80AlignedPrefillTraits : FusedHs64Sm80PrefillTraits {
+    static constexpr bool kAlignedQWithSink = true;
+};
+
+template<bool AlignedQWithSink>
+struct FusedHs64Sm80K128PrefillTraits : FusedHs64Sm80PrefillTraits {
+    static constexpr bool kSinglePrefillPair = true;
+    static constexpr bool kAlignedQWithSink = AlignedQWithSink;
+    // The SM80 block32 path already shares RoPE coefficients. This also
+    // lets the epilogue reuse the swizzled address for each block32 load.
+    static constexpr bool kCachePrefillRope = AlignedQWithSink;
+
+    // Transpose columns within each 16-value group for four consecutive
+    // PV stores. Rotate the low row bits so adjacent producer rows use
+    // opposite bank halves and eight consumer rows retain distinct groups.
+    using QuantRowShape = cute::Shape<cute::_2, cute::_4>;
+    using QuantRowStride = cute::Stride<cute::_256, cute::_64>;
+    using QuantColShape = cute::Shape<cute::_4, cute::_4, cute::_4>;
+    using QuantColStride = cute::Stride<cute::_4, cute::_1, cute::_16>;
+    using QuantOutputAtom = decltype(cute::composition(cute::Swizzle<3, 2, 4>{},
+        cute::Layout<cute::Shape<QuantRowShape, QuantColShape>,
+                     cute::Stride<QuantRowStride, QuantColStride>>{}));
+    using QuantOutputHalf = decltype(cute::tile_to_shape(QuantOutputAtom{},
+        cute::Shape<cute::_64, cute::_256>{}));
+    using SmemLayoutO_Half64x256 = std::conditional_t<AlignedQWithSink, QuantOutputHalf,
+        typename FusedHs64Sm80PrefillTraits::SmemLayoutO_Half64x256>;
+    static_assert(cute::cosize_v<SmemLayoutO_Half64x256> == 64 * 256);
+    static_assert(QuantOutputHalf{}(cute::make_coord(0, 4)) == 1);
+    static_assert(QuantOutputHalf{}(cute::make_coord(0, 1)) == 4);
+    static_assert(QuantOutputHalf{}(cute::make_coord(1, 0)) == 272);
+    static_assert(QuantOutputHalf{}(cute::make_coord(2, 0)) == 68);
+};
+
+struct FusedHs64Sm80MidQPrefillTraits : FusedHs64Sm80AlignedPrefillTraits {
+    static constexpr bool kVectorPrefillOutput = true;
+    static constexpr bool kMidQSaturatingPack = true;
+    using SmemLayoutO_Half64x256 = FusedHs64Sm80K128PrefillTraits<true>::QuantOutputHalf;
+};
+
 #if ACOMPUTE_VERSION == 10000
-    using T = FusedHs64Sm80PrefillTraits;
+template<typename T>
+__forceinline__ __device__ void run_hs64_sm80_prefill(const FusedHs64Params& params) {
     FusedHs64Params fixed = params;
+    if constexpr (T::kSinglePrefillPair) {
+        fixed.topk = 128;
+        fixed.topk_len_ptr = nullptr;
+    }
     fixed.q_orig = 1;
     fixed.seqlen_q = fixed.h_q = fixed.ngroups = T::kBlockM;
     fixed.h = fixed.h_h_k_ratio = 1;
@@ -111,13 +158,86 @@ fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_kernel(
     fixed.o_batch_stride = fixed.o_row_stride = 0;
     const Flash_fwd_mla_params& base = fixed;
     flashmla::dsa::hs64::hs64_attention<T, false>(base, fixed.max_logits);
+}
+#endif
+
+__global__ void __launch_bounds__(512, 1, 1)
+fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_kernel(
+    __grid_constant__ const FusedHs64Params params) {
+#if ACOMPUTE_VERSION == 10000
+    run_hs64_sm80_prefill<FusedHs64Sm80PrefillTraits>(params);
 #endif
 }
+
+#if !FLASHMLA_FUSED_OUTPUT_CHANNELWISE
+__global__ void __launch_bounds__(512, 1, 1)
+fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_aligned_kernel(
+    __grid_constant__ const FusedHs64Params params) {
+#if ACOMPUTE_VERSION == 10000
+    run_hs64_sm80_prefill<FusedHs64Sm80AlignedPrefillTraits>(params);
+#endif
+}
+
+__global__ void __launch_bounds__(512, 1, 1)
+fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_midq_layout_kernel(
+    __grid_constant__ const FusedHs64Params params) {
+#if ACOMPUTE_VERSION == 10000
+    run_hs64_sm80_prefill<FusedHs64Sm80MidQPrefillTraits>(params);
+#endif
+}
+
+template<bool AlignedQWithSink>
+__global__ void __launch_bounds__(512, 1, 1)
+fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_k128_kernel(
+    __grid_constant__ const FusedHs64Params params) {
+#if ACOMPUTE_VERSION == 10000
+    run_hs64_sm80_prefill<FusedHs64Sm80K128PrefillTraits<AlignedQWithSink>>(params);
+#endif
+}
+#endif
 
 void launch_fused_prefill_hs64_sm80(const FusedHs64Params& params, hggcStream_t stream) {
     using T = FusedHs64Sm80PrefillTraits;
     constexpr size_t bytes = sizeof(typename T::SharedMemoryPlan);
     auto kernel = &fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_kernel;
+#if !FLASHMLA_FUSED_OUTPUT_CHANNELWISE
+    const bool aligned_q_with_sink = params.attn_sink_ptr != nullptr &&
+        (reinterpret_cast<uintptr_t>(params.q_ptr) & 15u) == 0 &&
+        params.stride_q_s_q % 8 == 0;
+    if (params.topk == 128 && params.topk_len_ptr == nullptr) {
+        kernel = aligned_q_with_sink
+            ? &fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_k128_kernel<true>
+            : &fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_k128_kernel<false>;
+    } else if (aligned_q_with_sink && params.topk > 128 && params.topk_len_ptr == nullptr) {
+        if (params.topk == 640 && params.seqlen_k == 4096 && params.b >= 64 && params.b <= 512) {
+            kernel = &fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_midq_layout_kernel;
+            struct ResolvedKernel {
+                unsigned long long context_id = 0;
+                HGfunction function = nullptr;
+            };
+            static thread_local ResolvedKernel resolved;
+            HGcontext context = nullptr;
+            unsigned long long context_id = 0;
+            const bool have_id = hgCtxGetCurrent(&context) == HGGC_SUCCESS && context != nullptr
+                && hgCtxGetId(context, &context_id) == HGGC_SUCCESS;
+            HGfunction function = have_id && resolved.context_id == context_id ? resolved.function : nullptr;
+            if (function == nullptr) {
+                C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
+                hggcFunction_t symbol = nullptr;
+                C10_CUDA_CHECK(hggcGetFuncBySymbol(&symbol, reinterpret_cast<const void*>(kernel)));
+                function = reinterpret_cast<HGfunction>(symbol);
+                if (have_id) resolved = {context_id, function};
+            }
+            FusedHs64Params launch_params = params;
+            void* arguments[] = {&launch_params};
+            CUDA_DRIVER_CHECK(hgLaunchKernel(function, params.b, 1, 1, T::NUM_THREADS, 1, 1,
+                bytes, stream, arguments, nullptr));
+            return;
+        } else {
+            kernel = &fused_norm_rope_attn_rope_cast_prefill_hs64_sm80_aligned_kernel;
+        }
+    }
+#endif
     C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     kernel<<<dim3(params.b, 1, 1), T::NUM_THREADS, bytes, stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();

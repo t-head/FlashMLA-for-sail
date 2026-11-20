@@ -1,9 +1,11 @@
+#include <hggc.h>
 #include <cmath>
 #include <math_constants.h>
 #include <type_traits>
 
 #include "api/common.h"
 #include "sparse/fused_v41_wi.cuh"
+#include "sparse/fused_v41_hs64.cuh"
 #include "decode/sparse/fused_v41_splitkv.cuh"
 #include "prefill/sparse/sparse_prefill_std.cuh"
 
@@ -244,11 +246,19 @@ struct FusedSmallPrefillParams : SparsePrefillParams {
     Params fused;
 };
 
-template<bool Norm, bool H8, bool Thin = false>
+// Expose the geometry of the single-query SM80 H64 launch to the kernel.
+struct FusedH64SingleQueryPrefillParams : FusedSmallPrefillParams {
+    static constexpr int h_q = 64;
+    static constexpr int topk = 640;
+    static constexpr int stride_indices_s_q = 0;
+    static constexpr int32_t* topk_length = nullptr;
+};
+
+template<bool Norm, bool H8, bool Thin = false, bool SplitHeads = false>
 struct FusedSmallPrefillTraits
     : std::conditional_t<Thin, small_prefill::H8WideM8Traits, std::conditional_t<H8, small_prefill::H8BaseTraits, small_prefill::BaseTraits>> {
     using Base = std::conditional_t<Thin, small_prefill::H8WideM8Traits, std::conditional_t<H8, small_prefill::H8BaseTraits, small_prefill::BaseTraits>>;
-    using PrefillParams = FusedSmallPrefillParams;
+    using PrefillParams = std::conditional_t<SplitHeads, FusedH64SingleQueryPrefillParams, FusedSmallPrefillParams>;
     static constexpr bool kFusedSmallPrefill = true;
     static constexpr size_t kStdSmemEnd = Base::kSmemSize + 2 * Base::kBlockN * sizeof(bool);
     static constexpr size_t kScratchOffset = (kStdSmemEnd + 15) / 16 * 16;
@@ -259,6 +269,7 @@ struct FusedSmallPrefillTraits
         kScratchOffset + (H8 && !Norm ? Base::kBlockM * sizeof(bool) : kScratchBytes), kStageBytes);
 
     static_assert(!Thin || (H8 && !Norm));
+    static_assert(!SplitHeads || (Thin && !Params::per_token_scale));
     static_assert(Base::kBlockM == (Thin ? 8 : 16) && Base::kBlockN == (H8 && !Thin ? 32 : 64)
                   && Base::kNThreads == (H8 && !Thin ? 256 : 512));
     static_assert(!Base::Is_Q_in_regs && !Base::Share_Q_K_smem && !Base::QKV_FP8);
@@ -286,7 +297,8 @@ struct FusedSmallPrefillTraits
     template<typename KT, typename TensorQ>
     static __forceinline__ __device__ void load_fused_q(
         const PrefillParams& params, TensorQ& q, char* smem, int tidx,
-        int m_block, int64_t s_q_idx) {
+        int m_block, int64_t query_idx) {
+        const int64_t s_q_idx = SplitHeads ? 0 : query_idx;
         using Element = typename KT::InputT;
         float* partials = reinterpret_cast<float*>(smem + kScratchOffset);
         float* norm = partials + (H8 ? 8 * 8 : KT::kBlockM * kQParts);
@@ -306,7 +318,7 @@ struct FusedSmallPrefillTraits
                 const int dim = dim_begin + i;
                 uint4 raw{};
                 if (H8 || head < params.h_q) {
-                    const int offset = (dim / 16) * ((H8 ? 8 : params.h_q) * 16) + head * 16 + dim % 16;
+                    const int offset = (dim / 16) * ((H8 && !SplitHeads ? 8 : params.h_q) * 16) + head * 16 + dim % 16;
                     if (aligned) {
                         raw = __ldg(reinterpret_cast<const uint4*>(src + offset));
                     } else {
@@ -407,8 +419,9 @@ struct FusedSmallPrefillTraits
     template<typename KT, typename AccO, typename LSE, typename MLogits>
     static __forceinline__ __device__ void store_fused_output(
         const PrefillParams& params, AccO& acc_o, const LSE& lse, const MLogits& mlogits,
-        char* smem, int tidx, int m_block, int64_t s_q_idx, int topk_length) {
+        char* smem, int tidx, int m_block, int64_t query_idx, int topk_length) {
         using namespace cute;
+        const int64_t s_q_idx = SplitHeads ? 0 : query_idx;
         const auto& p = params.fused;
         constexpr bool kRegisterOutput = H8 && !Norm && Params::per_token_scale
             && ACOMPUTE_VERSION >= 10500;
@@ -427,7 +440,7 @@ struct FusedSmallPrefillTraits
                 const bool live = topk_length > 0 && (__float_as_uint(lse(mi)) & 0x7f800000u) != 0x7f800000u;
                 valid[row] = live;
                 if constexpr (!kRegisterOutput) {
-                    if (head < (H8 ? 8 : params.h_q)) {
+                    if (head < (H8 && !SplitHeads ? 8 : params.h_q)) {
                         const int64_t index = s_q_idx * params.h_q + head;
                         p.lse[index] = live ? lse(mi) * CUDART_LN2_F : INFINITY;
                         p.max_logits[index] = live ? mlogits(mi) * CUDART_LN2_F : -INFINITY;
@@ -583,15 +596,36 @@ struct FusedSmallPrefillTraits
                 uint2 packed;
                 #pragma unroll
                 for (int i = 0; i < 8; i += 4) {
-                    const uint32_t low = small_prefill::fp8_pair_from_float(values[i] * scale_inv, values[i + 1] * scale_inv);
-                    const uint32_t high = small_prefill::fp8_pair_from_float(values[i + 2] * scale_inv, values[i + 3] * scale_inv);
-                    (i == 0 ? packed.x : packed.y) = low | (high << 16);
+#if ACOMPUTE_VERSION == 10000 && !FLASHMLA_FUSED_OUTPUT_CHANNELWISE
+                    if constexpr (SplitHeads) {
+                        uint32_t word = 0;
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            word |= uint32_t(sm80_signed_fp8_from_float(values[i + j] * scale_inv)) << (8 * j);
+                        }
+                        (i == 0 ? packed.x : packed.y) = word;
+                    } else
+#endif
+                    {
+                        const uint32_t low = small_prefill::fp8_pair_from_float(values[i] * scale_inv, values[i + 1] * scale_inv);
+                        const uint32_t high = small_prefill::fp8_pair_from_float(values[i + 2] * scale_inv, values[i + 3] * scale_inv);
+                        (i == 0 ? packed.x : packed.y) = low | (high << 16);
+                    }
                 }
-                const int64_t out_offset = s_q_idx * (8 * 512) + tile * (8 * 32) + row * 32 + lane * 8;
+                const int64_t group = SplitHeads ? m_block : 0;
+                const int64_t out_offset = s_q_idx * ((SplitHeads ? params.h_q : 8) * 512)
+                    + group * (8 * 512) + tile * (8 * 32) + row * 32 + lane * 8;
                 *reinterpret_cast<uint2*>(p.out_fp8 + out_offset) = packed;
-                if (lane == 0) {
-                    const int sf_index = tile * 8 + row;
-                    auto* sf_word = p.out_sf + s_q_idx + int64_t(sf_index / 4) * p.stride_out_sf_word;
+                const int sf_index = tile * 8 + row;
+                auto* sf_word = p.out_sf + s_q_idx + group * p.stride_out_sf_group
+                    + int64_t(sf_index / 4) * p.stride_out_sf_word;
+                if constexpr (SplitHeads) {
+                    // Four consecutive heads occupy a 16-lane group.
+                    const uint32_t encoded = uint8_t(exponent + 127);
+                    const uint32_t pair = encoded | (__shfl_down_sync(0xffffffff, encoded, 4, 16) << 8);
+                    const uint32_t word = pair | (__shfl_down_sync(0xffffffff, pair, 8, 16) << 16);
+                    if ((tidx & 15) == 0) *sf_word = word;
+                } else if (lane == 0) {
                     reinterpret_cast<uint8_t*>(sf_word)[sf_index % 4] = uint8_t(exponent + 127);
                 }
             }
@@ -652,8 +686,10 @@ struct FusedSmallPrefillTraits
 
 template<bool Norm>
 void run_fused_norm_rope_attn_rope_cast_prefill_small(const Params& p) {
-    TORCH_CHECK(p.mode == FwdMode::Prefill && (p.arch == 89 || (p.arch == 80 && p.h_q == 8)));
-    if (p.h_q == 8) {
+    const bool split_h64 = !Norm && !Params::per_token_scale && p.arch == 80 && p.h_q == 64
+        && p.s_q == 1 && p.topk == 640 && p.topk_length == nullptr;
+    TORCH_CHECK(p.mode == FwdMode::Prefill && (p.arch == 89 || (p.arch == 80 && p.h_q == 8) || split_h64));
+    if (p.h_q == 8 || split_h64) {
         TORCH_CHECK(p.topk > 0 && p.topk % small_prefill::BaseTraits::kBlockN == 0,
                     "H8 fused prefill requires a positive top-k divisible by 64");
         TORCH_CHECK((reinterpret_cast<uintptr_t>(p.kv) & 15) == 0 && p.stride_kv_s_kv % 8 == 0,
@@ -702,10 +738,38 @@ void run_fused_norm_rope_attn_rope_cast_prefill_small(const Params& p) {
     params.fused = p;
     params.fused.topk_length = topk_length;
 
-    const auto launch = [&](auto h8, auto thin) {
-        using T = FusedSmallPrefillTraits<Norm, decltype(h8)::value, decltype(thin)::value>;
+    const auto launch = [&](auto h8, auto thin, auto split_heads) {
+        using T = FusedSmallPrefillTraits<Norm, decltype(h8)::value, decltype(thin)::value,
+                                          decltype(split_heads)::value>;
         constexpr size_t bytes = T::kSmallSmemBytes;
-        auto kernel = &flash::flash_sparse_prefill_fwd_kernel<T, true, false, true, false, FusedSmallPrefillParams>;
+        auto kernel = &flash::flash_sparse_prefill_fwd_kernel<T, true, false, true, false,
+                                                             typename T::PrefillParams>;
+        if constexpr (decltype(split_heads)::value) {
+            // The runtime symbol and its opt-in shared-memory limit both live
+            // in the current context. Cache the resolved handle for this thread.
+            struct ResolvedKernel {
+                unsigned long long context_id = 0;
+                HGfunction function = nullptr;
+            };
+            static thread_local ResolvedKernel resolved;
+            HGcontext context = nullptr;
+            unsigned long long context_id = 0;
+            const bool have_id = hgCtxGetCurrent(&context) == HGGC_SUCCESS && context != nullptr
+                && hgCtxGetId(context, &context_id) == HGGC_SUCCESS;
+            HGfunction function = have_id && resolved.context_id == context_id ? resolved.function : nullptr;
+            if (function == nullptr) {
+                C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
+                hggcFunction_t symbol = nullptr;
+                C10_CUDA_CHECK(hggcGetFuncBySymbol(&symbol, reinterpret_cast<const void*>(kernel)));
+                function = reinterpret_cast<HGfunction>(symbol);
+                if (have_id) resolved = {context_id, function};
+            }
+            FusedH64SingleQueryPrefillParams single{params};
+            void* arguments[] = {&single};
+            CUDA_DRIVER_CHECK(hgLaunchKernel(function, single.h_q / T::kBlockM, 1, 1,
+                T::kNThreads, 1, 1, bytes, p.stream, arguments, nullptr));
+            return;
+        }
         static std::mutex attr_mutex;
         static std::set<int> configured_devices;
         const int device = get_current_device();
@@ -716,17 +780,23 @@ void run_fused_norm_rope_attn_rope_cast_prefill_small(const Params& p) {
                 configured_devices.insert(device);
             }
         }
-        kernel<<<dim3(p.s_q * cute::ceil_div(p.h_q, T::kBlockM), 1, 1), T::kNThreads, bytes, p.stream>>>(params);
-        CHECK_CUDA_KERNEL_LAUNCH();
+        if constexpr (!decltype(split_heads)::value) {
+            kernel<<<dim3(p.s_q * cute::ceil_div(p.h_q, T::kBlockM), 1, 1), T::kNThreads, bytes, p.stream>>>(params);
+            CHECK_CUDA_KERNEL_LAUNCH();
+        }
     };
     if constexpr (!Norm && !Params::per_token_scale) {
+        if (split_h64) {
+            launch(std::true_type{}, std::true_type{}, std::true_type{});
+            return;
+        }
         if (p.arch == 80 && p.h_q == 8 && p.s_q <= 16) {
-            launch(std::true_type{}, std::true_type{});
+            launch(std::true_type{}, std::true_type{}, std::false_type{});
             return;
         }
     }
-    if (p.h_q == 8) launch(std::true_type{}, std::false_type{});
-    else launch(std::false_type{}, std::false_type{});
+    if (p.h_q == 8) launch(std::true_type{}, std::false_type{}, std::false_type{});
+    else launch(std::false_type{}, std::false_type{}, std::false_type{});
 }
 
 template void run_fused_norm_rope_attn_rope_cast_prefill_small<false>(const Params&);

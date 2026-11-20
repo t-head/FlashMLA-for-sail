@@ -9,6 +9,94 @@
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
+#if ACOMPUTE_VERSION == 10000 && !FLASHMLA_FUSED_OUTPUT_CHANNELWISE
+struct Sm80SignedFp8Table {
+    uint16_t words[1 << 13];
+
+    static constexpr uint8_t encode(uint32_t bits) {
+        const uint32_t magnitude = bits & 0x7fffffffu;
+        const uint32_t sign = (bits >> 24) & 0x80u;
+        if (magnitude > 0x7f800000u) return 0x7f;
+        if (magnitude >= 0x43e00000u) return uint8_t(sign | 0x7e);
+        if (magnitude >= 0x3c800000u) {
+            const uint32_t rounded = magnitude - 0x3c000000u + 0x7ffffu
+                + ((magnitude >> 20) & 1u);
+            return uint8_t(sign | (rounded >> 20));
+        }
+        if (magnitude <= 0x3a800000u) return uint8_t(sign);
+        // Scale by the E4M3 subnormal quantum (2^-9) and round to even.
+        const uint32_t shift = 141 - (magnitude >> 23);
+        const uint32_t mantissa = (magnitude & 0x7fffffu) | 0x800000u;
+        const uint32_t rounded = mantissa + (1u << (shift - 1)) - 1u
+            + ((mantissa >> shift) & 1u);
+        return uint8_t(sign | (rounded >> shift));
+    }
+
+    constexpr Sm80SignedFp8Table(bool zero_nan = false) : words{} {
+        for (uint32_t key = 0; key < (1u << 13); ++key) {
+            const uint32_t boundary = key << 19;
+            const uint16_t tie = encode(boundary);
+            const uint16_t successor = encode(boundary | 1u);
+            words[key] = uint16_t((zero_nan && tie == 0x7f ? 0 : tie)
+                | ((zero_nan && successor == 0x7f ? 0 : successor) << 8));
+        }
+    }
+};
+
+inline __device__ const Sm80SignedFp8Table kSm80SignedFp8Table{};
+inline __device__ const Sm80SignedFp8Table kSm80ZeroNanFp8Table{true};
+
+__forceinline__ __device__ uint8_t sm80_signed_fp8_from_float(
+    float value, const uint16_t* table = kSm80SignedFp8Table.words) {
+    const uint32_t bits = __float_as_uint(value);
+    // Issue the lookup without waiting for the sticky-bit calculation.
+    const uint32_t entry = __ldg(table + (bits >> 19));
+    const uint32_t shift = uint32_t((bits & 0x7ffffu) != 0) * 8;
+    return uint8_t(entry >> shift);
+}
+
+// Normal-range FP8 rounding at the original FP32 exponent, before adding the sign.
+__forceinline__ __device__ uint32_t sm80_round_normal_scaled_bits(uint32_t bits, uint32_t bias) {
+    return (bits + bias + ((bits >> 20) & 1u)) >> 20;
+}
+
+__forceinline__ __device__ uint32_t sm80_pack_four_normal(const float* src, uint32_t bias) {
+    const uint32_t x0 = __float_as_uint(src[0]);
+    const uint32_t x1 = __float_as_uint(src[1]);
+    const uint32_t x2 = __float_as_uint(src[2]);
+    const uint32_t x3 = __float_as_uint(src[3]);
+    const uint32_t mag01 = __byte_perm(sm80_round_normal_scaled_bits(x0, bias),
+                                         sm80_round_normal_scaled_bits(x1, bias), 0x0040);
+    const uint32_t mag23 = __byte_perm(sm80_round_normal_scaled_bits(x2, bias),
+                                         sm80_round_normal_scaled_bits(x3, bias), 0x0040);
+    const uint32_t sign01 = __byte_perm(x0, x1, 0x0073);
+    const uint32_t sign23 = __byte_perm(x2, x3, 0x0073);
+    const uint32_t signs = __byte_perm(sign01, sign23, 0x5410) & 0x80808080u;
+    return __byte_perm(mag01, mag23, 0x5410) | signs;
+}
+
+__forceinline__ __device__ uint32_t sm80_pack_saturating_pair(
+    uint32_t x, uint32_t y, uint32_t packed_offset) {
+    const uint32_t original_pair = __byte_perm(x, y, 0x7632);
+    // The midpoint-up offset has zero low bits. Saturating the two
+    // magnitude halfwords yields a bounded approximation for subnormals.
+    const uint32_t magnitude = __vsubus2(original_pair & 0x7fff7fffu, packed_offset);
+    uint32_t signed_pair;
+    asm("ppu.lop3.b32 %0, %1, %2, %3, 0xca;"
+        : "=r"(signed_pair) : "r"(0x00800080u), "r"(original_pair >> 8), "r"(magnitude >> 4));
+    return signed_pair;
+}
+
+__forceinline__ __device__ uint32_t sm80_pack_four_saturating(
+    const float* values, uint32_t packed_offset) {
+    const uint32_t low = sm80_pack_saturating_pair(
+        __float_as_uint(values[0]), __float_as_uint(values[1]), packed_offset);
+    const uint32_t high = sm80_pack_saturating_pair(
+        __float_as_uint(values[2]), __float_as_uint(values[3]), packed_offset);
+    return __byte_perm(low, high, 0x6420);
+}
+#endif
+
 struct FusedHs64Params : Flash_fwd_mla_params {
     float rms_norm_eps;
     const int32_t* token_positions;
@@ -31,6 +119,10 @@ struct FusedHs64Traits : Base {
     static constexpr bool kFusedDirectQueries = false;
     static constexpr bool kSkipNextKPrefetch = SkipNextKPrefetch;
     static constexpr bool kPersistentPrefillQueries = false;
+    static constexpr bool kSinglePrefillPair = false;
+    static constexpr bool kVectorPrefillOutput = false;
+    static constexpr bool kAlignedQWithSink = false;
+    static constexpr bool kMidQSaturatingPack = false;
     static constexpr bool kCachePrefillRope = false;
     static constexpr bool kDeferPrefillSink = false;
     static constexpr bool kFusedPackedFp4 =
@@ -85,9 +177,13 @@ struct FusedHs64Traits : Base {
     }
 
     template<typename T>
+    static constexpr bool kUsePrefillRopeCache = T::kCachePrefillRope
+        || (Base::kIsPrefill && Base::kArch == 80 && !Norm && !Params::per_token_scale);
+
+    template<typename T>
     static __forceinline__ __device__ void prefetch_prefill_rope(
         const FusedHs64Params& fused, int batch_idx, int tidx) {
-        if constexpr (T::kCachePrefillRope) {
+        if constexpr (kUsePrefillRopeCache<T>) {
             if (tidx < 64) {
                 const int position = __ldg(fused.token_positions + batch_idx);
                 const float* rope = fused.cos_sin_cache + int64_t(position) * 64;
@@ -100,7 +196,7 @@ struct FusedHs64Traits : Base {
     template<typename T>
     static __forceinline__ __device__ const float* q_rope(
         const FusedHs64Params& fused, int batch_idx) {
-        if constexpr (T::kCachePrefillRope) {
+        if constexpr (kUsePrefillRopeCache<T>) {
             return prefill_rope_slot(batch_idx);
         } else {
             const int position = __ldg(fused.token_positions + batch_idx);
@@ -110,7 +206,7 @@ struct FusedHs64Traits : Base {
 
     template<typename T>
     static __forceinline__ __device__ float rope_coeff(const float* rope, int i) {
-        if constexpr (T::kCachePrefillRope) return rope[i];
+        if constexpr (kUsePrefillRopeCache<T>) return rope[i];
         else return __ldg(rope + i);
     }
 
@@ -145,12 +241,12 @@ struct FusedHs64Traits : Base {
             cutlass::arch::cpasync_barrier_arrive_noinc(barrier_Q);
             return;
         }
-        if((reinterpret_cast<uintptr_t>(src) & 15) == 0) {
+        if (T::kAlignedQWithSink || (reinterpret_cast<uintptr_t>(src) & 15) == 0) {
             // The barrier counts the Q loaders. RMS and RoPE follow its wait
             // in finish_fused_q, so raw Q copy overlaps other work.
             if(tidx < T::kQBarrierThreads) {
                 constexpr bool kCoalesceQ = WideOutput &&
-                    flashmla::dsa::hs64::kHs64PrefillGroupedQueries<T> &&
+                    (flashmla::dsa::hs64::kHs64PrefillGroupedQueries<T> || T::kAlignedQWithSink) &&
                     (!Norm || T::kPersistentPrefillQueries);
                 static_assert(!T::kPersistentPrefillQueries || kCoalesceQ);
                 constexpr int kCopyStep = T::kPersistentPrefillQueries ? 16 : 8;
@@ -237,7 +333,7 @@ struct FusedHs64Traits : Base {
         const auto& fused = static_cast<const FusedHs64Params&>(params);
         const auto* src = static_cast<const typename T::InputT*>(fused.q_ptr)
             + int64_t(batch_idx) * fused.stride_q_s_q;
-        if((reinterpret_cast<uintptr_t>(src) & 15) != 0) return;
+        if (!T::kAlignedQWithSink && (reinterpret_cast<uintptr_t>(src) & 15) != 0) return;
         extern __shared__ char wksp_buf[];
         auto* partials = reinterpret_cast<float*>(wksp_buf + kNormScratchOffset);
         auto* norm = reinterpret_cast<float*>(wksp_buf + kNormOffset);
@@ -396,7 +492,8 @@ struct FusedHs64Traits : Base {
             flashmla::dsa::hs64::hs64_convert_layout_acc_rowcol<T>(rO.layout()));
         static_assert(decltype(size<0>(rowcol))::value == 4);
         static_assert(decltype(size<1>(rowcol))::value == 16);
-        const bool deferred_sink = T::kDeferPrefillSink && params.attn_sink_ptr != nullptr;
+        const bool deferred_sink = T::kDeferPrefillSink &&
+            (T::kAlignedQWithSink || params.attn_sink_ptr != nullptr);
         // The SM80 prefill caller already applies the sink scale and sets
         // all four rNorm entries to 1 before reaching this no-split hook.
         constexpr bool kSinkNormalizedInCaller =
@@ -454,9 +551,39 @@ struct FusedHs64Traits : Base {
                 }
             }
         }
+        constexpr bool kNativeOutputLayout = WideOutput && T::kSinglePrefillPair
+            && T::kAlignedQWithSink && Base::kIsPrefill && Base::kArch == 80
+            && !Norm && !Params::per_token_scale;
+        // Keep the layout and packing choices independent for the multi-pair path.
+        constexpr bool kVectorOutputLayout = kNativeOutputLayout || T::kVectorPrefillOutput;
+        static_assert(!T::kMidQSaturatingPack || (WideOutput && !T::kSinglePrefillPair &&
+            T::kAlignedQWithSink && T::kDeferPrefillSink && Base::kIsPrefill &&
+            Base::kArch == 80 && !Norm && !Params::per_token_scale));
+        constexpr bool kSaturatingPack = kNativeOutputLayout || T::kMidQSaturatingPack;
+        static_assert(!T::kVectorPrefillOutput || (WideOutput && T::kAlignedQWithSink &&
+            !T::kSinglePrefillPair && Base::kIsPrefill && Base::kArch == 80 &&
+            !Norm && !Params::per_token_scale));
         auto stage_half = [&](auto& half) {
-            Tensor dst = thr.partition_D(half);
-            if constexpr (T::kUsePairedCubes) {
+            if constexpr (kVectorOutputLayout) {
+                static_assert(!T::kUsePairedCubes && T::kPvAtomLayoutM == 2 && T::kPvAtomLayoutN == 4);
+                const int h0 = flashmla::dsa::hs64::get_PV_row_idx<T>(0, idx_in_warpgroup);
+                const int col0 = 32 * (idx_in_warpgroup >> 7)
+                    + 16 * ((idx_in_warpgroup >> 6) & 1) + (idx_in_warpgroup & 3);
+                auto* output_base = reinterpret_cast<float4*>(&half(h0, col0));
+                // The rotated-row swizzle only uses h[2:0] and col[5:0].
+                // Subsequent fragments advance in whole 8x64 atoms.
+                #pragma unroll
+                for (int mi = 0; mi < 4; ++mi) {
+                    const int row_vectors = (mi & 1) * 128 + (mi >> 1) * 512;
+                    #pragma unroll
+                    for (int group = 0; group < 4; ++group) {
+                        const float4 output{rowcol(mi, 4 * group), rowcol(mi, 4 * group + 1),
+                                            rowcol(mi, 4 * group + 2), rowcol(mi, 4 * group + 3)};
+                        output_base[row_vectors + group * 1024] = output;
+                    }
+                }
+            } else if constexpr (T::kUsePairedCubes) {
+                Tensor dst = thr.partition_D(half);
                 #pragma unroll
                 for(int j = 0; j < size<2>(dst); ++j) {
                     #pragma unroll
@@ -467,6 +594,7 @@ struct FusedHs64Traits : Base {
                     }
                 }
             } else {
+                Tensor dst = thr.partition_D(half);
                 cute::copy(copy_c, src, dst);
             }
         };
@@ -503,34 +631,58 @@ struct FusedHs64Traits : Base {
                 } else {
 #endif
                 if constexpr (WideOutput) {
-                    // The swizzle preserves the three low column bits.
+                    // All load addresses can use the same 32-column tile start.
                     const int col = (tile & 7) * 32;
-                    constexpr bool kReuseTileOffset = T::kCacheRms || T::kCachePrefillRope;
+                    constexpr bool kReuseTileOffset = T::kCacheRms || T::kCachePrefillRope
+                        || T::kVectorPrefillOutput;
                     const int tile_offset = kReuseTileOffset
                         ? int(half.layout()(make_coord(head, col))) : 0;
-                    #pragma unroll
-                    for(int i = 0; i < 32; i += 4) {
-                        const float* chunk;
-                        if constexpr (kReuseTileOffset) {
-                            // The column increment changes no source bits of Swizzle<3,3,3>.
-                            chunk = cute::raw_pointer_cast(half.data()) + (tile_offset ^ i);
-                        } else {
-                            chunk = &half(head, col + i);
+                    if constexpr (kVectorOutputLayout) {
+                        static_assert(kReuseTileOffset);
+                        #pragma unroll
+                        for (int i = 0; i < 32; i += 4) {
+                            const float* chunk = cute::raw_pointer_cast(half.data()) + (tile_offset ^ i);
+                            const float4 group = *reinterpret_cast<const float4*>(chunk);
+                            const int first = (i & 16) + ((i & 15) / 4);
+                            values[first] = group.x;
+                            values[first + 4] = group.y;
+                            values[first + 8] = group.z;
+                            values[first + 12] = group.w;
                         }
-                        *reinterpret_cast<float4*>(values + i) =
-                            *reinterpret_cast<const float4*>(chunk);
+                    } else {
+                        #pragma unroll
+                        for(int i = 0; i < 32; i += 4) {
+                            const float* chunk;
+                            if constexpr (kReuseTileOffset) {
+                                // The column increment changes no source bits of Swizzle<3,3,3>.
+                                chunk = cute::raw_pointer_cast(half.data()) + (tile_offset ^ i);
+                            } else {
+                                chunk = &half(head, col + i);
+                            }
+                            *reinterpret_cast<float4*>(values + i) =
+                                *reinterpret_cast<const float4*>(chunk);
+                        }
                     }
                 } else {
                     #pragma unroll
                     for(int i = 0; i < 32; ++i) values[i] = half(head, (tile & 7) * 32 + i);
                 }
+                constexpr bool kZeroNanAtPack = (T::kSinglePrefillPair || T::kMidQSaturatingPack)
+                    && T::kDeferPrefillSink && Base::kIsPrefill && Base::kArch == 80
+                    && !Norm && !Params::per_token_scale;
+                const bool zero_nan_at_pack = kZeroNanAtPack && deferred_sink && tile < 14;
                 if constexpr (T::kDeferPrefillSink) {
                     if (deferred_sink) {
                         const float factor = sink_scales[head];
-                        #pragma unroll
-                        for (int i = 0; i < 32; ++i) {
-                            const float scaled = values[i] * factor;
-                            values[i] = scaled == scaled ? scaled : 0.0f;
+                        if (zero_nan_at_pack) {
+                            #pragma unroll
+                            for (int i = 0; i < 32; ++i) values[i] *= factor;
+                        } else {
+                            #pragma unroll
+                            for (int i = 0; i < 32; ++i) {
+                                const float scaled = values[i] * factor;
+                                values[i] = scaled == scaled ? scaled : 0.0f;
+                            }
                         }
                     }
                 }
@@ -553,21 +705,56 @@ struct FusedHs64Traits : Base {
                 }
                 }
 #endif
+                constexpr bool kUseNormalPack = (kZeroNanAtPack && T::kAlignedQWithSink)
+                    || T::kMidQSaturatingPack;
                 float amax = 0.0f;
+                bool bounded_finite = false;
+                bool all_zero_block = false;
+                uint32_t magnitude_min = 0x7fffffffu;
                 if (!fused.per_token_scale || decltype(scan_only)::value) {
-                    if constexpr (WideOutput) {
-                        float amax1 = 0.0f, amax2 = 0.0f, amax3 = 0.0f;
+                    if constexpr (kUseNormalPack) {
+                        // Unsigned abs-bit max also detects every Inf/NaN.
+                        // fmax alone can hide NaN and cannot certify finiteness.
+                        uint32_t m0 = 0, m1 = 0, m2 = 0, m3 = 0;
+                        uint32_t n0 = 0x7fffffffu, n1 = 0x7fffffffu;
+                        uint32_t n2 = 0x7fffffffu, n3 = 0x7fffffffu;
                         #pragma unroll
-                        for(int i = 0; i < 32; i += 4) {
-                            amax = fmaxf(amax, fabsf(values[i]));
-                            amax1 = fmaxf(amax1, fabsf(values[i + 1]));
-                            amax2 = fmaxf(amax2, fabsf(values[i + 2]));
-                            amax3 = fmaxf(amax3, fabsf(values[i + 3]));
+                        for (int i = 0; i < 32; i += 4) {
+                            const uint32_t b0 = __float_as_uint(values[i]) & 0x7fffffffu;
+                            const uint32_t b1 = __float_as_uint(values[i + 1]) & 0x7fffffffu;
+                            const uint32_t b2 = __float_as_uint(values[i + 2]) & 0x7fffffffu;
+                            const uint32_t b3 = __float_as_uint(values[i + 3]) & 0x7fffffffu;
+                            m0 = max(m0, b0); m1 = max(m1, b1);
+                            m2 = max(m2, b2); m3 = max(m3, b3);
+                            if constexpr (!kSaturatingPack) {
+                                n0 = min(n0, b0); n1 = min(n1, b1);
+                                n2 = min(n2, b2); n3 = min(n3, b3);
+                            }
                         }
-                        amax = fmaxf(fmaxf(amax, amax1), fmaxf(amax2, amax3));
-                    } else {
-                        #pragma unroll
-                        for(int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(values[i]));
+                        const uint32_t magnitude_max = max(max(m0, m1), max(m2, m3));
+                        bounded_finite = magnitude_max < 0x7f800000u;
+                        if constexpr (!kSaturatingPack) {
+                            magnitude_min = min(min(n0, n1), min(n2, n3));
+                            // Final post-RoPE bits, before amax is clamped for SF.
+                            all_zero_block = magnitude_max == 0u;
+                        }
+                        if (bounded_finite) amax = __uint_as_float(magnitude_max);
+                    }
+                    if (!bounded_finite) {
+                        if constexpr (WideOutput) {
+                            float amax1 = 0.0f, amax2 = 0.0f, amax3 = 0.0f;
+                            #pragma unroll
+                            for(int i = 0; i < 32; i += 4) {
+                                amax = fmaxf(amax, fabsf(values[i]));
+                                amax1 = fmaxf(amax1, fabsf(values[i + 1]));
+                                amax2 = fmaxf(amax2, fabsf(values[i + 2]));
+                                amax3 = fmaxf(amax3, fabsf(values[i + 3]));
+                            }
+                            amax = fmaxf(fmaxf(amax, amax1), fmaxf(amax2, amax3));
+                        } else {
+                            #pragma unroll
+                            for(int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(values[i]));
+                        }
                     }
                     amax = fmaxf(1e-4f, amax);
                 }
@@ -583,11 +770,60 @@ struct FusedHs64Traits : Base {
                 }
                 alignas(16) uint8_t packed[32];
                 auto* pairs = reinterpret_cast<uint16_t*>(packed);
-                #pragma unroll
-                for(int i = 0; i < 32; i += 2) {
-                    // Reuse the existing SM80 software converter and SM89 pair instruction.
-                    pairs[i / 2] = splitkv::fp8_pair_from_float(
-                        values[i] * scale_inv, values[i + 1] * scale_inv);
+#if ACOMPUTE_VERSION == 10000 && !FLASHMLA_FUSED_OUTPUT_CHANNELWISE
+                const uint16_t* fp8_table = kSm80SignedFp8Table.words;
+                if constexpr (kZeroNanAtPack) {
+                    // The positive finite reciprocal sends a pruned NaN (+0)
+                    // to FP8 +0. For infinite amax, the reference multiplier
+                    // is -Inf and either the original NaN or +0 produces NaN.
+                    if (zero_nan_at_pack && __float_as_uint(amax) < 0x7f800000u) {
+                        fp8_table = kSm80ZeroNanFp8Table.words;
+                    }
+                }
+#endif
+                bool use_normal_pack = false;
+#if ACOMPUTE_VERSION == 10000 && !FLASHMLA_FUSED_OUTPUT_CHANNELWISE
+                if constexpr (kUseNormalPack) {
+                    if (bounded_finite) {
+                        auto* bytes_as_words = reinterpret_cast<uint32_t*>(packed);
+                        if constexpr (kSaturatingPack) {
+                            const uint32_t half_offset = uint32_t(960 + 8 * exponent) * 16u - 8u;
+                            const uint32_t paired_offset = half_offset | (half_offset << 16);
+                            #pragma unroll
+                            for (int i = 0; i < 32; i += 4)
+                                bytes_as_words[i / 4] = sm80_pack_four_saturating(values + i, paired_offset);
+                            use_normal_pack = true;
+                        } else {
+                            const uint32_t normal_threshold = uint32_t(121 + exponent) << 23;
+                            if (magnitude_min >= normal_threshold || all_zero_block) {
+                                constexpr uint32_t half_minus_one = 0x7ffffu;
+                                const uint32_t exponent_bias = all_zero_block ? 0u : uint32_t(960 + 8 * exponent);
+                                const uint32_t rounding_bias = half_minus_one - (exponent_bias << 20);
+                                #pragma unroll
+                                for (int i = 0; i < 32; i += 4)
+                                    bytes_as_words[i / 4] = sm80_pack_four_normal(values + i, rounding_bias);
+                                use_normal_pack = true;
+                            }
+                        }
+                    }
+                }
+#endif
+                if (!use_normal_pack) {
+                    #pragma unroll
+                    for(int i = 0; i < 32; i += 2) {
+#if ACOMPUTE_VERSION == 10000 && !FLASHMLA_FUSED_OUTPUT_CHANNELWISE
+                        if constexpr (Base::kIsPrefill && Base::kArch == 80 && !Norm) {
+                            const uint32_t low = sm80_signed_fp8_from_float(values[i] * scale_inv, fp8_table);
+                            const uint32_t high = sm80_signed_fp8_from_float(values[i + 1] * scale_inv, fp8_table);
+                            pairs[i / 2] = uint16_t(low | (high << 8));
+                        } else
+#endif
+                        {
+                            // Keep the existing converters for the other paths.
+                            pairs[i / 2] = splitkv::fp8_pair_from_float(
+                                values[i] * scale_inv, values[i + 1] * scale_inv);
+                        }
+                    }
                 }
                 const int group = head / 8;
                 const int in_group = head & 7;
