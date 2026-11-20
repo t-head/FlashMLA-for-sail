@@ -227,6 +227,19 @@ template<int HeadDim, int Arch>
 inline constexpr bool kHs64PrefillFourQueryGroups<
     Hs64PrefillFourQueryTraits<HeadDim, Arch>> = true;
 
+template<typename T, typename KvOffset>
+struct Hs64KvOffsetTraits : T {
+    using kv_offset_t = KvOffset;
+};
+template<typename T, typename KvOffset>
+inline constexpr int kPackedMain<Hs64KvOffsetTraits<T, KvOffset>> = kPackedMain<T>;
+template<typename T, typename KvOffset>
+inline constexpr Hs64Worklist kWorklist<Hs64KvOffsetTraits<T, KvOffset>> = kWorklist<T>;
+template<typename T, typename KvOffset>
+inline constexpr bool kPackedExtraStep<Hs64KvOffsetTraits<T, KvOffset>> = kPackedExtraStep<T>;
+template<typename T, typename KvOffset>
+inline constexpr bool kHs64PrefillFourQueryGroups<Hs64KvOffsetTraits<T, KvOffset>> =
+    kHs64PrefillFourQueryGroups<T>;
 
 // WG1 owns both odd-K copy groups on SM89 D512 prefill and full-tile decode,
 // and on D576. WG0 publishes completion of its old odd-low PV readers first.
@@ -2845,14 +2858,14 @@ __forceinline__ __device__ void compute_K_addr_bf16(
     int tile_valid = valid_len - effective_block * kBlockN;
 
     // Interleave the two metadata halves inside each 8-lane copy group. Lanes
-    // 0..3 own pass 0 and lanes 4..7 own pass 1; one 32-bit xor4 shuffle shares
-    // the other pass's 16-byte-atom offset. The invalid sentinel carries valid.
+    // 0..3 own pass 0 and lanes 4..7 own pass 1. XOR4 exchanges the two offsets.
     // The downstream 8 lanes x 16 B contiguous 128 B copy remains unchanged.
     static_assert(kBlockN == 64 && T::kGmemPasses == 2 && T::kGmemThrPerTok == 8,
                   "the one-pass offset mapping requires the M64 copy layout");
     static_assert(T::kGmemElemsPerLoad == 8 && sizeof(InputT) == 2,
                   "one-pass copy offsets are encoded in 16-byte atoms");
-    constexpr unsigned int kInvalidAtom = ~0u;
+    using AtomOffset = typename T::kv_offset_t;
+    constexpr AtomOffset kInvalidAtom = ~AtomOffset{0};
     const int lane = tidx & 31;
     const int warp = tidx >> 5;
     const int pair = lane >> 3;
@@ -2899,22 +2912,22 @@ __forceinline__ __device__ void compute_K_addr_bf16(
         }
     }
 
-    unsigned int meta_atom = kInvalidAtom;
+    AtomOffset meta_atom = kInvalidAtom;
     if constexpr (T::kIsPrefill && T::kArch == 89 && T::kHasExtraKTile &&
                   !T::kMultiPrefillHeadTiles) {
         // Unsigned arithmetic is safe for invalid indices; select the sentinel
         // afterward to avoid an execution-mask flush during pending K copies.
-        const unsigned int row_atom = static_cast<unsigned int>(
+        const AtomOffset row_atom = static_cast<AtomOffset>(
             static_cast<size_t>(t_idx) * k_stride_elems / T::kGmemElemsPerLoad);
-        meta_atom = row_atom | (0u - static_cast<unsigned int>(!meta_valid));
+        meta_atom = row_atom | (AtomOffset{0} - static_cast<AtomOffset>(!meta_valid));
     } else if constexpr (kPackedMain<T> != 0) {
         if (meta_valid)
-            meta_atom = static_cast<unsigned>(t_idx) * (kBytesPerToken / kAddressUnitBytes);
+            meta_atom = static_cast<AtomOffset>(t_idx) * (kBytesPerToken / kAddressUnitBytes);
     } else if (meta_valid) {
         if constexpr (T::kIsPrefill) {
             // One-token pages: preserve the real padded row stride without
             // the decode page split or its packed-page runtime branch.
-            meta_atom = static_cast<unsigned int>(
+            meta_atom = static_cast<AtomOffset>(
                 static_cast<size_t>(t_idx) * k_stride_elems * sizeof(InputT)
                 / kAddressUnitBytes);
         } else {
@@ -2924,8 +2937,7 @@ __forceinline__ __device__ void compute_K_addr_bf16(
                 & (k_stride_elems == static_cast<size_t>(page_block_size)
                     * (kBytesPerToken / sizeof(InputT)));
             if (linear_pages) {
-                // Preserve the original uint32 atom narrowing, with no page split.
-                meta_atom = static_cast<unsigned int>(t_idx)
+                meta_atom = static_cast<AtomOffset>(t_idx)
                     * (kBytesPerToken / kAddressUnitBytes);
             } else {
                 int page_idx    = t_idx >> __builtin_ctz(page_block_size);
@@ -2933,16 +2945,19 @@ __forceinline__ __device__ void compute_K_addr_bf16(
                 size_t row_elem_offset =
                     static_cast<size_t>(page_idx) * k_stride_elems
                     + static_cast<size_t>(off_in_page) * (kBytesPerToken / sizeof(InputT));
-                meta_atom = static_cast<unsigned int>(
+                meta_atom = static_cast<AtomOffset>(
                     row_elem_offset * sizeof(InputT) / kAddressUnitBytes);
             }
         }
     }
 
-    const unsigned int peer_atom =
-        __shfl_xor_sync(0xffffffff, meta_atom, 4);
-    const unsigned int atom0 = owns_pass1 ? peer_atom : meta_atom;
-    const unsigned int atom1 = owns_pass1 ? meta_atom : peer_atom;
+    AtomOffset peer_atom = __shfl_xor_sync(0xffffffff, static_cast<uint32_t>(meta_atom), 4);
+    if constexpr (sizeof(AtomOffset) > sizeof(uint32_t)) {
+        const uint32_t high = __shfl_xor_sync(0xffffffff, static_cast<uint32_t>(meta_atom >> 32), 4);
+        peer_atom |= static_cast<uint64_t>(high) << 32;
+    }
+    const AtomOffset atom0 = owns_pass1 ? peer_atom : meta_atom;
+    const AtomOffset atom1 = owns_pass1 ? meta_atom : peer_atom;
     is_valid[0] = (atom0 != kInvalidAtom);
     is_valid[1] = (atom1 != kInvalidAtom);
     const size_t lane_atom = static_cast<size_t>(lane & 7);
@@ -3011,20 +3026,17 @@ __forceinline__ __device__ void compute_K_addr_bf16(
     }
 
     if constexpr (PREFETCH_K && !T::kIsPrefill && !T::kV41FP8) {
-        // Keep the uniform 64-bit base plus vector 32-bit offset used by
-        // the address pipeline. Non-bulk L2 hints preserve lane addresses
-        // without changing the real async-copy request geometry.
-        // The range check only skips the hint; actual copies stay full-width.
+        // The optional prefetch hint accepts a narrow byte offset.
         constexpr unsigned kAtomLimit = 0x0fffffffu
             - T::kNumKTiles * T::kGmemThrPerTok;
         CUTLASS_PRAGMA_UNROLL
         for (int pass = 0; pass < T::kGmemPasses; ++pass) {
-            const unsigned atom = pass == 0 ? atom0 : atom1;
-            if (atom <= kAtomLimit) {
+            const AtomOffset atom = pass == 0 ? atom0 : atom1;
+            if (static_cast<uint64_t>(atom) <= kAtomLimit) {
                 CUTLASS_PRAGMA_UNROLL
                 for (int tile = 0; tile < T::kNumKTiles; ++tile) {
                     const unsigned byte_offset =
-                        (atom + static_cast<unsigned>(lane_atom)
+                        (static_cast<unsigned>(atom) + static_cast<unsigned>(lane_atom)
                          + tile * T::kGmemThrPerTok) * 16u;
                     __ppu_prefetch_nonebulk_L2(
                         reinterpret_cast<char*>(k_base_ptr)
@@ -6516,7 +6528,12 @@ static void launch_flash_sparse_decode_wg_hs64(Flash_fwd_params &params, hggcStr
     static_assert(T::kUsePv2x4,
                   "HS64 instances use the shared PV 2x4 layout");
 
-    auto mla_kernel = &flash_sparse_decode_wg_kernel_hs64<T, AllowExtra>;
+    const bool narrow = T::kV41FP8
+        ? sparse_decode_hs64_v41_kv_offsets_fit_u32(params, T::kExtraFP4)
+        : sparse_decode_hs64_kv_offsets_fit_u32(params);
+    auto mla_kernel = narrow
+        ? &flash_sparse_decode_wg_kernel_hs64<Hs64KvOffsetTraits<T, uint32_t>, AllowExtra>
+        : &flash_sparse_decode_wg_kernel_hs64<Hs64KvOffsetTraits<T, typename T::index_t>, AllowExtra>;
     constexpr size_t smem_size =
         std::max(sizeof(typename T::SharedMemoryPlan),
                  sizeof(typename T::SharedMemoryOutPut));
@@ -6626,7 +6643,11 @@ template<int HeadDim, int Arch, bool GroupQueries, bool MultiHeadTiles>
 static void launch_sparse_prefill_hs64(SparsePrefillParams &params) {
     using T = Hs64PrefillTraits<HeadDim, Arch, GroupQueries, MultiHeadTiles>;
 
-    auto kernel = &flash_sparse_prefill_fwd_hs64<T>;
+    const bool narrow = sparse_decode_hs64_cache_range_supported(
+        params.s_kv, 1, HeadDim, params.stride_kv_s_kv);
+    auto kernel = narrow
+        ? &flash_sparse_prefill_fwd_hs64<Hs64KvOffsetTraits<T, uint32_t>>
+        : &flash_sparse_prefill_fwd_hs64<Hs64KvOffsetTraits<T, typename T::index_t>>;
     constexpr size_t smem_size =
         std::max(sizeof(typename T::SharedMemoryPlan),
                  sizeof(typename T::SharedMemoryOutPut));
@@ -6650,7 +6671,11 @@ template<int HeadDim, int Arch>
 static void launch_sparse_prefill_hs64_four_queries(SparsePrefillParams &params) {
     using T = Hs64PrefillFourQueryTraits<HeadDim, Arch>;
     static_assert(kHs64PrefillGroupedQueries<T> && !T::kMultiPrefillHeadTiles);
-    auto kernel = &flash_sparse_prefill_fwd_hs64<T>;
+    const bool narrow = sparse_decode_hs64_cache_range_supported(
+        params.s_kv, 1, HeadDim, params.stride_kv_s_kv);
+    auto kernel = narrow
+        ? &flash_sparse_prefill_fwd_hs64<Hs64KvOffsetTraits<T, uint32_t>>
+        : &flash_sparse_prefill_fwd_hs64<Hs64KvOffsetTraits<T, typename T::index_t>>;
     constexpr size_t smem_size =
         std::max(sizeof(typename T::SharedMemoryPlan),
                  sizeof(typename T::SharedMemoryOutPut));
