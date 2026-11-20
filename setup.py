@@ -152,7 +152,7 @@ ext_modules.append(
 
 
 FLASHMLA_VERSION = '2.1.0'  # FlashMLA version
-RELEASE_VERSION = 'v1.0.0'  # Release version
+RELEASE_VERSION = 'v1.1.0'  # Release version
 
 
 def get_ppu_sdk_version():

@@ -4,7 +4,7 @@ name: flashmla checkin     # Workflow name, shown on the Actions page
 on:
   workflow_dispatch:                                       # manual trigger from the web UI or API
   pull_request:
-    branches: ['main']                                       # PRs targeting main
+    branches: ['main', 'release/*']                          # PRs targeting main or a release branch
     types: [opened, synchronize, reopened]
   # push:
   #   branches: ['feature/add-ci-workflow']                                       # uncomment for debugging
