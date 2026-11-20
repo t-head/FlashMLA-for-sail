@@ -1243,6 +1243,8 @@ struct Hs64NoPvPrimedWork {
     __forceinline__ __device__ void operator()() const {}
 };
 
+struct Hs64NoPvPeer {};
+
 // Compute O += PV, where P resides in shared memory
 template <
     typename T,
@@ -1250,14 +1252,16 @@ template <
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
-    typename AfterFirstP = Hs64NoPvPrimedWork>
+    typename AfterFirstP = Hs64NoPvPrimedWork,
+    typename PeerP = Hs64NoPvPeer, typename PeerV = Hs64NoPvPeer>
 __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
     Tensor<Engine0, Layout0> &sP,
     Tensor<Engine1, Layout1> &sKV_half, // (HEAD_DIM_V/2, BLOCK_N)
     Tensor<Engine2, Layout2> &rO,       // ((2, 2, 32), 1, 1)
     int idx_in_warpgroup,
     int warp_idx,
-    AfterFirstP after_first_p = {}, bool narrow_main_tail = false)
+    AfterFirstP after_first_p = {}, bool narrow_main_tail = false,
+    PeerP* peer_p = nullptr, PeerV* peer_v = nullptr)
 {
     typename T::TiledMmaPV tiled_mma;
     // P is the A operand (M x K only): fold the N-warp out with % kAtomLayoutM.
@@ -1343,6 +1347,46 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
                 cute::copy(smem_tiled_copy_P, tSsP(_, _, k), cP1(_, _, _0{}));
             }
         };
+        if constexpr (!std::is_same_v<PeerP, Hs64NoPvPeer>) {
+            static_assert(T::kArch == 80 && T::kIsPrefill && !PRIME_FIRST_P);
+            auto peer_descriptor = make_tensor(peer_p->data(), typename T::SmemLayoutPTsm{});
+            auto tSsPeerP = smem_thr_copy_P.partition_S(make_mix_tensor_like(peer_descriptor));
+            auto tSsPeerV = smem_thr_copy_Vt.partition_S(make_mix_tensor_like(*peer_v));
+            CUTE_STATIC_ASSERT_V(size(tSsPeerP) == size(tSsP));
+            CUTE_STATIC_ASSERT_V(size(tSsPeerV) == size(tSsVt));
+
+            auto load_next = [&](auto k, auto& cP, auto& cV) {
+                constexpr int ki = decltype(k)::value;
+                if constexpr (ki < kReductionSlices) {
+                    cute::copy(smem_tiled_copy_P, tSsP(_, _, k), cP(_, _, _0{}));
+                    cute::copy(smem_tiled_copy_Vt, tSsVt(_, _, k), cV(_, _, _0{}));
+                } else {
+                    auto offset = Int<ki - kReductionSlices>{};
+                    cute::copy(smem_tiled_copy_P, tSsPeerP(_, _, offset), cP(_, _, _0{}));
+                    cute::copy(smem_tiled_copy_Vt, tSsPeerV(_, _, offset), cV(_, _, _0{}));
+                }
+            };
+            // Continue the existing K16 prefetch across the two P/V tiles.
+            // Both tiles were published by the same CTA barrier. Keep the
+            // local tile's four products before the peer tile's four products.
+            load0(_0{});
+            for_each(make_int_sequence<2 * kReductionSlices>{}, [&](auto k) {
+                constexpr int ki = decltype(k)::value;
+                if constexpr (ki + 1 < 2 * kReductionSlices) {
+                    if constexpr ((ki & 1) == 0) {
+                        load_next(Int<ki + 1>{}, cP1, cV1);
+                    } else {
+                        load_next(Int<ki + 1>{}, cP0, cV0);
+                    }
+                }
+                if constexpr ((ki & 1) == 0) {
+                    cute::gemm(tiled_mma, rP0(_, _, _0{}), rV0(_, _, _0{}), rO);
+                } else {
+                    cute::gemm(tiled_mma, rP1(_, _, _0{}), rV1(_, _, _0{}), rO);
+                }
+            });
+            return;
+        }
         if constexpr (kPackedMain<T> == 256 && !PRIME_FIRST_P) {
             if (narrow_main_tail) {
                 load0(_0{});
@@ -2038,6 +2082,7 @@ __forceinline__ __device__ void wg1_bunch_0_pre(
 template<
     typename T,
     bool IS_BLK0_LAST,
+    bool PUBLISH_MAX = true,
     typename Engine5, typename Layout5,
     typename EngineVI, typename LayoutVI>
 __forceinline__ __device__ void wg1_bunch_0_pre_crosscut(
@@ -2112,8 +2157,10 @@ __forceinline__ __device__ void wg1_bunch_0_pre_crosscut(
             }
         }
         r_cur_max[local_row_idx] = cur_max;
-        if (idx_in_warpgroup % 4 == 0) {
-            smem_cross_n_reduction[((int)(threadIdx.x >> 8) * 2 + warp_n_idx) * T::kBlockM + row_idx] = cur_max;
+        if constexpr (PUBLISH_MAX) {
+            if (idx_in_warpgroup % 4 == 0) {
+                smem_cross_n_reduction[((int)(threadIdx.x >> 8) * 2 + warp_n_idx) * T::kBlockM + row_idx] = cur_max;
+            }
         }
     }
 
@@ -5385,6 +5432,18 @@ __forceinline__ __device__ void hs64_attention(
         // CTA barrier publishes them before the query loop reaches output.
         T::cache_prefill_sink(params, tidx);
     }
+    constexpr bool kAlignedQWithSink = [] {
+        if constexpr (Hs64HasFusedHooks<T>::value) return T::kAlignedQWithSink;
+        return false;
+    }();
+    constexpr bool kSinglePrefillPair = [] {
+        if constexpr (Hs64HasFusedHooks<T>::value) return T::kSinglePrefillPair;
+        return false;
+    }();
+    static_assert(!kSinglePrefillPair || (T::kIsPrefill && T::kArch == 80 && !ALLOW_EXTRA
+                  && !kHs64PrefillGroupedQueries<T> && !T::kV41FP8 && T::kBlockN == 64));
+    constexpr bool kSharedPairMax = kSinglePrefillPair && kAlignedQWithSink &&
+        kDeferPrefillSink && T::kIsCrossCut && T::kUsePv2x4;
     constexpr bool kWaitQBeforePrologBarrier =
         kHs64PrefillGroupedQueries<T> || kHs64FusedPackedFp4<T>
         || (Hs64HasFusedHooks<T>::value && T::kIsPrefill && T::kArch == 80);
@@ -5471,12 +5530,16 @@ __forceinline__ __device__ void hs64_attention(
             }
         }
         const int total_k = seqlen_kpad + cute::round_up(extra_seqlen_k, kBlockN * 2);
-        const int start_block_idx = batch_idx == begin_idx ? begin_seqlen / kBlockN : 0;
+        const int start_block_idx = !kSinglePrefillPair && batch_idx == begin_idx
+            ? begin_seqlen / kBlockN : 0;
         int end_block_idx = batch_idx == end_idx
             ? cute::round_up(end_seqlen, kBlockN * 2) / kBlockN
             : total_k / kBlockN;
-        if constexpr (T::kIsPrefill || kPackedMain<T> != 0 || kHs64FusedDirectQueries<T>)
+        if constexpr (kSinglePrefillPair) {
+            end_block_idx = 2;
+        } else if constexpr (T::kIsPrefill || kPackedMain<T> != 0 || kHs64FusedDirectQueries<T>) {
             end_block_idx = total_k / kBlockN;
+        }
         const bool is_no_split = T::kIsPrefill || kPackedMain<T> != 0 || kHs64FusedDirectQueries<T> ||
             (start_block_idx == 0 && end_block_idx == (total_k / kBlockN));
 
@@ -5546,7 +5609,10 @@ __forceinline__ __device__ void hs64_attention(
             }
             _out[1] = -1;
         };
-        if (warpgroup_idx == 0) {
+        if constexpr (kSinglePrefillPair) {
+            if (warpgroup_idx == 0) prefetch_tok(0, pre_token_idx0, batch_idx);
+            else prefetch_tok(1, pre_token_idx1, batch_idx);
+        } else if (warpgroup_idx == 0) {
             // WG0: prolog loads block0 (uses idx0), main loop first loads nxt_block0=block2, nxt_block1=block3
             // idx0: prefetch block0 (prolog), will be updated to block2 by prolog load
             // idx1: prefetch block3 (first main loop nxt_block1)
@@ -5577,7 +5643,32 @@ __forceinline__ __device__ void hs64_attention(
         int prolog_vi_wg0 = (start_block_idx / 2) % 2;       // 0 or 1
         int prolog_vi_wg1 = 2 + (start_block_idx / 2) % 2;    // 2 or 3
         constexpr int kNumTiles = T::kNumKTiles;
-        {
+        if constexpr (kSinglePrefillPair) {
+            static_assert(kNumTiles == 8);
+            auto load_pair_half = [&](auto& buffer, auto even, int* tokens, int vi,
+                                      __mbarrier_t* barriers) {
+                constexpr bool kEven = decltype(even)::value;
+                constexpr int kBlock = kEven ? 0 : 1;
+                InputT* pointers[T::kGmemPasses];
+                bool valid[T::kGmemPasses];
+                // S=0 publishes validity. The high and low loads consume the
+                // same two token pointers and retain their separate commits.
+                compute_K_addr_bf16<0, false, T>(params, batch_idx, kBlock, 2 * kBlockN,
+                    idx_in_warpgroup, -1, smem_valid_indices, vi, tokens, 0, pointers, valid);
+                issue_K_load_bf16<T::kStage1KTiles, kNumTiles, false, T,
+                                 false, !kEven || T::kUseEvenHighBank>(
+                    params, buffer, batch_idx, kBlock, 2 * kBlockN, &barriers[1],
+                    idx_in_warpgroup, -1, pointers, valid, tokens, 2, 2, 0);
+                issue_K_load_bf16<0, T::kStage1KTiles, false, T, false, kEven>(
+                    params, buffer, batch_idx, kBlock, 2 * kBlockN, &barriers[0],
+                    idx_in_warpgroup, -1, pointers, valid, tokens, 2, 2, 0);
+            };
+            if (warpgroup_idx == 0) {
+                load_pair_half(cur_sK0, std::true_type{}, pre_token_idx0, prolog_vi_wg0, barriers_K0);
+            } else {
+                load_pair_half(cur_sK1, std::false_type{}, pre_token_idx1, prolog_vi_wg1, barriers_K1);
+            }
+        } else {
             if (warpgroup_idx == 0) {
                 if (start_block_idx < end_block_idx) {
                     // wg0 loads block 0: stage 1 (tiles 0-3 → buf 0) + stage 2 (tiles 4-8 → buf 1)
@@ -5793,7 +5884,123 @@ __forceinline__ __device__ void hs64_attention(
             }
         }
 
-        if (warpgroup_idx == 0) {
+        if constexpr (kSharedPairMax) {
+            static_assert(T::kBlockM == 64 && T::kAtomLayoutM == 4 &&
+                          T::kAtomLayoutN == 2 && T::kUseEvenHighBank &&
+                          !T::kHasExtraKTile && !T::kParkQ5Fragment);
+            Tensor rP = partition_fragment_C(tiled_mma,
+                Shape<Int<T::kBlockM>, Int<T::kBlockN>>{});
+            cute::clear(rP);
+            if (warpgroup_idx == 0) {
+                warpgroup_cooperative_qkt_gemm<T, 1, false, true>(
+                    sQ, cur_sK0, cur_sK0, rP, rQ8, rQ6, rQ4, rQlow0,
+                    barriers_K0, cur_phase_K0, idx_in_warpgroup);
+            } else {
+                warpgroup_cooperative_qkt_gemm<T, 1, true>(
+                    sQ, cur_sK1, cur_sK1, rP, rQ8, rQ6, rQ4, rQlow0,
+                    barriers_K1, cur_phase_K1, idx_in_warpgroup);
+            }
+
+            T::template scale_fused_scores<T>(rP, idx_in_warpgroup, fused_q_norm);
+            float partial_max[2];
+            const unsigned no_valid_preload[2] = {};
+            wg1_bunch_0_pre_crosscut<T, false, false>(
+                partial_max, rP, params.scale_softmax_log2, idx_in_warpgroup,
+                smem_valid_indices, warpgroup_idx == 0 ? prolog_vi_wg0 : prolog_vi_wg1,
+                smem_cross_n_reduction, no_valid_preload);
+
+            static_assert(offsetof(SharedMemoryPlan, smem_cross_n_reduction) % alignof(float2) == 0);
+            constexpr int pairs_per_group = T::kBlockM / 2;
+            const int lane = idx_in_warpgroup & 31;
+            const int warp_m = (idx_in_warpgroup / 32) % T::kAtomLayoutM;
+            const int warp_n = idx_in_warpgroup / (32 * T::kAtomLayoutM);
+            const int row0 = get_AorC_row_idx<T::kAtomLayoutM>(0, idx_in_warpgroup);
+            const int row_pair = 8 * warp_m + (lane >> 2);
+            auto* max_pairs = reinterpret_cast<float2*>(smem_cross_n_reduction);
+            const bool leader = (lane & 3) == 0;
+            if (leader) {
+                max_pairs[(2 * warpgroup_idx + warp_n) * pairs_per_group + row_pair] =
+                    make_float2(partial_max[0], partial_max[1]);
+            }
+            __ppu_barrier_sync(0, T::NUM_THREADS, 15u);
+
+            // The two rows of each group are adjacent in the published tile.
+            float row_max_pair[2] = {MAX_INIT_VAL_SM, MAX_INIT_VAL_SM};
+            if (leader) {
+                const int peer_n = (2 * warpgroup_idx + (1 - warp_n)) * pairs_per_group + row_pair;
+                const int peer_wg = 2 * (1 - warpgroup_idx) * pairs_per_group + row_pair;
+                const float2 local_peer = max_pairs[peer_n];
+                const float2 remote0 = max_pairs[peer_wg];
+                const float2 remote1 = max_pairs[peer_wg + pairs_per_group];
+                const float scale = params.scale_softmax_log2;
+                const float local0 = max(partial_max[0], local_peer.x) * scale;
+                const float local1 = max(partial_max[1], local_peer.y) * scale;
+                const float other0 = max(remote0.x, remote1.x) * scale;
+                const float other1 = max(remote0.y, remote1.y) * scale;
+                row_max_pair[0] = max(row_max_pair[0], max(local0, other0));
+                row_max_pair[1] = max(row_max_pair[1], max(local1, other1));
+                if (warpgroup_idx == 0 && warp_n == 0) {
+                    sM(row0) = row_max_pair[0];
+                    sM(row0 + 8) = row_max_pair[1];
+                }
+            }
+            Tensor rPb = make_tensor<InputT>(rP.layout());
+            CUTLASS_PRAGMA_UNROLL
+            for (int mi = 0; mi < 2; ++mi) {
+                const int row = row0 + 8 * mi;
+                const float row_max = __shfl_sync(0xffffffff, row_max_pair[mi], lane & ~3);
+                float row_sum = 0.0f;
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 2 * mi; i < size(rP); i += 4) {
+                    const float p0 = exp2f(hs64_acc<T>(rP, i) - row_max);
+                    const float p1 = exp2f(hs64_acc<T>(rP, i + 1) - row_max);
+                    hs64_acc<T>(rPb, i) = InputT(p0);
+                    hs64_acc<T>(rPb, i + 1) = InputT(p1);
+                    row_sum += p0 + p1;
+                }
+                row_sum += __shfl_xor_sync(0xffffffff, row_sum, 1);
+                row_sum += __shfl_xor_sync(0xffffffff, row_sum, 2);
+                if ((lane & 3) == 0) {
+                    if (warp_n == 0) {
+                        sL_reduction_wksp[128 * warpgroup_idx + row] = row_sum;
+                    } else if (warpgroup_idx == 0) {
+                        sScale0(row) = row_sum;
+                    } else {
+                        sScale1(row) = row_sum;
+                    }
+                }
+            }
+
+            Tensor local_p = warpgroup_idx == 0 ? sP0 : sP1;
+            save_rP1_to_sP<T>(rPb, local_p, idx_in_warpgroup);
+            // The CTA barrier publishes both BF16 P tiles and all sum
+            // partials. Each WG can now issue its two PV products.
+            __ppu_barrier_sync(0, T::NUM_THREADS, 15u);
+            auto v0 = make_tensor(cur_sK0.data(), typename T::SmemLayoutVDirect{});
+            auto v1 = make_tensor(cur_sK1.data(), typename T::SmemLayoutVDirect{});
+            const int wg_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
+            if (warpgroup_idx == 0) {
+                auto v0_left = get_half_V<T, 0>(v0);
+                auto v1_left = get_half_V<T, 0>(v1);
+                warpgroup_cooperative_pv_gemm_remoteP<T>(
+                    sP0, v0_left, rO, idx_in_warpgroup, wg_idx,
+                    Hs64NoPvPrimedWork{}, false, &sP1, &v1_left);
+            } else {
+                auto v1_right = get_half_V<T, 1>(v1);
+                auto v0_high = local_tile(cur_sK0,
+                    Shape<Int<T::kBlockN>, _64>{}, Coord<_0, Int<4>>{});
+                auto v0_right = make_tensor(v0_high.data(), typename T::SmemLayoutVtHigh4{});
+                warpgroup_cooperative_pv_gemm_remoteP<T>(
+                    sP1, v1_right, rO, idx_in_warpgroup, wg_idx,
+                    Hs64NoPvPrimedWork{}, false, &sP0, &v0_right);
+            }
+            if (tidx < 2 * T::kBlockM) {
+                const int row = tidx % T::kBlockM;
+                const bool first_wg = tidx < T::kBlockM;
+                const int sum_idx = row + (first_wg ? 0 : 128);
+                sL_reduction_wksp[sum_idx] += first_wg ? sScale0(row) : sScale1(row);
+            }
+        } else if (warpgroup_idx == 0) {
             // Warpgroup 0
             Tensor rP0 = partition_fragment_C(tiled_mma, Shape<Int<T::BLOCK_SIZE_M>, Int<T::kBlockN>>{});  // MMA, MMA_M, MMA_K
             const int wg_idx = __builtin_ppu_to_uniform_b32(idx_in_warpgroup / 32);
@@ -5820,7 +6027,7 @@ __forceinline__ __device__ void hs64_attention(
 
             int first_vi_preload_wg0 = 1 - (start_block_idx / 2) % 2;
             int first_vi_preload_wg1 = 3 - (start_block_idx / 2) % 2;
-            if constexpr (!ALLOW_EXTRA) {
+            if constexpr (!ALLOW_EXTRA && !kSinglePrefillPair) {
                 compute_K_addr_bf16<0, false, T>(
                     params, batch_idx, start_block_idx + 2, seqlen_k,
                     idx_in_warpgroup, ori_block_max, smem_valid_indices,
@@ -5831,7 +6038,7 @@ __forceinline__ __device__ void hs64_attention(
                     idx_in_warpgroup, ori_block_max, smem_valid_indices,
                     first_vi_preload_wg1, pre_token_idx1, extra_seqlen_k,
                     precomp_ptr1, precomp_valid1);
-            } else {
+            } else if constexpr (ALLOW_EXTRA) {
                 bool init_load_extra =
                     (ori_block_max >= 0) &&
                     (start_block_idx + 2 >= ori_block_max);
@@ -5923,7 +6130,7 @@ __forceinline__ __device__ void hs64_attention(
 
             // Precompute initial addresses for first iteration
 
-            if constexpr (!ALLOW_EXTRA) {
+            if constexpr (!ALLOW_EXTRA && !kSinglePrefillPair) {
                 compute_K_addr_bf16<4, false, T>(
                     params, batch_idx, start_block_idx + 3, seqlen_k,
                     idx_in_warpgroup, ori_block_max, smem_valid_indices, 0,
@@ -5934,7 +6141,7 @@ __forceinline__ __device__ void hs64_attention(
                     idx_in_warpgroup, ori_block_max, smem_valid_indices, 0,
                     pre_token_idx0, extra_seqlen_k, precomp_ptr1_wg1,
                     precomp_valid1_wg1);
-            } else {
+            } else if constexpr (ALLOW_EXTRA) {
                 bool init_load_extra =
                     (ori_block_max >= 0) &&
                     (start_block_idx + 3 >= ori_block_max);
@@ -6017,16 +6224,18 @@ __forceinline__ __device__ void hs64_attention(
         }
 
         // Reduce rL across threads within the same warp
-        rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 1);
-        rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 2);
-        rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 1);
-        rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 2);
+        if constexpr (!kSharedPairMax) {
+            rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 1);
+            rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 2);
+            rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 1);
+            rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 2);
+        }
 
         int my_row = get_AorC_row_idx<T::kAtomLayoutM>(0, idx_in_warpgroup);
 
         // Cross-N rL reduction: (4,2) splits the N columns across two N-warps,
         // so each row's rL is the sum of two partials.
-        if constexpr (T::kIsCrossCut) {
+        if constexpr (T::kIsCrossCut && !kSharedPairMax) {
             int warp_n_idx = (idx_in_warpgroup / 32) / T::kAtomLayoutM;
             int wg_idx_cn = (int)(threadIdx.x >> 8);
             if constexpr (T::kUsePv2x4) {
@@ -6104,9 +6313,11 @@ __forceinline__ __device__ void hs64_attention(
                 pre_sink1 = __ldg(params.attn_sink_ptr + q_head_idx_1);
             }
         }
-        if (idx_in_warpgroup % 4 == 0 && (idx_in_warpgroup / 32) < T::kAtomLayoutM) {
-            sL_reduction_wksp[my_row + warpgroup_idx * 128] = rL[0];
-            sL_reduction_wksp[my_row + 8 + warpgroup_idx * 128] = rL[1];
+        if constexpr (!kSharedPairMax) {
+            if (idx_in_warpgroup % 4 == 0 && (idx_in_warpgroup / 32) < T::kAtomLayoutM) {
+                sL_reduction_wksp[my_row + warpgroup_idx * 128] = rL[0];
+                sL_reduction_wksp[my_row + 8 + warpgroup_idx * 128] = rL[1];
+            }
         }
         __syncthreads();
 
@@ -6136,7 +6347,8 @@ __forceinline__ __device__ void hs64_attention(
             }
         }
 
-        const bool defer_prefill_sink = kDeferPrefillSink && params.attn_sink_ptr != nullptr;
+        const bool defer_prefill_sink = kDeferPrefillSink &&
+            (kAlignedQWithSink || params.attn_sink_ptr != nullptr);
         float rL_pv[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         bool target_pv_empty[4] = {false, false, false, false};
         bool target_row0_empty = false, target_row1_empty = false;
@@ -6301,7 +6513,7 @@ __forceinline__ __device__ void hs64_attention(
             }
 
             // The deferred sink path prunes after applying its scale.
-            if (!kDeferPrefillSink || params.attn_sink_ptr == nullptr) {
+            if (!defer_prefill_sink) {
                 CUTLASS_PRAGMA_UNROLL
                 for (int idx = 0; idx < size(rO); ++idx) {
                     if (rO(idx) != rO(idx)) rO(idx) = 0.0f;

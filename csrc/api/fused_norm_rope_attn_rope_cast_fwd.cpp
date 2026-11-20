@@ -139,6 +139,14 @@ void launch_fused(const Params& p) {
         }
     }
     if constexpr (Mode == FwdMode::Prefill && Heads == 64) {
+        if constexpr (!EnableNorm && !Params::per_token_scale) {
+            if (p.arch == 80 && p.s_q == 1 && p.topk == 640
+                && p.topk_length == nullptr && (reinterpret_cast<uintptr_t>(p.kv) & 15) == 0
+                && p.stride_kv_s_kv % 8 == 0) {
+                fused::core_attn::run_fused_norm_rope_attn_rope_cast_prefill_small<false>(p);
+                return;
+            }
+        }
         if ((p.arch == 89 || (p.arch == 80 && !EnableNorm)) &&
             p.topk >= 128 && p.topk % 128 == 0) {
             fused::core_attn::run_fused_norm_rope_attn_rope_cast_prefill_hs64<EnableNorm>(p);
