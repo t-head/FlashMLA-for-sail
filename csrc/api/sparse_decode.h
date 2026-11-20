@@ -62,6 +62,7 @@ static bool use_v41_packed_h64(const Flash_fwd_params &p) {
     const bool fixed_window = p.topk == 128 && p.page_block_size == 128;
     const bool ragged_window = p.topk == 256 && p.page_block_size == 256;
     if ((!fixed_window && !ragged_window) || p.ngroups != 64 || p.h != 1 ||
+        p.num_blocks <= 0 || p.extra_num_blocks <= 0 ||
         p.d != 512 || p.d_v != 512 || p.extra_topk != 512 || p.extra_page_block_size != 64 ||
         p.k_batch_stride != p.page_block_size * 528 || p.extra_k_batch_stride != 64 * extra_bytes ||
         p.b <= 0 || p.b > 65535 || p.num_sm_parts <= 0)
@@ -73,12 +74,7 @@ static bool use_v41_packed_h64(const Flash_fwd_params &p) {
         p.q_batch_stride <= 0 || p.q_batch_stride % 8 != 0 ||
         p.q_row_stride < p.d || p.q_row_stride > max_stride || p.q_row_stride % 8 != 0 ||
         p.indices_batch_stride < 0 || p.indices_row_stride < 0 || p.indices_row_stride > max_stride ||
-        p.extra_indices_batch_stride < 0 || p.extra_indices_row_stride < 0 || p.extra_indices_row_stride > max_stride ||
-        !flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
-            p.num_blocks, p.page_block_size, 528, 8, p.k_batch_stride) ||
-        !flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
-            p.extra_num_blocks, p.extra_page_block_size, extra_bytes,
-            ExtraFP4 ? 4 : 8, p.extra_k_batch_stride))
+        p.extra_indices_batch_stride < 0 || p.extra_indices_row_stride < 0 || p.extra_indices_row_stride > max_stride)
         return false;
 
     const auto *device = at::cuda::getCurrentDeviceProperties();
