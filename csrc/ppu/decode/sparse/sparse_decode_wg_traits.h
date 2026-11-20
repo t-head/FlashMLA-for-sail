@@ -380,6 +380,7 @@ struct Hs64BaseTraits {
     static constexpr int kArch = Arch;
     using InputT = cutlass::bfloat16_t;
     using ElementAccum = float;
+    using index_t = Flash_fwd_params::index_t;
 
     static constexpr int kBlockN = Config::BLOCK_SIZE_N;
     static constexpr int kHeadDimV = Config::HEAD_DIM_V;
@@ -450,6 +451,7 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
 
     using Base = Hs64BaseTraits<Arch>;
     using InputT = typename Base::InputT;
+    using kv_offset_t = std::conditional_t<IsV41FP8, uint32_t, typename Base::index_t>;
 
     // Unchecked prefetch is reserved for the host-selected full-tile path.
     static constexpr bool kGuardIndices = GuardIndices;
