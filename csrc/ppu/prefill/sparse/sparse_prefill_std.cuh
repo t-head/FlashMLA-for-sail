@@ -32,6 +32,8 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const PrefillParams params) {
         static_assert(Kernel_traits::kFusedSmallPrefill && HAVE_TOPK_LENGTH && !SINGLE_KV);
     }
 
+    // Fused M8 is selected only for SM80; other targets use the M16 path.
+    if constexpr (!kFusedSmallPrefill || !Kernel_traits::USE_MMA_M8 || ACOMPUTE_VERSION == 10000) {
     static_assert(CrossCut);
     static_assert(!SINGLE_KV || (Kernel_traits::kStages == 2 && !Kernel_traits::Share_Q_K_smem));
     using Element = typename Kernel_traits::Element;
@@ -543,6 +545,7 @@ flash_sparse_prefill_fwd_kernel(__grid_constant__ const PrefillParams params) {
         );
     }
 
+    } // SM80 fused M8 target guard
 }
 
 } // namespace flash

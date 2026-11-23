@@ -170,6 +170,7 @@ bool run_fused_norm_rope_attn_rope_cast_decode_native_wi_impl(
     flashmla::dsa::v41::launch_sparse_decode_wg_v41_main<T>(p, params.stream);
 
     combine::Params c{};
+    c.arch = params.arch;
     c.per_token_scale = PerTokenScale;
     c.s_q = params.s_q;
     c.h_q = 128;

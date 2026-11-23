@@ -30,7 +30,7 @@ def prefill(
     """
     A fused kernel for Q Norm + Q RoPE + Core Attn (sparse attention) + O RoPE + O cast to FP8, for DeepSeek-V4.1
     Only support PPU sm80 / sm89 architectures.
-    H8 is supported on SM89 with positive topk divisible by 64 and 16-byte-aligned KV rows.
+    H8 requires positive topk divisible by 64 and 16-byte-aligned KV rows.
 
     Args (Norm):
         enable_q_norm: bool, whether to apply Q RMSNorm
@@ -44,8 +44,8 @@ def prefill(
 
     Args (Cast):
         n_wv_group: n_wv_group during o projection
-        num_per_channels: 32 for per-32 UE8M0 scales; 4096 for one FP32 scale
-            per token/WV group (SM89). Both formats are supported in the same build.
+        num_per_channels: runtime output quantization granularity; 32 for blockwise UE8M0 scales,
+            or 4096 for one FP32 scale per token/WV group. Both are supported by the same extension.
         use_tma_aligned_col_major_sf: True for per-32; False for per-token FP32 scales
         round_sf: True for per-32; False for per-token FP32 scales
         use_packed_ue8m0: True for per-32; False for per-token FP32 scales
@@ -109,7 +109,6 @@ def decode(
     """
     Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4.1
     Only support PPU sm80 / sm89 architectures.
-    H8 is supported on SM89.
 
     The batch size is always 1, and the batch dimension is not included in any tensor shape below.
 
@@ -125,8 +124,8 @@ def decode(
 
     Args (Cast):
         n_wv_group: n_wv_group during o projection
-        num_per_channels: 32 for per-32 UE8M0 scales; 4096 for one FP32 scale
-            per token/WV group (SM89). Both formats are supported in the same build.
+        num_per_channels: runtime output quantization granularity; 32 for blockwise UE8M0 scales,
+            or 4096 for one FP32 scale per token/WV group. Both are supported by the same extension.
         use_tma_aligned_col_major_sf: True for per-32; False for per-token FP32 scales
         round_sf: True for per-32; False for per-token FP32 scales
         use_packed_ue8m0: True for per-32; False for per-token FP32 scales
@@ -134,15 +133,17 @@ def decode(
     Args (Core Attn):
         q: [s_q, h_q, d_qk], bfloat16
             Already permuted by permute_q_b_proj
-        k_cache: [num_blocks, page_block_size, h_kv, bytes_per_token], fp8_e4m3 (or int8/uint8). h_kv must be 1. Paged quantized KV cache. The format is
-            detected from bytes_per_token: 528 (V4.1 fp8) or 288 (V4.1 with fp4 e2m1 + per-16 e4m3 scales; only valid for `extra_k_cache`).
-            Each token stores its raw data followed by its scales. See tests/quant.py for the layouts
+        k_cache: [num_blocks, page_block_size, 1, 528]. Paged V4.1 KV cache with data followed by scales.
+            On SM80, int8 selects INT8/INT4 and float8_e4m3fn selects FP8/FP4. A uint8 main cache
+            uses FP8/FP4 when extra_k_cache has dtype float8_e4m3fn; otherwise it uses INT8/INT4.
         indices_in_kvcache: [s_q, topk], int32. Page-relative KV token indices
         sm_scale: float, scaling factor for attention scores
         d_v: value dimension, must be 512
         attn_sink: optional, [h_q], float32. Per-head attention sink bias
         topk_length: optional, [s_q], int32. Actual valid topk count of the request
-        extra_k_cache: optional, [extra_num_blocks, extra_page_block_size, h_kv, bytes_per_token]. Secondary paged KV cache; it uses the fp8_e4m3 format of `k_cache`, or the fp4 e2m1 / per-16 e4m3 format (288 bytes per token), which is only allowed here
+        extra_k_cache: optional, [extra_num_blocks, extra_page_block_size, 1, bytes_per_token].
+            Uses the main cache's encoding family, with 528 bytes per token for 8-bit data or 288 for packed 4-bit data.
+            Raw uint8 storage inherits the main cache's encoding.
         extra_indices_in_kvcache: optional, [s_q, extra_topk], int32. Indices into the extra KV cache
         extra_topk_length: optional, [s_q], int32. Actual valid extra topk count of the request
 

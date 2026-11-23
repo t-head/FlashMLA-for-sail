@@ -12,6 +12,7 @@
 #include <cutlass/numeric_types.h>
 #include <algorithm>
 #include <limits>
+#include <optional>
 
 #include "kerutils/host/host.h"
 #include "kerutils/host/hardware_info.h"
@@ -21,6 +22,22 @@
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+
+inline bool resolve_v41_float_kv(const at::Tensor& kv, const std::optional<at::Tensor>& extra_kv) {
+    const auto dtype = kv.scalar_type();
+    // A byte view carries no encoding. Use the extra cache dtype when it
+    // supplies one; preserve the INT interpretation for two raw byte views.
+    const bool float_kv = dtype == torch::kFloat8_e4m3fn ||
+        (dtype == torch::kUInt8 && extra_kv && extra_kv->scalar_type() == torch::kFloat8_e4m3fn);
+    if (extra_kv) {
+        const auto extra_dtype = extra_kv->scalar_type();
+        const auto expected = float_kv ? torch::kFloat8_e4m3fn : torch::kInt8;
+        TORCH_CHECK(extra_dtype == expected || extra_dtype == torch::kUInt8,
+                    "V4.1 extra KV cache dtype must match the main KV encoding (", expected,
+                    ") or use uint8 storage, got ", extra_dtype);
+    }
+    return float_kv;
+}
 
 static bool use_cross_cut(int num_heads_per_head_k, int batch_size) {
     if (!is_sm89_or_newer()) {

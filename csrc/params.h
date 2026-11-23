@@ -11,12 +11,15 @@
 
 #include <hggc_bf16.h>
 
+inline constexpr bool kDefaultV41FloatKv = false;
+
 struct Flash_fwd_params {
     using index_t = int64_t;
 
     int b, q_orig, seqlen_q, d, d_v;
     int h, h_q, h_h_k_ratio, ngroups;
     bool is_causal;
+    bool v41_float_kv = kDefaultV41FloatKv;
     float scale_softmax, scale_softmax_log2;
     int *__restrict__ cu_seqlens_k;
 

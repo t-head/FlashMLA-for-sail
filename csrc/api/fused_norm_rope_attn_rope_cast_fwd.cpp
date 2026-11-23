@@ -34,8 +34,10 @@ at::Tensor allocate_output_scale_factor(const Params& p, const at::Tensor& like)
     if (p.per_token_scale) {
         return torch::empty({p.s_q, p.n_wv_group, 1}, like.options().dtype(torch::kFloat32));
     }
-    return allocate_scale_factor(p.s_q, p.wv_group_size * 512, 32, like,
-                                 p.n_wv_group).transpose(0, 1);
+    const int64_t words = p.wv_group_size * 512 / (32 * 4);
+    const int64_t aligned_rows = (int64_t(p.s_q) + 3) / 4 * 4;
+    return torch::empty_strided({p.s_q, p.n_wv_group, words},
+        {1, aligned_rows * words, aligned_rows}, like.options().dtype(torch::kInt32));
 }
 
 Params make_fused_params(
@@ -94,11 +96,10 @@ Params make_fused_params(
     _check_optional_tensor(topk_length, check_device);
     check_device(token_positions);
     check_device(cos_sin_cache);
-    const auto [major, minor] = get_compute_capability(q.get_device());
+    const auto* device_props = at::cuda::getDeviceProperties(q.get_device());
+    const int major = device_props->major;
+    const int minor = device_props->minor;
     TORCH_CHECK(major == 8 && (minor == 0 || minor == 9), "Fused attention requires PPU SM80 or SM89");
-    TORCH_CHECK(q.size(1) != 8 || minor == 9, "H8 fused attention requires PPU SM89");
-    TORCH_CHECK(!per_token_scale || minor == 9,
-                "Per-token FP32 output scales currently require PPU SM89");
 
     Params p{};
     p.arch = minor == 9 ? 89 : 80;
@@ -138,7 +139,16 @@ void launch_fused(const Params& p) {
         }
     }
     if constexpr (Mode == FwdMode::Prefill && Heads == 64) {
-        if (p.arch == 89 && p.topk >= 128 && p.topk % 128 == 0) {
+        if constexpr (!EnableNorm) {
+            if (p.arch == 80 && !p.per_token_scale && p.s_q == 1 && p.topk == 640
+                && p.topk_length == nullptr && (reinterpret_cast<uintptr_t>(p.kv) & 15) == 0
+                && p.stride_kv_s_kv % 8 == 0) {
+                fused::core_attn::run_fused_norm_rope_attn_rope_cast_prefill_small<false>(p);
+                return;
+            }
+        }
+        if ((p.arch == 89 || (p.arch == 80 && !EnableNorm)) &&
+            p.topk >= 128 && p.topk % 128 == 0) {
             fused::core_attn::run_fused_norm_rope_attn_rope_cast_prefill_hs64<EnableNorm>(p);
             return;
         }
@@ -177,25 +187,17 @@ template<int Heads, bool EnableNorm, bool ExtraFP4>
 void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
     Params p = raw;
     const int sm_count = logical_sm_count();
-    if constexpr (Heads == 8) {
-        if (p.s_q >= 1 && p.topk == 128 && p.extra_topk == 512
-            && !p.topk_length && !p.extra_topk_length) {
-            // Complete-query CTAs avoid metadata and combine launches. Bound
-            // the resident grid by the query count so tiny batches stay nonempty.
-            const fused::core_attn::SplitKVParams direct{
-                nullptr, nullptr, std::min(p.s_q, 2 * sm_count), nullptr, nullptr};
-            fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<
-                Heads, EnableNorm, ExtraFP4>(p, direct);
-            return;
-        }
-    }
     if constexpr (Heads == 64) {
         constexpr int extra_bytes = ExtraFP4 ? 288 : 528;
         const auto aligned = [](const void* ptr) { return reinterpret_cast<uintptr_t>(ptr) % 16 == 0; };
-        const bool small_complete_query = !EnableNorm && ExtraFP4 && p.per_token_scale
-            && p.s_q > 0 && p.s_q < sm_count && p.topk == 128
+        const bool packed_arch = (p.arch == 89 && sm_count == 39) ||
+            (p.arch == 80 && sm_count == 20 && !EnableNorm && ExtraFP4 &&
+             !p.per_token_scale && p.topk == 128 &&
+             !p.topk_length && !p.extra_topk_length);
+        const bool small_complete_query = p.arch == 89 && !EnableNorm && ExtraFP4
+            && p.per_token_scale && p.s_q > 0 && p.s_q < sm_count && p.topk == 128
             && !p.topk_length && !p.extra_topk_length;
-        if (p.arch == 89 && sm_count == 39 && (p.s_q >= sm_count || small_complete_query) && p.s_q <= 65535
+        if (packed_arch && (p.s_q >= sm_count || small_complete_query) && p.s_q <= 65535
             && (p.topk == 128 || p.topk == 256) && p.page_block_size == p.topk
             && p.stride_kv_s_kv == int64_t(p.page_block_size) * 528
             && p.extra_topk == 512 && p.extra_page_block_size == 64
@@ -214,9 +216,13 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
     if constexpr (Heads == 64 && !EnableNorm) {
         const auto aligned = [](const void* ptr) { return reinterpret_cast<uintptr_t>(ptr) % 16 == 0; };
         const auto pow2 = [](int size) { return size > 0 && (size & (size - 1)) == 0; };
-        const bool pure_swa = p.per_token_scale && !p.extra_kv
+        const bool pure_swa = p.arch == 89 && p.per_token_scale && !p.extra_kv
             && p.extra_topk == 0 && !p.extra_topk_length;
-        if (p.arch == 89 && sm_count == 39 && p.s_q >= sm_count && p.s_q <= 65535
+        const bool direct_arch = (p.arch == 89 && sm_count == 39) ||
+            (p.arch == 80 && ExtraFP4 && !p.per_token_scale
+                && !p.topk_length && !p.extra_topk_length
+                && p.stride_kv_s_kv % 16 == 0 && p.stride_extra_kv_block % 16 == 0);
+        if (direct_arch && p.s_q >= sm_count && p.s_q <= 65535
             && p.topk == 128 && (pure_swa || (ExtraFP4 && p.extra_topk == 512))
             && pow2(p.page_block_size) && (pure_swa || pow2(p.extra_page_block_size))
             && flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
@@ -229,6 +235,65 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
             // cache addressing and in-kernel length clamps. The packed layout
             // gate above keeps priority.
             fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_hs64_direct(p, sm_count);
+            return;
+        }
+    }
+    // Split the uniform H8 workload into equal KV-block intervals, without metadata.
+    const int h8_parts = p.s_q == 1 ? sm_count : 2 * sm_count;
+    const bool h8_static_split =
+        Heads == 8 && !EnableNorm && ExtraFP4 && !p.per_token_scale
+        && p.arch == 80 && p.s_q >= 1
+        && (p.s_q == 1 || p.s_q > h8_parts) && p.s_q < 4 * h8_parts
+        && p.topk == 128 && p.extra_topk == 512
+        && !p.topk_length && !p.extra_topk_length
+        && (p.s_q * 20) % h8_parts == 0;
+    if (h8_static_split) {
+        const auto f32_opts = q.options().dtype(torch::kFloat32);
+        // Keep all transient split-KV storage in one stream-owned allocation.
+        const int accum_rows = p.s_q + h8_parts;
+        const int split_words = (p.s_q + 1 + 63) / 64 * 64;
+        const int lse_words = (accum_rows * Heads + 63) / 64 * 64;
+        auto workspace = torch::empty({int64_t(split_words) + lse_words
+            + int64_t(accum_rows) * Heads * 512}, f32_opts);
+        auto* data = workspace.data_ptr<float>();
+        const fused::core_attn::SplitKVParams split{
+            nullptr, reinterpret_cast<int*>(data), h8_parts,
+            data + split_words, data + split_words + lse_words};
+        fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<
+            Heads, EnableNorm, ExtraFP4>(p, split);
+        return;
+    }
+    if constexpr (Heads == 8 || (Heads == 64 && !EnableNorm && ExtraFP4)) {
+        if (p.s_q >= 1 && p.topk == 128 && p.extra_topk == 512
+            && !p.topk_length && !p.extra_topk_length
+            && (Heads == 8 || (p.arch == 80 && p.extra_kv != nullptr))) {
+            if constexpr (Heads == 64) {
+                // Sixteen complete-query CTAs use the existing direct kernel and epilogue.
+                const bool direct16 = !p.per_token_scale
+                    && p.arch == 80 && p.s_q == 16 && sm_count == 20;
+                if (!direct16 && p.s_q < 8 * sm_count && p.s_q % sm_count != 0) {
+                    const auto f32_opts = q.options().dtype(torch::kFloat32);
+                    const int leading_rows = p.s_q / sm_count * sm_count;
+                    const int active_parts = std::min(sm_count, (p.s_q % sm_count) * 10);
+                    const int accum_rows = leading_rows + active_parts;
+                    const int split_words = (p.s_q + 1 + 63) / 64 * 64;
+                    const int lse_words = (accum_rows * Heads + 63) / 64 * 64;
+                    auto workspace = torch::empty({int64_t(split_words) + lse_words
+                        + int64_t(accum_rows) * Heads * 512}, f32_opts);
+                    auto* data = workspace.data_ptr<float>();
+                    const fused::core_attn::SplitKVParams tail{
+                        nullptr, reinterpret_cast<int*>(data), sm_count,
+                        data + split_words, data + split_words + lse_words};
+                    fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<
+                        Heads, EnableNorm, ExtraFP4>(p, tail);
+                    return;
+                }
+            }
+            // Complete-query CTAs avoid metadata and combine launches.
+            const fused::core_attn::SplitKVParams direct{
+                nullptr, nullptr, std::min(p.s_q, (Heads == 8 ? 2 : 1) * sm_count), nullptr, nullptr};
+            fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<
+                Heads, EnableNorm, ExtraFP4>(p, direct);
             return;
         }
     }
@@ -288,7 +353,7 @@ void launch_fused_decode(const Params& p, const at::Tensor& q) {
             const bool long_extra = p.topk == 64 && p.extra_topk == 2048;
             const bool use_wi = p.arch == 89
                 ? (p.extra_topk == 0 && p.topk <= 128) || long_extra
-                : uniform_topk && !p.extra_fp4 && long_extra;
+                : p.v41_float_kv && uniform_topk && !p.extra_fp4 && long_extra;
             if (use_wi) {
                 launch_fused<FwdMode::Decode, Heads, EnableNorm>(p);
                 return;
@@ -439,6 +504,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
         p.stride_extra_indices_s_q = extra_idx.stride(0);
         p.extra_fp4 = cache.size(3) == 288;
     }
+    p.v41_float_kv = p.arch != 80 || resolve_v41_float_kv(kv, extra_kv);
     TORCH_CHECK(int64_t(p.topk) + p.extra_topk + 63 <= std::numeric_limits<int>::max(),
                 "Combined topk exceeds the kernel index range");
 
