@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <type_traits>
 #include "api/common.h"
+#include "fused_v41_output.cuh"
 #include "fused_v41_wi.cuh"
 #include "decode/sparse/fused_v41_splitkv.cuh"
 #include "decode/sparse/sparse_decode_wg_hs64.cuh"
@@ -80,6 +81,7 @@ __forceinline__ __device__ uint32_t sm80_pack_four_saturating(
 template<bool PerTokenScale>
 struct FusedHs64Params : Flash_fwd_mla_params {
     float rms_norm_eps;
+    OutputFormat output_format = OutputFormat::FP8;
     const int32_t* token_positions;
     const float* cos_sin_cache;
     uint8_t* out_fp8;
@@ -480,6 +482,9 @@ struct FusedHs64Traits : Base {
                 && Base::kHeadDim == 512 && Base::kV41FP8 && Base::kExtraFP4
                 && !Base::kHasExtraKTile && !Base::kParkQ5Fragment));
         const auto& fused = static_cast<const FusedParams&>(params);
+        const OutputFormat output_format = Base::kArch == 80 && !Base::kIsPrefill
+            ? fused.output_format : OutputFormat::FP8;
+        const bool int8_output = output_format == OutputFormat::INT8;
         Tensor rowcol = make_tensor(rO.data(),
             flashmla::dsa::hs64::hs64_convert_layout_acc_rowcol<T>(rO.layout()));
         static_assert(decltype(size<0>(rowcol))::value == 4);
@@ -697,6 +702,19 @@ struct FusedHs64Traits : Base {
                         for (int i = 0; i < 32; ++i) rO(output_cache_half * 32 + i) = values[i];
                     }
                 }
+                const int group = head / 8;
+                const int in_group = head & 7;
+                const int64_t out_offset = int64_t(batch_idx) * (64 * 512)
+                    + group * 4096 + tile * 256 + in_group * 32;
+                if constexpr (!decltype(scan_only)::value) {
+                    if (output_format == OutputFormat::BF16) {
+                        #pragma unroll
+                        for (int i = 0; i < 32; ++i) {
+                            output::store_bf16(fused.out_fp8, out_offset + i, values[i]);
+                        }
+                        return 0.0f;
+                    }
+                }
                 constexpr bool kSaturatingPack = (kZeroNanAtPack && T::kAlignedQWithSink)
                     || T::kMidQSaturatingPack;
                 float amax = 0.0f;
@@ -746,7 +764,7 @@ struct FusedHs64Traits : Base {
                     else
                         scale_inv = __fdividef(1.0f, group_scales[head / 8]);
                 } else {
-                    const float scale = amax / 448.0f;
+                    const float scale = output::quant_scale(amax, output_format);
                     exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
                     scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
                 }
@@ -777,7 +795,11 @@ struct FusedHs64Traits : Base {
                     }
                 }
 #endif
-                if (!use_saturating_pack) {
+                if (int8_output) {
+                    #pragma unroll
+                    for (int i = 0; i < 32; ++i)
+                        packed[i] = output::pack_int8(values[i] * scale_inv);
+                } else if (!use_saturating_pack) {
                     #pragma unroll
                     for(int i = 0; i < 32; i += 2) {
 #if ACOMPUTE_VERSION == 10000
@@ -794,10 +816,6 @@ struct FusedHs64Traits : Base {
                         }
                     }
                 }
-                const int group = head / 8;
-                const int in_group = head & 7;
-                const int64_t out_offset = int64_t(batch_idx) * (64 * 512)
-                    + group * 4096 + tile * 256 + in_group * 32;
                 auto* out = reinterpret_cast<uint4*>(fused.out_fp8 + out_offset);
                 const auto* words = reinterpret_cast<const uint4*>(packed);
                 out[0] = words[0];
@@ -841,7 +859,7 @@ struct FusedHs64Traits : Base {
                 for (int tile_pair = 0; tile_pair < 8; ++tile_pair) {
                     group_amax = fmaxf(group_amax, group_partials[tile_pair * 8 + group]);
                 }
-                const float scale = group_amax / 448.0f;
+                const float scale = output::quant_scale(group_amax, output_format);
                 group_scales[group] = scale;
                 if constexpr (Norm) {
                     reinterpret_cast<float*>(fused.out_sf)[int64_t(batch_idx) * fused.stride_out_sf_token

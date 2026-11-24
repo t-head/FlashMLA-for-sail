@@ -18,6 +18,7 @@ namespace {
 namespace fused = flashmla::fused_norm_rope_attn_rope_cast_fwd;
 using Params = fused::core_attn::Params;
 using FwdMode = fused::core_attn::FwdMode;
+using OutputFormat = fused::core_attn::OutputFormat;
 
 at::Tensor allocate_scale_factor(
     int64_t rows, int64_t hidden_dim, int64_t gran, const at::Tensor& like,
@@ -47,7 +48,7 @@ Params make_fused_params(
     double rms_norm_eps, const at::Tensor& token_positions,
     bool is_rope_neox_style, int64_t rope_dim, const at::Tensor& cos_sin_cache,
     int64_t n_wv_group, int64_t num_per_channels, bool use_tma_aligned_col_major_sf,
-    bool round_sf, bool use_packed_ue8m0) {
+    bool round_sf, bool use_packed_ue8m0, FwdMode mode = FwdMode::Prefill) {
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(attn_sink, 1);
     KU_CHECK_NDIM(topk_length, 1);
@@ -69,13 +70,18 @@ Params make_fused_params(
     TORCH_CHECK(n_wv_group > 0 && q.size(1) % n_wv_group == 0);
     TORCH_CHECK(q.size(1) / n_wv_group == 8, "WV group size must be 8");
     TORCH_CHECK(!is_rope_neox_style && rope_dim == 64);
-    TORCH_CHECK(num_per_channels == 32 || num_per_channels == 4096,
-                "num_per_channels must be 32 (per-32 UE8M0) or 4096 (per-token FP32)");
-    const bool per_token_scale = num_per_channels == 4096;
+    TORCH_CHECK(num_per_channels == 32 || num_per_channels == 4096 ||
+                    (mode == FwdMode::Decode &&
+                     (num_per_channels == -32 || num_per_channels == -4096 || num_per_channels == 0)),
+                "num_per_channels selects FP8 (32 or 4096), INT8 (-32 or -4096, SM80 Decode), "
+                "or BF16 (0, SM80 Decode)");
+    const auto output_format = num_per_channels == 0 ? OutputFormat::BF16 :
+                               num_per_channels < 0 ? OutputFormat::INT8 : OutputFormat::FP8;
+    const bool per_token_scale = num_per_channels == 4096 || num_per_channels == -4096;
     if (per_token_scale) {
         TORCH_CHECK(!use_tma_aligned_col_major_sf && !round_sf && !use_packed_ue8m0,
                     "Per-token output requires row-major, unrounded FP32 scales");
-    } else {
+    } else if (output_format != OutputFormat::BF16) {
         TORCH_CHECK(use_tma_aligned_col_major_sf && round_sf && use_packed_ue8m0);
     }
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
@@ -100,6 +106,8 @@ Params make_fused_params(
     const int major = device_props->major;
     const int minor = device_props->minor;
     TORCH_CHECK(major == 8 && (minor == 0 || minor == 9), "Fused attention requires PPU SM80 or SM89");
+    TORCH_CHECK(output_format == OutputFormat::FP8 || minor == 0,
+                "Fused INT8 and BF16 output require SM80");
 
     Params p{};
     p.arch = minor == 9 ? 89 : 80;
@@ -109,6 +117,7 @@ Params make_fused_params(
     p.sm_scale_log2 = static_cast<float>(sm_scale * LOG_2_E);
     p.enable_q_norm = enable_q_norm;
     p.per_token_scale = per_token_scale;
+    p.output_format = output_format;
     p.rms_norm_eps = static_cast<float>(rms_norm_eps);
     p.q = q.data_ptr();
     p.topk_length = get_optional_tensor_ptr<int32_t>(topk_length);
@@ -453,7 +462,8 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     at::cuda::CUDAGuard guard(q.device());
     auto p = make_fused_params(q, sm_scale, d_v, attn_sink, topk_length, enable_q_norm,
         rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0);
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0,
+        FwdMode::Decode);
     TORCH_CHECK(p.s_q > 0);
     KU_CHECK_NDIM(kv, 4);
     KU_CHECK_NDIM(indices, 2);
@@ -515,18 +525,23 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     TORCH_CHECK(int64_t(p.topk) + p.extra_topk + 63 <= std::numeric_limits<int>::max(),
                 "Combined topk exceeds the kernel index range");
 
-    auto out_fp8 = torch::empty({p.s_q, p.n_wv_group, p.wv_group_size * 512},
-                                q.options().dtype(torch::kFloat8_e4m3fn));
-    auto out_sf = allocate_output_scale_factor(p, q);
+    const bool bf16_output = p.output_format == OutputFormat::BF16;
+    const auto dtype = bf16_output ? torch::kBFloat16 : p.output_format == OutputFormat::INT8
+        ? torch::kInt8 : torch::kFloat8_e4m3fn;
+    auto out = torch::empty({p.s_q, p.n_wv_group, p.wv_group_size * 512}, q.options().dtype(dtype));
+    auto out_sf = bf16_output ? torch::empty({0}, q.options().dtype(torch::kFloat32))
+                             : allocate_output_scale_factor(p, q);
     auto lse = torch::empty({p.s_q, p.h_q}, q.options().dtype(torch::kFloat32));
-    p.out_fp8 = static_cast<uint8_t*>(out_fp8.data_ptr());
-    p.out_sf = reinterpret_cast<uint32_t*>(out_sf.data_ptr());
+    p.out_fp8 = static_cast<uint8_t*>(out.data_ptr());
+    if (!bf16_output) {
+        p.out_sf = reinterpret_cast<uint32_t*>(out_sf.data_ptr());
+        p.stride_out_sf_token = out_sf.stride(0);
+        p.stride_out_sf_group = out_sf.stride(1);
+        p.stride_out_sf_word = out_sf.stride(2);
+    }
     p.lse = lse.data_ptr<float>();
-    p.stride_out_sf_token = out_sf.stride(0);
-    p.stride_out_sf_group = out_sf.stride(1);
-    p.stride_out_sf_word = out_sf.stride(2);
     dispatch_fused_decode(p, q);
-    return {out_fp8, out_sf, lse};
+    return {out, out_sf, lse};
 }
 
 std::vector<at::Tensor> permute_q_b_proj(

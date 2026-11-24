@@ -155,6 +155,10 @@ template<typename T>
 struct Hs64HasFusedHooks<T, std::void_t<decltype(T::kFusedHs64)>>
     : std::bool_constant<T::kFusedHs64> {};
 
+template<typename T, typename = void> inline constexpr bool kHs64LegacyInt8 = false;
+template<typename T>
+inline constexpr bool kHs64LegacyInt8<T, std::void_t<decltype(T::kLegacyInt8)>> = T::kLegacyInt8;
+
 template<typename T>
 inline constexpr bool kHs64FusedDirectQueries = [] {
     if constexpr (Hs64HasFusedHooks<T>::value) return T::kFusedDirectQueries;
@@ -2922,7 +2926,7 @@ __forceinline__ __device__ void compute_K_addr_bf16(
         valid_len = seqlen_k;
         k_base_ptr = reinterpret_cast<InputT*>(params.k_ptr);
         k_stride_elems = static_cast<size_t>(params.k_batch_stride) /
-            (T::kV41FP8 ? sizeof(InputT) : 1);
+            (T::kV41FP8 || kHs64LegacyInt8<T> ? sizeof(InputT) : 1);
     }
     int tile_valid = valid_len - effective_block * kBlockN;
 
@@ -2949,6 +2953,9 @@ __forceinline__ __device__ void compute_K_addr_bf16(
         constexpr int kPageShift = USE_EXTRA ? 6 : (kPackedMain<T> == 256 ? 8 : 7);
         const unsigned int page_count = USE_EXTRA ? params.extra_num_blocks : params.num_blocks;
         meta_valid = static_cast<unsigned int>(t_idx) < (page_count << kPageShift);
+    } else if constexpr (kHs64LegacyInt8<T>) {
+        meta_valid = static_cast<unsigned>(t_idx) <
+                     static_cast<unsigned>(params.num_blocks) * T::kLegacyInt8PageSize;
     } else {
         // Prefill indices are token IDs and may include positive out-of-range
         // sentinels. Each KV token is mapped to a one-token page by the host.
@@ -3100,7 +3107,7 @@ __forceinline__ __device__ void compute_K_addr_bf16(
         }
     }
 
-    if constexpr (PREFETCH_K && !T::kIsPrefill && !T::kV41FP8) {
+    if constexpr (PREFETCH_K && !T::kIsPrefill && !T::kV41FP8 && !kHs64LegacyInt8<T>) {
         // The optional prefetch hint accepts a narrow byte offset.
         constexpr unsigned kAtomLimit = 0x0fffffffu
             - T::kNumKTiles * T::kGmemThrPerTok;
@@ -3455,6 +3462,72 @@ __forceinline__ __device__ void hs64_store_v41_sm80_tile(
     auto packed = recast<uint4>(values);
     *reinterpret_cast<uint4*>(&store(hs64_sm80_store_row(token, dim), dim)) = packed(0);
     *reinterpret_cast<uint4*>(&store(hs64_sm80_store_row(token, dim + 8), dim + 8)) = packed(1);
+}
+
+template<int S, int E, typename T, bool LocalCopy, bool MergeEvenHigh,
+         bool OddLowOnly, bool EvenHighOnly, bool EvenLowOnly,
+         typename TensorSK, typename TensorHigh>
+__forceinline__ __device__ void hs64_store_legacy_int8(
+    const Flash_fwd_mla_params &params, TensorSK &sK_buf, TensorHigh *even_high,
+    const typename T::InputT *token_ptr, bool valid, int tidx) {
+    constexpr bool kV32 = T::kHeadDim == 576;
+    constexpr int kNopeDim = kV32 ? 512 : 448;
+    constexpr int kRopeOffset = kV32 ? 528 : 448;
+    constexpr int kRows = T::kLegacyInt8PageSize;
+    const int lane = tidx & 3;
+    const int token = (tidx >> 3) + ((tidx & 4) ? T::kGmemTokPerPass : 0);
+    const uint8_t *row = reinterpret_cast<const uint8_t*>(token_ptr) - (tidx & 7) * 16;
+    const uint8_t *v40_scales = nullptr;
+    if constexpr (!kV32) {
+        if (valid) {
+            constexpr int kV40PagePitch = (T::kBytesPerToken + 8) * kRows;
+            const auto *base = reinterpret_cast<const uint8_t*>(params.k_ptr);
+            const auto offset = static_cast<uint32_t>(row - base);
+            const auto page_offset = offset / kV40PagePitch * kV40PagePitch;
+            const auto token_in_page = (offset - page_offset) / T::kBytesPerToken;
+            v40_scales = base + page_offset + kRows * T::kBytesPerToken + token_in_page * 8;
+        }
+    }
+    auto store_tile = [&](auto &dst, int tile, int dst_tile) {
+        auto values = make_tensor<typename T::InputT>(Layout<Shape<_16>>{});
+        if (!valid) {
+            cute::clear(values);
+        } else if (tile == kNopeDim / 64) {
+            auto packed = recast<uint4>(values);
+            const uint4 *rope = reinterpret_cast<const uint4*>(row + kRopeOffset) + lane * 2;
+            packed(0) = __ldg(rope);
+            packed(1) = __ldg(rope + 1);
+        } else {
+            auto codes = make_tensor<uint8_t>(Layout<Shape<_16>>{});
+            recast<uint4>(codes)(0) = __ldg(reinterpret_cast<const uint4*>(row + tile * 64) + lane);
+            auto output = make_tensor(values.data(), values.layout());
+            if constexpr (kV32) {
+                const float scale = __ldg(reinterpret_cast<const float*>(row + 512) + tile / 2);
+                flash::int8_to_bf16_fp32_scale(codes, output, scale);
+            } else {
+                const uint8_t raw = __ldg(v40_scales + tile);
+                const auto scale = *reinterpret_cast<const flash::fp8_e8m0*>(&raw);
+                flash::int8_to_bf16(codes, output, float(scale));
+            }
+        }
+        hs64_store_v41_sm80_tile<T>(dst, token, dst_tile * 64 + lane * 16, values);
+    };
+    if constexpr (MergeEvenHigh) {
+        static_assert(LocalCopy && S == 0 && E == 4);
+        if constexpr (!EvenHighOnly) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int tile = 0; tile < 4; ++tile) store_tile(sK_buf, tile, tile);
+        }
+        if constexpr (!EvenLowOnly) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int tile = 4; tile < 8; ++tile) store_tile(*even_high, tile, tile - 4);
+            if constexpr (kV32) store_tile(sK_buf, 8, 8);
+        }
+    } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int tile = S; tile < E; ++tile) store_tile(sK_buf, tile, tile);
+        if constexpr (kV32 && LocalCopy && S == 0 && !OddLowOnly) store_tile(sK_buf, 8, 8);
+    }
 }
 
 template<typename T, bool kSharedStore = false, typename TensorDst>
@@ -3989,7 +4062,13 @@ __forceinline__ __device__ void issue_K_load_bf16(
     using InputT = typename T::InputT;
     constexpr int kBlockN = T::kBlockN;
 
-    if constexpr (T::kV41FP8) {
+    if constexpr (kHs64LegacyInt8<T>) {
+        static_assert(T::kArch == 80 && T::kGmemPasses == 2 && T::kGmemThrPerTok == 8);
+        const int pass = (tidx >> 2) & 1;
+        hs64_store_legacy_int8<S, E, T, LOCAL_COPY_GROUP, MERGE_EVEN_HIGH,
+                             ODD_LOW_ONLY, EVEN_HIGH_ONLY, EVEN_LOW_ONLY>(
+            params, sK_buf, even_high, token_ptr[pass], is_valid[pass], tidx);
+    } else if constexpr (T::kV41FP8) {
         const bool use_extra = kPackedExtraStep<T> ||
             (ori_block_max >= 0 && block_idx_kv >= ori_block_max);
         static_assert(T::kGmemPasses == 2 && T::kGmemThrPerTok == 8);
@@ -6992,16 +7071,21 @@ static void launch_flash_sparse_decode_wg_hs64(Flash_fwd_params &params, hggcStr
     static_assert(T::kUsePv2x4,
                   "HS64 instances use the shared PV 2x4 layout");
 
-    // Keep the original narrow encoding while it still fits, including padded pages.
-    const bool narrow = T::kV41FP8
-        ? sparse_decode_hs64_v41_kv_offsets_fit_u32<true>(params, T::kExtraFP4)
-        : sparse_decode_hs64_kv_offsets_fit_u32(params);
-    auto mla_kernel = narrow
-        ? &flash_sparse_decode_wg_kernel_hs64<Hs64KvOffsetTraits<T, uint32_t>, AllowExtra>
-        : &flash_sparse_decode_wg_kernel_hs64<Hs64KvOffsetTraits<T, typename T::index_t>, AllowExtra>;
-    if constexpr (T::kV41FP8 && kPackedMain<T> == 0) {
-        if (!narrow && sparse_decode_hs64_v41_kv_offsets_fit_u32<false>(params, T::kExtraFP4))
-            mla_kernel = &flash_sparse_decode_wg_kernel_hs64<Hs64RowUnitOffsetTraits<T>, AllowExtra>;
+    auto mla_kernel = &flash_sparse_decode_wg_kernel_hs64<Hs64KvOffsetTraits<T, uint32_t>, AllowExtra>;
+    if constexpr (!kHs64LegacyInt8<T>) {
+        // Keep the original narrow encoding while it still fits, including padded pages.
+        const bool narrow = T::kV41FP8
+            ? sparse_decode_hs64_v41_kv_offsets_fit_u32<true>(params, T::kExtraFP4)
+            : sparse_decode_hs64_kv_offsets_fit_u32(params);
+        if (!narrow) {
+            mla_kernel = &flash_sparse_decode_wg_kernel_hs64<
+                Hs64KvOffsetTraits<T, typename T::index_t>, AllowExtra>;
+            if constexpr (T::kV41FP8 && kPackedMain<T> == 0) {
+                if (sparse_decode_hs64_v41_kv_offsets_fit_u32<false>(params, T::kExtraFP4)) {
+                    mla_kernel = &flash_sparse_decode_wg_kernel_hs64<Hs64RowUnitOffsetTraits<T>, AllowExtra>;
+                }
+            }
+        }
     }
     constexpr size_t smem_size =
         std::max(sizeof(typename T::SharedMemoryPlan),

@@ -105,12 +105,12 @@ def decode(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """
-    Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4.1
+    Fused decoding: Q Norm + Q RoPE + paged attention + O RoPE + output cast for DeepSeek-V4.1.
     Only support PPU sm80 / sm89 architectures.
 
-    The batch size is always 1, and the batch dimension is not included in any tensor shape below.
+    Flatten batch and query positions into the leading s_q token dimension.
 
     Args (Norm):
         enable_q_norm: bool, whether to apply Q RMSNorm
@@ -123,43 +123,51 @@ def decode(
         cos_sin_cache: [num_positions, rope_dim], float32
 
     Args (Cast):
-        n_wv_group: n_wv_group during o projection
-        num_per_channels: runtime output quantization granularity; 32 for blockwise UE8M0 scales,
-            or 4096 for one FP32 scale per token/WV group. Both are supported by the same extension.
-        use_tma_aligned_col_major_sf: True for per-32; False for per-token FP32 scales
-        round_sf: True for per-32; False for per-token FP32 scales
-        use_packed_ue8m0: True for per-32; False for per-token FP32 scales
+        n_wv_group: Number of WV groups, with 8 query heads per group.
+        num_per_channels: Selects the attention output dtype independently of k_cache.dtype.
+            32 gives FP8 (torch.float8_e4m3fn) and -32 gives torch.int8, both with one
+            packed UE8M0 scale per 32 values.
+            4096 gives FP8 and -4096 gives torch.int8, both with one FP32 scale per token
+            per WV group (4096 values).
+            0 gives torch.bfloat16 with out_sf=None. INT8 and BF16 outputs require SM80.
+        use_tma_aligned_col_major_sf: True for ±32. False for ±4096.
+        round_sf: True for ±32. False for ±4096.
+        use_packed_ue8m0: True for ±32. False for ±4096.
+            For num_per_channels == 0, all three scale flags are ignored. Pass False for each.
 
     Args (Core Attn):
-        q: [s_q, h_q, d_qk], bfloat16
-            Already permuted by permute_q_b_proj
+        q: [s_q, h_q, 512], torch.bfloat16. Produced by the Q projection using weights prepared
+            with permute_q_b_proj.
         k_cache: [num_blocks, page_block_size, 1, 528]. Paged V4.1 KV cache with data followed by scales.
-            On SM80, int8 selects INT8/INT4 and float8_e4m3fn selects FP8/FP4. A uint8 main cache
-            uses FP8/FP4 when extra_k_cache has dtype float8_e4m3fn; otherwise it uses INT8/INT4.
-        indices_in_kvcache: [s_q, topk], int32. Page-relative KV token indices
+            On SM80, torch.int8 selects INT8/INT4 and torch.float8_e4m3fn selects FP8/FP4.
+            A torch.uint8 main cache uses FP8/FP4 when extra_k_cache has dtype torch.float8_e4m3fn,
+            and INT8/INT4 otherwise.
+        indices_in_kvcache: [s_q, topk], torch.int32. Each index is page_id * page_block_size + slot.
         sm_scale: float, scaling factor for attention scores
         d_v: value dimension, must be 512
         attn_sink: optional, [h_q], float32. Per-head attention sink bias
         topk_length: optional, [s_q], int32. Actual valid topk count of the request
         extra_k_cache: optional, [extra_num_blocks, extra_page_block_size, 1, bytes_per_token].
             Uses the main cache's encoding family, with 528 bytes per token for 8-bit data or 288 for packed 4-bit data.
-            Raw uint8 storage inherits the main cache's encoding.
+            Raw uint8 storage inherits the main cache's encoding. Pass extra_indices_in_kvcache with it.
         extra_indices_in_kvcache: optional, [s_q, extra_topk], int32. Indices into the extra KV cache
         extra_topk_length: optional, [s_q], int32. Actual valid extra topk count of the request
 
     Returns:
-        - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result (wv_group_size = h_q / n_wv_group)
-        - out_sf: per-32 uses [s_q, n_wv_group, 32] int32 packed UE8M0; per-token uses contiguous [s_q, n_wv_group, 1] float32 dequantization scales
-        - lse: [s_q, h_q], float
+        - out: [s_q, n_wv_group, 8 * d_v], in WV layout and the selected output dtype.
+          Contains the attention result after output RoPE and before WV projection.
+        - out_sf: [s_q, n_wv_group, 32] packed int32 UE8M0 for block32, or contiguous
+          [s_q, n_wv_group, 1] float32 for per-token/WV-group scaling. None for BF16.
+        - lse: [s_q, h_q], torch.float32.
     """
-    out_fp8, out_sf, lse = _backend.fused_norm_rope_attn_rope_cast_decode(
+    out, out_sf, lse = _backend.fused_norm_rope_attn_rope_cast_decode(
         q, k_cache, indices_in_kvcache, sm_scale, d_v,
         attn_sink, topk_length,
         extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
         n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0
     )
-    return out_fp8, out_sf, lse
+    return out, out_sf if num_per_channels != 0 else None, lse
 
 
 def permute_q_b_proj(

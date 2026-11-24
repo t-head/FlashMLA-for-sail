@@ -111,11 +111,13 @@ static FusedHs64Params<PerTokenScale> make_fused_hs64_decode_params(const Output
     params.extra_topk = p.extra_kv ? p.extra_topk : -1;
     params.attn_sink_ptr = const_cast<float*>(p.attn_sink);
     params.o_ptr = p.out_fp8;
-    // The shared HS64 body forms its BF16 output view; the hook stores FP8.
-    params.o_row_stride = 512 / sizeof(cutlass::bfloat16_t);
+    // The shared HS64 body expresses output strides in BF16 elements.
+    params.o_row_stride = p.output_format == OutputFormat::BF16
+        ? 512 : 512 / sizeof(cutlass::bfloat16_t);
     params.o_batch_stride = 64 * params.o_row_stride;
     params.softmax_lse_ptr = p.lse;
     params.rms_norm_eps = p.rms_norm_eps;
+    params.output_format = p.output_format;
     params.token_positions = p.token_positions;
     params.cos_sin_cache = p.cos_sin_cache;
     params.out_fp8 = p.out_fp8;

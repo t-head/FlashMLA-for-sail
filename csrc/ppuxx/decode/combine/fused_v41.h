@@ -18,6 +18,7 @@ struct Params {
     uint32_t* out_sf;
     float* lse;
     bool per_token_scale;
+    core_attn::OutputFormat output_format = core_attn::OutputFormat::FP8;
     int64_t stride_out_sf_token;
     int64_t stride_out_sf_group, stride_out_sf_word;
     hggcStream_t stream;

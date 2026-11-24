@@ -118,9 +118,12 @@ def flash_mla_with_kvcache(
                 Besides, some kernels also have their own requirements on the layout of k cache, including:
                     - For sparse fp8 decoding kernel on F3, k_cache.stride(0) must be a multiple of 656B (V3.2) or 576B (V4). Padding is needed sometimes.
                     - V4.1 stores data and scales per token; no 512-byte page padding is required.
-                    - For packed V4.1 on SM80, int8 selects INT8/INT4 and float8_e4m3fn selects FP8/FP4.
-                      A uint8 main cache uses FP8/FP4 when extra_k_cache is float8_e4m3fn;
-                      otherwise it uses INT8/INT4.
+                    - On SM80, use torch.int8 for packed INT8 KV or torch.float8_e4m3fn for packed
+                      FP8 KV. The last dimension is 656 bytes for V3.2, 584 for V4.0, and 528 for V4.1.
+                      The bytes must already be encoded in the selected format. Use a dtype view
+                      to expose existing packed bytes without converting their values.
+                      A torch.uint8 main cache uses the FP family when extra_k_cache has dtype
+                      torch.float8_e4m3fn, and the INT family otherwise.
         block_table: (batch_size, max_num_blocks_per_seq), torch.int32. Can be None when sparse attention is used.
         cache_seqlens: (batch_size), torch.int32. Can be None when sparse attention is used.
         head_dim_v: Head_dim of v. Must be 512
@@ -128,13 +131,16 @@ def flash_mla_with_kvcache(
         num_splits placeholder: must be "None" (to be compatible with the old interface).
         softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim_k).
         causal: bool. Whether to apply causal attention mask. Only valid for dense attention
-        is_fp8_kvcache: bool.
+        is_fp8_kvcache: Legacy bool in the scheduler configuration. For SM80 packed sparse Decode,
+            k_cache and extra_k_cache determine the KV encoding. Keep this flag consistent when
+            reusing tile_scheduler_metadata.
         indices: (batch_size, seq_len_q, topk). KV indices when sparse attention is enabled.
                     Pay attention that indices_in_kvcache[i][j][k] = (the index of the page block where token t resides) * block_size + (the offset of token t among the page block),
                     where t is the k-th token of the j-th q-sequence in the i-th batch.
         attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
         extra_k_cache and extra_indices_in_kvcache: Optional secondary inputs for MODEL1. V4.1 extra KV
-            uses the main cache's encoding family and can also store 4-bit data at 288 bytes per token.
+            uses the main cache's encoding family. For packed 4-bit extra KV, use 288 bytes per token
+            in torch.uint8 storage. FP8 primary KV pairs with FP4, and INT8 primary KV pairs with INT4.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
         out: Optional contiguous output with shape
             (batch_size, seq_len_q, num_heads_q, head_dim_v). Native FP8 requires
