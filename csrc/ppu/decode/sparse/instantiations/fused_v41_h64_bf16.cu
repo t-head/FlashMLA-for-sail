@@ -128,7 +128,7 @@ static FusedHs64Params<PerTokenScale> make_fused_hs64_decode_params(const Output
 }
 
 // Keep generic KV addressing (kPackedMain == 0); only query ownership differs.
-template<int Arch, bool FloatKV, bool PerTokenScale>
+template<int Arch, bool FloatKV, bool PerTokenScale, bool RowUnits = (Arch == 89)>
 struct FusedHs64DirectTraits : FusedHs64Traits<false,
     flashmla::dsa::hs64::Hs64Traits<512, true, Arch, true, true>, true, false, PerTokenScale> {
     using Base = FusedHs64Traits<false,
@@ -136,6 +136,7 @@ struct FusedHs64DirectTraits : FusedHs64Traits<false,
     using SharedMemoryPlan = typename Base::SharedMemoryPlan;
     static_assert(!PerTokenScale || Arch == 89);
     static constexpr bool kFusedDirectQueries = true;
+    static constexpr bool kUseRowUnits = RowUnits;
     static constexpr bool kV41FloatKV = FloatKV;
     // Consecutive owned queries alternate the existing two RoPE slots.
     static constexpr bool kCachePrefillRope = PerTokenScale;
@@ -147,6 +148,16 @@ static void run_fused_hs64_direct_output(const OutputParams<PerTokenScale>& p, i
     using T = FusedHs64DirectTraits<Arch, FloatKV, PerTokenScale>;
     static_assert(T::kQBarrierThreads == 512);
     const FusedHs64Params<PerTokenScale> params = make_fused_hs64_decode_params<true>(p);
+    if constexpr (Arch == 89) {
+        if (flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
+                p.num_blocks, p.page_block_size, 528, 8, p.stride_kv_s_kv) &&
+            (!p.extra_kv || flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
+                p.extra_num_blocks, p.extra_page_block_size, 288, 4, p.stride_extra_kv_block))) {
+            using Narrow = FusedHs64DirectTraits<Arch, FloatKV, PerTokenScale, false>;
+            launch_fused_hs64_wi<Narrow>(params, grid_rows, p.stream);
+            return;
+        }
+    }
     launch_fused_hs64_wi<T>(params, grid_rows, p.stream);
 }
 
