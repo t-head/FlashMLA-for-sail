@@ -155,6 +155,18 @@ __device__ __forceinline__ void int8_to_bf16(Tensor0 src, Tensor1 dst, float sca
 #endif
 }
 
+template<typename Tensor0, typename Tensor1>
+__device__ __forceinline__ void int8_to_bf16_fp32_scale(Tensor0 src, Tensor1 dst, float scale) {
+    auto values = recast<int8_t>(src);
+    auto output = recast<__ppu_bfloat162>(dst);
+    #pragma unroll
+    for (int i = 0; i < size(output); ++i) {
+        const float lo = float(values[2 * i]) * scale;
+        const float hi = float(values[2 * i + 1]) * scale;
+        output[i] = __float22bfloat162_rn({lo, hi});
+    }
+}
+
 static constexpr int kFp4LutReplicas = 32;
 static constexpr int kFp4LutEntries = 256 * kFp4LutReplicas;
 
@@ -732,7 +744,11 @@ struct KVCacheG2SFP8 {
                 #pragma unroll
                 for (int k = kNumQuantTiles - 1; k >= 0; --k) {
                     cute::copy(s2r_tile_copy_K_nope, tKsK_fp8(_, _, k), tKrK_fp8(_, _, k));
-                    fp8_to_bf16(tKrK_fp8(_, _, k), tKrK_bf16(_, _, k), float(fp8_scale[k]));
+                    if constexpr (FloatKV) {
+                        fp8_to_bf16(tKrK_fp8(_, _, k), tKrK_bf16(_, _, k), float(fp8_scale[k]));
+                    } else {
+                        int8_to_bf16(tKrK_fp8(_, _, k), tKrK_bf16(_, _, k), float(fp8_scale[k]));
+                    }
                     cute::copy(r2s_tile_copy_K_nope, tKrK_bf16(_, _, k), tKsK_bf16(_, _, k));
                 }
             }
@@ -740,7 +756,11 @@ struct KVCacheG2SFP8 {
             #pragma unroll
             for (int k = size<2>(tKrK_fp8) - 1; k >= 0; --k) {
                 cute::copy(s2r_tile_copy_K_nope, tKsK_fp8(_, _, k), tKrK_fp8(_, _, k));
-                fp8_to_bf16(tKrK_fp8(_, _, k), tKrK_bf16(_, _, k), scale[k/2]);
+                if constexpr (FloatKV) {
+                    fp8_to_bf16(tKrK_fp8(_, _, k), tKrK_bf16(_, _, k), scale[k/2]);
+                } else {
+                    int8_to_bf16_fp32_scale(tKrK_fp8(_, _, k), tKrK_bf16(_, _, k), scale[k/2]);
+                }
                 cute::copy(r2s_tile_copy_K_nope, tKrK_bf16(_, _, k), tKsK_bf16(_, _, k));
             }
         }

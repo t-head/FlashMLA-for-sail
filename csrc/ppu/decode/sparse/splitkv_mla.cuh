@@ -1136,7 +1136,7 @@ void run_flash_sparse_decode_fwd(Flash_fwd_params &params, hggcStream_t stream) 
     const int num_m_block = (params.seqlen_q / params.ngroups) * cute::ceil_div(params.ngroups, Kernel_traits::kBlockM);
 
         auto kernel = &flash::flash_sparse_decode_fwd_kernel<Kernel_traits, IsFP8, IsV41FP8, IsExtraFP4, MetadataBlockN>;
-        if constexpr (IsV41FP8) {
+        if constexpr (IsFP8) {
             if (params.v41_float_kv != kDefaultV41FloatKv) {
                 kernel = &flash::flash_sparse_decode_fwd_kernel<
                     Kernel_traits, IsFP8, IsV41FP8, IsExtraFP4, MetadataBlockN, !kDefaultV41FloatKv>;

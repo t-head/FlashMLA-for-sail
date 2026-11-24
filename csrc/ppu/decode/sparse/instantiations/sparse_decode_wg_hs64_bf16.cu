@@ -6,6 +6,22 @@ template void flashmla::dsa::hs64::run_flash_sparse_prefill_fwd_hs64<512, 89>(Sp
 template void flashmla::dsa::hs64::run_flash_sparse_prefill_fwd_hs64<576, 89>(SparsePrefillParams &params);
 
 namespace flashmla::dsa::hs64 {
+
+template<int HeadDim>
+struct Hs64LegacyInt8Decode : Hs64Traits<HeadDim, true, 80> {
+    static constexpr bool kLegacyInt8 = true;
+    static constexpr int kLegacyInt8PageSize = 64;
+    static constexpr int kBytesPerToken = HeadDim == 576 ? 656 : 576;
+};
+
+void run_legacy_int8_decode(Flash_fwd_params &params, hggcStream_t stream) {
+    if (params.d == 576) {
+        launch_flash_sparse_decode_wg_hs64<Hs64LegacyInt8Decode<576>, false>(params, stream);
+    } else {
+        launch_flash_sparse_decode_wg_hs64<Hs64LegacyInt8Decode<512>, false>(params, stream);
+    }
+}
+
 void run_flash_sparse_decode_wg_kernel_hs64(
     Flash_fwd_params &params, hggcStream_t stream,
     bool is_v41_fp8, bool is_extra_fp4) {
@@ -82,7 +98,16 @@ static void run_v41_packed_page_decode_typed(Flash_fwd_params &params, hggcStrea
     launch_flash_sparse_decode_wg_hs64<PackedCodec<128, Hs64Worklist::Single, ExtraFP4>, true>(params, stream);
 }
 
-void run_v41_packed_page_decode(Flash_fwd_params &params, hggcStream_t stream) {
+void run_v41_packed_page_decode(Flash_fwd_params &params, hggcStream_t stream, bool sm80) {
+    if (sm80) {
+        using FloatKV = Hs64PackedDecode<128, Hs64Worklist::Single, 80, true>;
+        using IntKV = Hs64PackedDecode<128, Hs64Worklist::Single, 80, false>;
+        if (params.v41_float_kv)
+            launch_flash_sparse_decode_wg_hs64<FloatKV, true>(params, stream);
+        else
+            launch_flash_sparse_decode_wg_hs64<IntKV, true>(params, stream);
+        return;
+    }
     if (params.extra_k_row_stride == 528)
         run_v41_packed_page_decode_typed<false>(params, stream);
     else

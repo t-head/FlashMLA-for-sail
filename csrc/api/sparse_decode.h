@@ -53,7 +53,28 @@ static int v41_h8_direct_parts(const Flash_fwd_params &p) {
 
 namespace flashmla::dsa::hs64 {
 bool supports_v41_packed_flat_mtp(const Flash_fwd_params &, int extra_bytes);
-void run_v41_packed_page_decode(Flash_fwd_params &, hggcStream_t);
+void run_v41_packed_page_decode(Flash_fwd_params &, hggcStream_t, bool sm80);
+void run_legacy_int8_decode(Flash_fwd_params &, hggcStream_t);
+}
+
+static bool use_sm80_legacy_int8_hs64(const Flash_fwd_params &p) {
+    constexpr int kLegacyInt8PageSize = 64;
+    const auto *device = at::cuda::getCurrentDeviceProperties();
+    const bool fixed_case = p.b == 64 && p.topk == 640;
+    const int cache_bytes = p.d == 576 ? 656 : 584;
+    const auto aligned = [](const void *ptr) {
+        return (reinterpret_cast<uintptr_t>(ptr) & 15u) == 0;
+    };
+    return device->major == 8 && device->minor == 0 && fixed_case &&
+        p.q_orig == 1 && p.ngroups == 64 && p.h == 1 && p.seqlen_q == 64 &&
+        (p.d == 512 || p.d == 576) && p.d_v == 512 &&
+        p.extra_topk < 0 && !p.topk_len_ptr && !p.attn_sink_ptr && p.num_sm_parts > 0 &&
+        p.page_block_size == kLegacyInt8PageSize && p.num_blocks > 0 &&
+        p.k_batch_stride == kLegacyInt8PageSize * cache_bytes &&
+        uint64_t(p.num_blocks) * p.k_batch_stride <= std::numeric_limits<uint32_t>::max() &&
+        p.q_row_stride == p.d && p.q_batch_stride == 64 * p.d &&
+        p.o_row_stride == p.d_v && p.o_batch_stride == 64 * p.d_v &&
+        aligned(p.q_ptr) && aligned(p.k_ptr) && aligned(p.o_ptr);
 }
 
 template<bool ExtraFP4 = true>
@@ -78,6 +99,12 @@ static bool use_v41_packed_h64(const Flash_fwd_params &p) {
         return false;
 
     const auto *device = at::cuda::getCurrentDeviceProperties();
+    if (device->major == 8 && device->minor == 0) {
+        return ExtraFP4 && fixed_window && p.q_orig == 1 && p.b >= 40 &&
+               !p.topk_len_ptr && !p.extra_topk_len_ptr &&
+               p.o_batch_stride > 0 && p.o_batch_stride % 8 == 0 &&
+               p.o_row_stride >= p.d_v && p.o_row_stride <= max_stride && p.o_row_stride % 8 == 0;
+    }
     const int sm_count = device->multiProcessorCount;
     if (device->major != 8 || device->minor != 9 || sm_count != 39) return false;
     if constexpr (ExtraFP4) {
@@ -314,7 +341,8 @@ sparse_attn_decode_interface(
         TORCH_CHECK(extra_kv->stride(-1) == 1,
                     "BF16 extra_kv must have contiguous head dimension");
     }
-    const bool v41_float_kv = is_v41_fp8 &&
+    // Match the fused SM80 path's encoding convention for packed KV.
+    const bool v41_float_kv = is_fp8 &&
         (cc_major != 8 || cc_minor != 0 || resolve_v41_float_kv(kv, extra_kv));
 
     const int topk = indices.size(-1);
@@ -527,15 +555,14 @@ sparse_attn_decode_interface(
         params.k_batch_stride = kv.stride(0);
         params.v_batch_stride = vcache.stride(0);
     }
+    const bool legacy_int8_hs64 = is_fp8 && !is_v41_fp8 && !v41_float_kv && !enable_batch_invariant &&
+        use_sm80_legacy_int8_hs64(params);
     at::Tensor hs64_metadata, hs64_num_splits_t;
-    if (!packed_h64 && !packed_fp8_extra_h64 && is_v41_fp8 &&
+    if (legacy_int8_hs64 || (!packed_h64 && !packed_fp8_extra_h64 && is_v41_fp8 &&
         flashmla::dsa::sparse_decode_hs64_v41_supported(params, is_extra_fp4) &&
-        is_sm89_or_newer()) {
-        // HS64 advances by 128 tokens, but the cached metadata (Phase 1 above)
-        // uses sparse_decode_metadata_block_size_n(ngroups, is_fp8), which is
-        // 64 whenever is_fp8 is true -- i.e. exactly the case HS64 requires
-        // (is_v41_fp8 is only ever set inside `if (is_fp8)`). The cached
-        // 64-token schedule cannot simply be handed over to HS64.
+        is_sm89_or_newer())) {
+        // The default packed-cache scheduler advances by 64 tokens. HS64
+        // consumes the separate cached schedule with a 128-token quantum.
         //
         // Previously this branch rebuilt that 128-token schedule on EVERY call,
         // i.e. once per layer, even though all layers sharing one
@@ -613,7 +640,9 @@ sparse_attn_decode_interface(
         params.num_sm_parts = h8_direct_parts;
         flashmla::dsa::v41::run_h8_fp8_fp4_direct(params, stream);
     } else if (packed_h64 || packed_fp8_extra_h64) {
-        flashmla::dsa::hs64::run_v41_packed_page_decode(params, stream);
+        flashmla::dsa::hs64::run_v41_packed_page_decode(params, stream, cc_major == 8 && cc_minor == 0);
+    } else if (legacy_int8_hs64) {
+        flashmla::dsa::hs64::run_legacy_int8_decode(params, stream);
     } else if (is_fp8) {
         if (head_size == 576) {
             run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 576, 512, false>(params, stream);
