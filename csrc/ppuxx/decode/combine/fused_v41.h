@@ -7,7 +7,7 @@
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::combine {
 
 struct Params {
-    int s_q, h_q, num_sm_parts;
+    int s_q, h_q, num_sm_parts, arch;
     const int* num_splits;
     const float* lse_accum;
     const float* o_accum;

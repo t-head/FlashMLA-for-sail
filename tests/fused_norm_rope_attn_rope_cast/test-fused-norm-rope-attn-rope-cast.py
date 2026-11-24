@@ -442,13 +442,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     lib.stick_unit_test_args(parser)
     parser.add_argument("--h-q", type=int, nargs="+", choices=[8, 64, 128], default=[128, 64],
-                        help="Head counts to test (H8 requires SM89)")
+                        help="Head counts to test")
     parser.add_argument("--output-scale", choices=("block32", "per-token"), default="block32",
                         help="Output FP8 scale format; per-token uses one FP32 scale per WV group")
     args = parser.parse_args()
     output_scale_gran = 4096 if args.output_scale == "per-token" else 32
-    if 8 in args.h_q and torch.cuda.get_device_capability() != (8, 9):
-        parser.error("--h-q 8 requires SM89")
 
     correctness_cases_prefill = []
     correctness_cases_decode = []

@@ -32,6 +32,7 @@ struct Params {
     int64_t stride_extra_kv_block;
     int64_t stride_extra_indices_s_q;
     bool extra_fp4;
+    bool v41_float_kv = kDefaultV41FloatKv;
     int n_wv_group, wv_group_size;
     uint8_t* out_fp8;
     uint32_t* out_sf;

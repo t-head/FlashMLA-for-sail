@@ -31,7 +31,8 @@ flash_sparse_decode_fwd_h8_fp8_fp4_direct_kernel(__grid_constant__ const Flash_f
         // Each CTA owns complete queries and writes BF16 output directly.
         const int batch = token / params.q_orig;
         const int query = token % params.q_orig;
-        flash::compute_attn_fp8_sparse_splitkv<H8DirectTraits, true, true, true>(
+        flash::compute_attn_fp8_sparse_splitkv<H8DirectTraits, true, true, true,
+            /*AbsoluteSplitIndex=*/false, /*FloatKV=*/true>(
             params, batch, 0, query, 0, 0, (kMainTopK + kExtraTopK) / kBlockN,
             true, kMainTopK, kMainTopK / kBlockN, kExtraTopK);
         __syncthreads();

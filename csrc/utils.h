@@ -526,7 +526,7 @@ CUTLASS_DEVICE void permute_output_fp8(Fragment &out) {
 #endif
 }
 
-template<typename Kernel_traits, bool Split, bool CrossCut = false, bool IsSparse = false, bool UniqueLseWriter = false, typename AccO, typename Softmax>
+template<typename Kernel_traits, bool Split, bool CrossCut = false, bool IsSparse = false, bool UniqueLseWriter = false, bool AbsoluteSplitIndex = false, typename AccO, typename Softmax>
 __forceinline__ __device__ void store(const Flash_fwd_params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
                                       __shared__ char* smem_,  AccO acc_o, Softmax softmax) {
 
@@ -547,7 +547,7 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
     const int tidx = threadIdx.x;
 
     // Epilogue
-    const int split_offset = __ldg(params.num_splits_ptr + bidb);
+    const int split_offset = AbsoluteSplitIndex ? 0 : __ldg(params.num_splits_ptr + bidb);
 
     // fp8 V-direct: permute acc_o into the EpiPerm order that TiledMmaStoreEpiO below
     // maps back to natural columns; row-wise lse/normalization is unaffected by it.

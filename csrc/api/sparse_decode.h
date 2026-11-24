@@ -314,6 +314,8 @@ sparse_attn_decode_interface(
         TORCH_CHECK(extra_kv->stride(-1) == 1,
                     "BF16 extra_kv must have contiguous head dimension");
     }
+    const bool v41_float_kv = is_v41_fp8 &&
+        (cc_major != 8 || cc_minor != 0 || resolve_v41_float_kv(kv, extra_kv));
 
     const int topk = indices.size(-1);
     CHECK_DEVICE(indices);
@@ -368,6 +370,7 @@ sparse_attn_decode_interface(
     params.h_h_k_ratio = num_heads / num_heads_k;
     params.ngroups = ngroups;
     params.is_causal = false;
+    params.v41_float_kv = v41_float_kv;
     params.topk = topk;
 
     params.d = head_size;

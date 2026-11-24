@@ -2,16 +2,17 @@
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
-template<bool Norm, bool ExtraFP4, int MainCapacity, flashmla::dsa::hs64::Hs64Worklist Worklist, bool PerTokenScale>
+template<bool Norm, bool ExtraFP4, int MainCapacity, flashmla::dsa::hs64::Hs64Worklist Worklist, int Arch, bool FloatKV, bool PerTokenScale>
 struct FusedHs64PackedTraits
     : FusedHs64Traits<Norm, std::conditional_t<ExtraFP4,
-        flashmla::dsa::hs64::Hs64PackedDecode<MainCapacity, Worklist>,
+        flashmla::dsa::hs64::Hs64PackedDecode<MainCapacity, Worklist, Arch, FloatKV>,
         flashmla::dsa::hs64::Hs64PackedFp8ExtraWorklist<MainCapacity, Worklist>>,
         ExtraFP4 || (!Norm && MainCapacity == 128 &&
             Worklist != flashmla::dsa::hs64::Hs64Worklist::Batch), false, PerTokenScale> {
+    static_assert(Arch == 89 || (!Norm && ExtraFP4 && MainCapacity == 128 && !PerTokenScale));
     // Flat uses 39 CTAs, so its next query always selects the other RoPE slot.
     static constexpr bool kCachePrefillRope =
-        !Norm && ExtraFP4 && MainCapacity == 128 && PerTokenScale &&
+        Arch == 89 && !Norm && ExtraFP4 && MainCapacity == 128 && PerTokenScale &&
         Worklist == flashmla::dsa::hs64::Hs64Worklist::Flat;
     static constexpr bool kFp8LeaderPrefetch =
         !Norm && !ExtraFP4 && MainCapacity == 128 && Worklist == flashmla::dsa::hs64::Hs64Worklist::Flat;
@@ -21,11 +22,11 @@ struct FusedHs64PackedTraits
 
 namespace flashmla::dsa::hs64 {
 
-template<bool Norm, bool ExtraFP4, int MainCapacity, Hs64Worklist Worklist, bool PerTokenScale>
-inline constexpr int kPackedMain<fused_norm_rope_attn_rope_cast_fwd::core_attn::FusedHs64PackedTraits<Norm, ExtraFP4, MainCapacity, Worklist, PerTokenScale>> = MainCapacity;
+template<bool Norm, bool ExtraFP4, int MainCapacity, Hs64Worklist Worklist, int Arch, bool FloatKV, bool PerTokenScale>
+inline constexpr int kPackedMain<fused_norm_rope_attn_rope_cast_fwd::core_attn::FusedHs64PackedTraits<Norm, ExtraFP4, MainCapacity, Worklist, Arch, FloatKV, PerTokenScale>> = MainCapacity;
 
-template<bool Norm, bool ExtraFP4, int MainCapacity, Hs64Worklist Worklist, bool PerTokenScale>
-inline constexpr Hs64Worklist kWorklist<fused_norm_rope_attn_rope_cast_fwd::core_attn::FusedHs64PackedTraits<Norm, ExtraFP4, MainCapacity, Worklist, PerTokenScale>> = Worklist;
+template<bool Norm, bool ExtraFP4, int MainCapacity, Hs64Worklist Worklist, int Arch, bool FloatKV, bool PerTokenScale>
+inline constexpr Hs64Worklist kWorklist<fused_norm_rope_attn_rope_cast_fwd::core_attn::FusedHs64PackedTraits<Norm, ExtraFP4, MainCapacity, Worklist, Arch, FloatKV, PerTokenScale>> = Worklist;
 
 }
 
@@ -35,18 +36,20 @@ template<typename T>
 __global__ void __launch_bounds__(512, 1, 1)
 fused_norm_rope_attn_rope_cast_decode_hs64_wi_kernel(
     __grid_constant__ const typename T::FusedParams params) {
-#if ACOMPUTE_VERSION >= 10500
-    if constexpr (T::kFusedPackedFp4) {
-        // The packed launcher flattens queries and fixes these capacities.
-        typename T::FusedParams fixed = params;
-        fixed.q_orig = 1;
-        fixed.seqlen_q = fixed.ngroups = T::kBlockM;
-        fixed.h = 1;
-        fixed.topk = flashmla::dsa::hs64::kPackedMain<T>;
-        fixed.extra_topk = 512;
-        flashmla::dsa::hs64::hs64_attention<T, true>(fixed);
-    } else {
-        flashmla::dsa::hs64::hs64_attention<T, true>(params);
+#if ACOMPUTE_VERSION == 10000 || ACOMPUTE_VERSION >= 10500
+    if constexpr (T::kArch == (ACOMPUTE_VERSION == 10000 ? 80 : 89)) {
+        if constexpr (T::kFusedPackedFp4) {
+            // The packed launcher flattens queries and fixes these capacities.
+            typename T::FusedParams fixed = params;
+            fixed.q_orig = 1;
+            fixed.seqlen_q = fixed.ngroups = T::kBlockM;
+            fixed.h = 1;
+            fixed.topk = flashmla::dsa::hs64::kPackedMain<T>;
+            fixed.extra_topk = 512;
+            flashmla::dsa::hs64::hs64_attention<T, true>(fixed);
+        } else {
+            flashmla::dsa::hs64::hs64_attention<T, true>(params);
+        }
     }
 #endif
 }
@@ -61,10 +64,15 @@ static void launch_fused_hs64_wi(
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template<bool Norm, bool ExtraFP4, int MainCapacity, flashmla::dsa::hs64::Hs64Worklist Worklist, bool PerTokenScale>
+template<int Arch>
+inline constexpr int kFusedHs64PackedSmCount = Arch == 80 ? 20 : 39;
+
+template<bool Norm, bool ExtraFP4, int MainCapacity, flashmla::dsa::hs64::Hs64Worklist Worklist,
+         int Arch, bool FloatKV, bool PerTokenScale>
 static void launch_fused_hs64_packed(const FusedHs64Params<PerTokenScale>& params, hggcStream_t stream) {
-    using T = FusedHs64PackedTraits<Norm, ExtraFP4, MainCapacity, Worklist, PerTokenScale>;
-    const int grid_rows = Worklist == flashmla::dsa::hs64::Hs64Worklist::Single ? params.b : 39;
+    using T = FusedHs64PackedTraits<Norm, ExtraFP4, MainCapacity, Worklist, Arch, FloatKV, PerTokenScale>;
+    const int grid_rows = Worklist == flashmla::dsa::hs64::Hs64Worklist::Single
+        ? params.b : kFusedHs64PackedSmCount<Arch>;
     launch_fused_hs64_wi<T>(params, grid_rows, stream);
 }
 
@@ -120,57 +128,78 @@ static FusedHs64Params<PerTokenScale> make_fused_hs64_decode_params(const Output
 }
 
 // Keep generic KV addressing (kPackedMain == 0); only query ownership differs.
-template<bool PerTokenScale>
+template<int Arch, bool FloatKV, bool PerTokenScale>
 struct FusedHs64DirectTraits : FusedHs64Traits<false,
-    flashmla::dsa::hs64::Hs64Traits<512, true, 89, true, true>, true, false, PerTokenScale> {
+    flashmla::dsa::hs64::Hs64Traits<512, true, Arch, true, true>, true, false, PerTokenScale> {
     using Base = FusedHs64Traits<false,
-        flashmla::dsa::hs64::Hs64Traits<512, true, 89, true, true>, true, false, PerTokenScale>;
+        flashmla::dsa::hs64::Hs64Traits<512, true, Arch, true, true>, true, false, PerTokenScale>;
     using SharedMemoryPlan = typename Base::SharedMemoryPlan;
+    static_assert(!PerTokenScale || Arch == 89);
     static constexpr bool kFusedDirectQueries = true;
+    static constexpr bool kV41FloatKV = FloatKV;
     // Consecutive owned queries alternate the existing two RoPE slots.
     static constexpr bool kCachePrefillRope = PerTokenScale;
     static constexpr bool kDeferPrefillSink = true;
     static_assert(Base::kPrefillSinkOffset + 64 * sizeof(float) <= offsetof(SharedMemoryPlan, smem_sP));
 };
-template<bool PerTokenScale>
+template<int Arch, bool FloatKV, bool PerTokenScale>
 static void run_fused_hs64_direct_output(const OutputParams<PerTokenScale>& p, int grid_rows) {
-    using T = FusedHs64DirectTraits<PerTokenScale>;
-    static_assert(flashmla::dsa::hs64::kPackedMain<T> == 0);
-    static_assert(flashmla::dsa::hs64::kWorklist<T> == flashmla::dsa::hs64::Hs64Worklist::Single);
+    using T = FusedHs64DirectTraits<Arch, FloatKV, PerTokenScale>;
     static_assert(T::kQBarrierThreads == 512);
     const FusedHs64Params<PerTokenScale> params = make_fused_hs64_decode_params<true>(p);
     launch_fused_hs64_wi<T>(params, grid_rows, p.stream);
 }
 
-template<bool Norm, bool ExtraFP4, bool PerTokenScale>
+template<bool Norm, bool ExtraFP4, int Arch, bool FloatKV, bool PerTokenScale>
 static void run_fused_hs64_packed_output(const OutputParams<PerTokenScale>& p) {
     const FusedHs64Params<PerTokenScale> params = make_fused_hs64_decode_params<ExtraFP4>(p);
     using flashmla::dsa::hs64::Hs64Worklist;
-    if (p.topk == 256) {
-        launch_fused_hs64_packed<Norm, ExtraFP4, 256, Hs64Worklist::Batch>(params, p.stream);
-    } else if (p.s_q >= (ExtraFP4 && !Norm && PerTokenScale ? 2 :
-                         (ExtraFP4 && (Norm || PerTokenScale) ? 6 : 8)) * 39) {
-        launch_fused_hs64_packed<Norm, ExtraFP4, 128, Hs64Worklist::Flat>(params, p.stream);
+    if constexpr (Arch == 89) {
+        if (p.topk == 256) {
+            launch_fused_hs64_packed<Norm, ExtraFP4, 256, Hs64Worklist::Batch, Arch, FloatKV>(
+                params, p.stream);
+            return;
+        }
+    }
+    constexpr int flat_waves = ExtraFP4 && !Norm && PerTokenScale ? 2 :
+        (ExtraFP4 && (Norm || PerTokenScale) ? 6 : 8);
+    if (p.s_q >= flat_waves * kFusedHs64PackedSmCount<Arch>) {
+        launch_fused_hs64_packed<Norm, ExtraFP4, 128, Hs64Worklist::Flat, Arch, FloatKV>(
+            params, p.stream);
     } else {
-        launch_fused_hs64_packed<Norm, ExtraFP4, 128, Hs64Worklist::Single>(params, p.stream);
+        launch_fused_hs64_packed<Norm, ExtraFP4, 128, Hs64Worklist::Single, Arch, FloatKV>(
+            params, p.stream);
     }
 }
 
 void run_fused_norm_rope_attn_rope_cast_decode_hs64_direct(const Params& p, int grid_rows) {
-    if (p.per_token_scale) {
-        run_fused_hs64_direct_output(OutputParams<true>{p}, grid_rows);
+    if (p.arch == 89) {
+        if (p.per_token_scale)
+            run_fused_hs64_direct_output<89, true>(OutputParams<true>{p}, grid_rows);
+        else
+            run_fused_hs64_direct_output<89, true>(OutputParams<false>{p}, grid_rows);
+    } else if (p.v41_float_kv) {
+        run_fused_hs64_direct_output<80, true>(OutputParams<false>{p}, grid_rows);
     } else {
-        run_fused_hs64_direct_output(OutputParams<false>{p}, grid_rows);
+        run_fused_hs64_direct_output<80, false>(OutputParams<false>{p}, grid_rows);
     }
 }
 
 template<bool Norm, bool ExtraFP4>
 void run_fused_norm_rope_attn_rope_cast_decode_hs64_packed(const Params& p) {
-    if (p.per_token_scale) {
-        run_fused_hs64_packed_output<Norm, ExtraFP4>(OutputParams<true>{p});
-    } else {
-        run_fused_hs64_packed_output<Norm, ExtraFP4>(OutputParams<false>{p});
+    if constexpr (!Norm && ExtraFP4) {
+        if (p.arch == 80) {
+            if (p.v41_float_kv)
+                run_fused_hs64_packed_output<Norm, ExtraFP4, 80, true>(OutputParams<false>{p});
+            else
+                run_fused_hs64_packed_output<Norm, ExtraFP4, 80, false>(OutputParams<false>{p});
+            return;
+        }
     }
+    if (p.per_token_scale)
+        run_fused_hs64_packed_output<Norm, ExtraFP4, 89, true>(OutputParams<true>{p});
+    else
+        run_fused_hs64_packed_output<Norm, ExtraFP4, 89, true>(OutputParams<false>{p});
 }
 
 template void run_fused_norm_rope_attn_rope_cast_decode_hs64_packed<false, false>(const Params&);
