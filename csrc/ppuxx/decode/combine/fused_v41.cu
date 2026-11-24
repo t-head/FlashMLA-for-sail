@@ -6,6 +6,7 @@
 
 #include "kerutils/common/common.h"
 #include "kerutils/common/static_switch.h"
+#include "ppu/sparse/fused_v41_output.cuh"
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::combine {
 
@@ -13,6 +14,7 @@ constexpr int kBlockM = 8;
 constexpr int kNumThreads = kBlockM * 32;
 constexpr int kHeadDimV = 512;
 constexpr int kElemsPerLane = kHeadDimV / 32;
+using core_attn::OutputFormat;
 
 __forceinline__ __device__ float2 apply_rope(float2 x, float c, float s) {
     return float2{fmaf(x.x, c, -x.y * s), fmaf(x.x, s, x.y * c)};
@@ -30,6 +32,14 @@ __forceinline__ __device__ uint8_t fp8_from_float_sm80(float value) {
     const uint32_t encoded = sign | rounded;
     const uint32_t nan_mask = 0u - ((0x7f800000u - magnitude) >> 31);
     return uint8_t(encoded ^ ((encoded ^ 0x7fu) & nan_mask));
+}
+
+__forceinline__ __device__ uint8_t pack_output(OutputFormat format, float scaled) {
+#if ACOMPUTE_VERSION == 10000
+    return format == OutputFormat::INT8 ? output::pack_int8(scaled) : fp8_from_float_sm80(scaled);
+#else
+    return cutlass::float_e4m3_t::from_float(scaled).storage;
+#endif
 }
 
 template<bool PerTokenScale>
@@ -134,8 +144,16 @@ fused_norm_rope_attn_rope_cast_combine_kernel(const OutputParams<PerTokenScale> 
 
     const int group = head / 8;
     const int in_group = head % 8;
-    uint8_t* out = params.out_fp8 + int64_t(token) * heads * 512 + group * (8 * 512)
+    const auto format = ACOMPUTE_VERSION == 10000 ? params.output_format : OutputFormat::FP8;
+    const int64_t out_offset = int64_t(token) * heads * 512 + group * (8 * 512)
         + in_group * 32 + lane;
+    if (format == OutputFormat::BF16) {
+        #pragma unroll
+        for (int i = 0; i < kElemsPerLane; ++i)
+            output::store_bf16(params.out_fp8, out_offset + i * (8 * 32), result[i]);
+        return;
+    }
+    uint8_t* out = params.out_fp8 + out_offset;
     if constexpr (PerTokenScale) {
         float amax = 0.0f;
         #pragma unroll
@@ -151,7 +169,7 @@ fused_norm_rope_attn_rope_cast_combine_kernel(const OutputParams<PerTokenScale> 
         amax = 0.0f;
         #pragma unroll
         for (int row = 0; row < kBlockM; ++row) amax = fmaxf(amax, lse_scale[row][0]);
-        const float scale = fmaxf(1e-4f, amax) / 448.0f;
+        const float scale = output::quant_scale(fmaxf(1e-4f, amax), format);
         const float scale_inv = __fdividef(1.0f, scale);
         if (threadIdx.x == 0) {
             reinterpret_cast<float*>(params.out_sf)[int64_t(token) * params.stride_out_sf_token
@@ -160,11 +178,7 @@ fused_norm_rope_attn_rope_cast_combine_kernel(const OutputParams<PerTokenScale> 
         if (warp < valid_rows) {
             #pragma unroll
             for (int i = 0; i < kElemsPerLane; ++i) {
-#if ACOMPUTE_VERSION == 10000
-                out[i * (8 * 32)] = fp8_from_float_sm80(result[i] * scale_inv);
-#else
-                out[i * (8 * 32)] = cutlass::float_e4m3_t::from_float(result[i] * scale_inv).storage;
-#endif
+                out[i * (8 * 32)] = pack_output(format, result[i] * scale_inv);
             }
         }
         return;
@@ -178,14 +192,10 @@ fused_norm_rope_attn_rope_cast_combine_kernel(const OutputParams<PerTokenScale> 
             amax = fmaxf(amax, __shfl_xor_sync(uint32_t(-1), amax, offset));
         }
         amax = fmaxf(1e-4f, amax);
-        const float scale = amax / 448.0f;
+        const float scale = output::quant_scale(amax, format);
         const int exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
         const float scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
-#if ACOMPUTE_VERSION == 10000
-        out[i * (8 * 32)] = fp8_from_float_sm80(result[i] * scale_inv);
-#else
-        out[i * (8 * 32)] = cutlass::float_e4m3_t::from_float(result[i] * scale_inv).storage;
-#endif
+        out[i * (8 * 32)] = pack_output(format, result[i] * scale_inv);
         if (lane == 0) {
             const int sf_index = i * 8 + in_group;
             auto* sf_word = sf_base + int64_t(sf_index / 4) * params.stride_out_sf_word;
@@ -288,24 +298,33 @@ fused_norm_rope_attn_rope_cast_combine_block32_sm80_kernel(const Params params) 
             result[i + 1] = rotated.y;
         }
     }
+    const int group = head / 8;
+    const int in_group = head % 8;
+    const int64_t offset = int64_t(token) * heads * 512 + group * (8 * 512)
+        + (col / 32) * (8 * 32) + in_group * 32 + col % 32;
+    const auto format = params.output_format;
+    if (format == OutputFormat::BF16) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+            output::store_bf16(params.out_fp8, offset + i, result[i]);
+        return;
+    }
     float amax = 0.0f;
     #pragma unroll
     for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(result[i]));
     amax = fmaxf(amax, __shfl_xor_sync(uint32_t(-1), amax, 1));
     amax = fmaxf(amax, __shfl_xor_sync(uint32_t(-1), amax, 2));
-    const float scale = fmaxf(1e-4f, amax) / 448.0f;
+    const float scale = output::quant_scale(fmaxf(1e-4f, amax), format);
     const int exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
     const float scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
     uint2 packed{};
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const uint32_t value = fp8_from_float_sm80(result[i] * scale_inv);
+        const float scaled = result[i] * scale_inv;
+        const uint32_t value = format == OutputFormat::INT8 ? output::pack_int8(scaled)
+                                                           : fp8_from_float_sm80(scaled);
         (i < 4 ? packed.x : packed.y) |= value << ((i % 4) * 8);
     }
-    const int group = head / 8;
-    const int in_group = head % 8;
-    const int64_t offset = int64_t(token) * heads * 512 + group * (8 * 512)
-        + (col / 32) * (8 * 32) + in_group * 32 + col % 32;
     *reinterpret_cast<uint2*>(params.out_fp8 + offset) = packed;
     if (head_lane % 4 == 0) {
         const int sf_index = (col / 32) * 8 + in_group;

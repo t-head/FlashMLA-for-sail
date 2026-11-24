@@ -6,6 +6,7 @@
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
 enum class FwdMode : uint8_t { Prefill, Decode };
+enum class OutputFormat : uint8_t { FP8, INT8, BF16 };
 
 struct Params {
     FwdMode mode;
@@ -14,6 +15,7 @@ struct Params {
     float sm_scale, sm_scale_log2, rms_norm_eps;
     bool enable_q_norm;
     bool per_token_scale;
+    OutputFormat output_format = OutputFormat::FP8;
     const void* q;
     const void* kv;
     const int32_t* indices;

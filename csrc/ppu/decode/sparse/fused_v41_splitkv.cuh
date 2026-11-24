@@ -9,6 +9,7 @@
 #include <cutlass/float8.h>
 
 #include "sparse/fused_v41.h"
+#include "sparse/fused_v41_output.cuh"
 #include "ppuxx/decode/combine/fused_v41.h"
 #include "decode/sparse/splitkv_mla.cuh"
 
@@ -495,12 +496,20 @@ __forceinline__ __device__ uint16_t fp8_pair_from_float(float low, float high) {
 #endif
 }
 
+__forceinline__ __device__ uint16_t pack_output_pair(OutputFormat format, float low, float high) {
+    if (format == OutputFormat::INT8) {
+        return uint16_t(output::pack_int8(low)) | (uint16_t(output::pack_int8(high)) << 8);
+    }
+    return fp8_pair_from_float(low, high);
+}
+
 // Reuse the retired KV storage after the FP32 output image for this epilogue.
 // Each scale belongs to one token and eight complete 512-channel heads.
 template<typename KT, bool H8, bool EnableNorm = true, typename P, typename TensorO, typename Retired>
 __forceinline__ __device__ void store_per_token_output(
     const P& p, int64_t token, int first_head, char* smem, TensorO& sO, Retired& retired,
     const bool* valid = nullptr, const float* lse = nullptr) {
+    const auto format = ACOMPUTE_VERSION == 10000 ? p.output_format : OutputFormat::FP8;
     constexpr int kGroups = H8 ? 1 : KT::kBlockM / 8;
     constexpr int kThreadsPerGroup = KT::kNThreads / kGroups;
     constexpr int kWarpsPerGroup = kThreadsPerGroup / 32;
@@ -543,7 +552,7 @@ __forceinline__ __device__ void store_per_token_output(
                     for (int warp = 0; warp < kWarpsPerGroup; ++warp)
                         amax = fmaxf(amax, partials[group * kWarpsPerGroup + warp]);
                 }
-                const float scale = amax / 448.0f;
+                const float scale = output::quant_scale(amax, format);
                 inverse = 1.0f / scale;
                 if (group_lane == 0 && global_group < p.h_q / 8) {
                     reinterpret_cast<float*>(p.out_sf)[token * p.stride_out_sf_token
@@ -558,7 +567,7 @@ __forceinline__ __device__ void store_per_token_output(
                 #pragma unroll
                 for (int warp = 0; warp < kWarpsPerGroup; ++warp)
                     amax = fmaxf(amax, partials[group * kWarpsPerGroup + warp]);
-                const float scale = amax / 448.0f;
+                const float scale = output::quant_scale(amax, format);
                 inverses[group] = 1.0f / scale;
                 if (global_group < p.h_q / 8) {
                     reinterpret_cast<float*>(p.out_sf)[token * p.stride_out_sf_token
@@ -634,9 +643,9 @@ __forceinline__ __device__ void store_per_token_output(
             uint2 packed;
             #pragma unroll
             for (int i = 0; i < 8; i += 4) {
-                const uint32_t low = fp8_pair_from_float(values[i] * scale_inv,
+                const uint32_t low = pack_output_pair(format, values[i] * scale_inv,
                     values[i + 1] * scale_inv);
-                const uint32_t high = fp8_pair_from_float(values[i + 2] * scale_inv,
+                const uint32_t high = pack_output_pair(format, values[i + 2] * scale_inv,
                     values[i + 3] * scale_inv);
                 (i == 0 ? packed.x : packed.y) = low | (high << 16);
             }
@@ -712,9 +721,9 @@ __forceinline__ __device__ void store_per_token_output(
         uint2 packed;
         #pragma unroll
         for (int i = 0; i < 8; i += 4) {
-            const uint32_t low = fp8_pair_from_float(retired(kSlot * 8 + i) * scale_inv,
+            const uint32_t low = pack_output_pair(format, retired(kSlot * 8 + i) * scale_inv,
                 retired(kSlot * 8 + i + 1) * scale_inv);
-            const uint32_t high = fp8_pair_from_float(retired(kSlot * 8 + i + 2) * scale_inv,
+            const uint32_t high = pack_output_pair(format, retired(kSlot * 8 + i + 2) * scale_inv,
                 retired(kSlot * 8 + i + 3) * scale_inv);
             (i == 0 ? packed.x : packed.y) = low | (high << 16);
         }
@@ -770,9 +779,9 @@ __forceinline__ __device__ void store_per_token_output(
         uint2 packed;
         #pragma unroll
         for (int i = 0; i < 8; i += 4) {
-            const uint32_t low = fp8_pair_from_float(sO(row, col + i) * scale_inv,
+            const uint32_t low = pack_output_pair(format, sO(row, col + i) * scale_inv,
                 sO(row, col + i + 1) * scale_inv);
-            const uint32_t high = fp8_pair_from_float(sO(row, col + i + 2) * scale_inv,
+            const uint32_t high = pack_output_pair(format, sO(row, col + i + 2) * scale_inv,
                 sO(row, col + i + 3) * scale_inv);
             (i == 0 ? packed.x : packed.y) = low | (high << 16);
         }
@@ -800,6 +809,7 @@ constexpr bool h8_output_float4_layout() {
 
 template<typename KT, typename P, typename TensorO>
 __forceinline__ __device__ void store_h8_output(const P& p, int token, int tidx, const TensorO& sO) {
+    const auto format = ACOMPUTE_VERSION == 10000 ? p.output_format : OutputFormat::FP8;
     constexpr int kHeads = 8;
     constexpr int kChunks = KT::kHeadDimV / 32;
     constexpr int kLanesPerScale = 2;
@@ -837,23 +847,30 @@ __forceinline__ __device__ void store_h8_output(const P& p, int token, int tidx,
         }
     }
 
+    const int64_t out_offset = int64_t(token) * kHeads * KT::kHeadDimV + scale_index * 32
+        + lane * kChannelsPerLane;
+    if (format == OutputFormat::BF16) {
+        #pragma unroll
+        for (int i = 0; i < kChannelsPerLane; ++i)
+            output::store_bf16(p.out_fp8, out_offset + i, values[i]);
+        return;
+    }
+
     float amax = 1e-4f;
     #pragma unroll
     for (int i = 0; i < kChannelsPerLane; ++i) amax = fmaxf(amax, fabsf(values[i]));
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, kLanesPerScale));
-    const float scale = amax / 448.0f;
+    const float scale = output::quant_scale(amax, format);
     const int exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
     const float scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
     uint32_t words[4];
     #pragma unroll
     for (int i = 0; i < kChannelsPerLane / 4; ++i) {
         const int d = i * 4;
-        const uint32_t pair_lo = fp8_pair_from_float(values[d] * scale_inv, values[d + 1] * scale_inv);
-        const uint32_t pair_hi = fp8_pair_from_float(values[d + 2] * scale_inv, values[d + 3] * scale_inv);
+        const uint32_t pair_lo = pack_output_pair(format, values[d] * scale_inv, values[d + 1] * scale_inv);
+        const uint32_t pair_hi = pack_output_pair(format, values[d + 2] * scale_inv, values[d + 3] * scale_inv);
         words[i] = pair_lo | (pair_hi << 16);
     }
-    const int64_t out_offset = int64_t(token) * kHeads * KT::kHeadDimV + scale_index * 32
-        + lane * kChannelsPerLane;
     *reinterpret_cast<uint4*>(p.out_fp8 + out_offset) = make_uint4(words[0], words[1], words[2], words[3]);
     if (lane == 0) {
         auto* sf_word = p.out_sf + token + int64_t(scale_index / 4) * p.stride_out_sf_word;
@@ -864,6 +881,7 @@ __forceinline__ __device__ void store_h8_output(const P& p, int token, int tidx,
 template<typename KT, typename P, typename AccO, typename Softmax>
 __forceinline__ __device__ void store_output(
     const P& p, int token, int h_k_idx, char* smem, AccO& acc_o, Softmax& softmax) {
+    const auto format = ACOMPUTE_VERSION == 10000 ? p.output_format : OutputFormat::FP8;
     constexpr int kBlockM = KT::kBlockM;
     constexpr int kChunks = KT::kHeadDimV / 32;
     constexpr int MMA_ATOM_M = KT::USE_MMA_M8 ? 8 : 16;
@@ -948,6 +966,16 @@ __forceinline__ __device__ void store_output(
                 values[i + 1] = rotated.y;
             }
         }
+        const int group = head / 8;
+        const int in_group = head & 7;
+        const int64_t out_offset = int64_t(token) * p.real_heads * 512
+            + group * (8 * 512) + chunk * (8 * 32) + in_group * 32;
+        if (format == OutputFormat::BF16) {
+            #pragma unroll
+            for (int i = 0; i < 32; ++i)
+                output::store_bf16(p.out_fp8, out_offset + i, values[i]);
+            continue;
+        }
         float amax = 0.0f;
         if constexpr (ACOMPUTE_VERSION == 10000 && !P::kEnableNorm) {
             float amax1 = 0.0f, amax2 = 0.0f, amax3 = 0.0f;
@@ -964,22 +992,20 @@ __forceinline__ __device__ void store_output(
             for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(values[i]));
         }
         amax = fmaxf(1e-4f, amax);
-        const float scale = amax / 448.0f;
+        const float scale = output::quant_scale(amax, format);
         const int exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
         const float scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
         alignas(16) uint8_t packed[32];
         #pragma unroll
         for (int i = 0; i < 32; ++i) {
 #if ACOMPUTE_VERSION == 10000
-            packed[i] = fp8_from_float_sm80(values[i] * scale_inv);
+            const float scaled = values[i] * scale_inv;
+            packed[i] = format == OutputFormat::INT8 ? output::pack_int8(scaled)
+                                                     : fp8_from_float_sm80(scaled);
 #else
             packed[i] = cutlass::float_e4m3_t::from_float(values[i] * scale_inv).storage;
 #endif
         }
-        const int group = head / 8;
-        const int in_group = head & 7;
-        const int64_t out_offset = int64_t(token) * p.real_heads * 512
-            + group * (8 * 512) + chunk * (8 * 32) + in_group * 32;
         uint4* out = reinterpret_cast<uint4*>(p.out_fp8 + out_offset);
         out[0] = reinterpret_cast<const uint4*>(packed)[0];
         out[1] = reinterpret_cast<const uint4*>(packed)[1];
@@ -995,6 +1021,7 @@ __forceinline__ __device__ void store_output(
 template<bool EnableNorm, bool PerTokenScale>
 struct FusedSplitKVParams : Flash_fwd_params {
     float rms_norm_eps;
+    OutputFormat output_format = OutputFormat::FP8;
     const int32_t* token_positions;
     const float* cos_sin_cache;
     uint8_t* out_fp8;
@@ -1252,6 +1279,7 @@ void launch_fused_decode_splitkv(
     p.token_positions = params.token_positions;
     p.cos_sin_cache = params.cos_sin_cache;
     p.out_fp8 = params.out_fp8;
+    p.output_format = params.output_format;
     p.out_sf = params.out_sf;
     p.lse_out = params.lse;
     p.stride_out_sf_group = params.stride_out_sf_group;
@@ -1330,6 +1358,7 @@ void launch_fused_decode_splitkv(
     c.num_sm_parts = split.num_sm_parts;
     c.arch = params.arch;
     c.per_token_scale = PerTokenScale;
+    c.output_format = params.output_format;
     c.num_splits = split.num_splits;
     c.lse_accum = split.lse_accum;
     c.o_accum = split.o_accum;
@@ -1348,8 +1377,9 @@ void launch_fused_decode_splitkv(
         c.s_q -= leading_rows;
         c.num_splits += leading_rows;
         c.token_positions += leading_rows;
-        c.out_fp8 += int64_t(leading_rows) * Heads * 512;
-        c.out_sf += int64_t(leading_rows) * params.stride_out_sf_token;
+        const int bytes_per_element = params.output_format == OutputFormat::BF16 ? 2 : 1;
+        c.out_fp8 += int64_t(leading_rows) * Heads * 512 * bytes_per_element;
+        if (c.out_sf) c.out_sf += int64_t(leading_rows) * params.stride_out_sf_token;
         c.lse += int64_t(leading_rows) * Heads;
     }
     combine::run_fused_norm_rope_attn_rope_cast_combine_kernel(c);

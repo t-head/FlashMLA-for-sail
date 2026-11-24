@@ -105,9 +105,9 @@ def decode(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """
-    Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4.1
+    Fused decoding: Q Norm + Q RoPE + paged attention + O RoPE + output cast for DeepSeek-V4.1.
     Only support PPU sm80 / sm89 architectures.
 
     The batch size is always 1, and the batch dimension is not included in any tensor shape below.
@@ -124,8 +124,8 @@ def decode(
 
     Args (Cast):
         n_wv_group: n_wv_group during o projection
-        num_per_channels: runtime output quantization granularity; 32 for blockwise UE8M0 scales,
-            or 4096 for one FP32 scale per token/WV group. Both are supported by the same extension.
+        num_per_channels: 32 or 4096 for FP8 output. SM80 also supports -32 or -4096
+            for INT8 with the corresponding scale granularity, and 0 for BF16.
         use_tma_aligned_col_major_sf: True for per-32; False for per-token FP32 scales
         round_sf: True for per-32; False for per-token FP32 scales
         use_packed_ue8m0: True for per-32; False for per-token FP32 scales
@@ -148,18 +148,18 @@ def decode(
         extra_topk_length: optional, [s_q], int32. Actual valid extra topk count of the request
 
     Returns:
-        - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result (wv_group_size = h_q / n_wv_group)
-        - out_sf: per-32 uses [s_q, n_wv_group, 32] int32 packed UE8M0; per-token uses contiguous [s_q, n_wv_group, 1] float32 dequantization scales
+        - out: [s_q, n_wv_group, wv_group_size * d_v], in the selected output dtype
+        - out_sf: packed UE8M0 for per-32 or row-major FP32 for per-token scaling. None for BF16.
         - lse: [s_q, h_q], float
     """
-    out_fp8, out_sf, lse = _backend.fused_norm_rope_attn_rope_cast_decode(
+    out, out_sf, lse = _backend.fused_norm_rope_attn_rope_cast_decode(
         q, k_cache, indices_in_kvcache, sm_scale, d_v,
         attn_sink, topk_length,
         extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
         n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0
     )
-    return out_fp8, out_sf, lse
+    return out, out_sf if num_per_channels != 0 else None, lse
 
 
 def permute_q_b_proj(
