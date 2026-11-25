@@ -2193,7 +2193,10 @@ __forceinline__ __device__ void store_o(
 
 // Internal address representation for aligned, main-only cache spans below 64GiB.
 template<typename T>
-struct CompactKAddrTraits : T { using Bf16KAddr = uint32_t; };
+struct CompactKAddrTraits : T {
+    static_assert(!T::kV32FP8, "Packed V3.2 uses full 64-bit byte addresses");
+    using Bf16KAddr = uint32_t;
+};
 template<typename T, typename = void>
 struct WgKAddrType { using type = typename T::InputT*; };
 template<typename T>
@@ -2225,6 +2228,31 @@ __forceinline__ __device__ WgKAddr<T> compute_K_addr_bf16(
     using InputT = typename T::InputT;
     constexpr int kBlockN        = Base::kBlockN;
     constexpr int kBytesPerToken = T::kBytesPerToken;
+
+    if constexpr (T::kV32FP8) {
+        static_assert(!T::IsFP8 && T::kHeadDim == 576 && T::kBlockM == 128 &&
+                      std::is_same_v<WgKAddr<T>, InputT*>);
+        const int effective_block = USE_EXTRA ? block_idx_kv - ori_block_max : block_idx_kv;
+        const int page_size = USE_EXTRA ? params.extra_page_block_size : params.page_block_size;
+        const int length = USE_EXTRA ? extra_seqlen_k : seqlen_k;
+        const int storage = USE_EXTRA ? params.extra_topk : params.topk;
+        const int blocks = USE_EXTRA ? params.extra_num_blocks : params.num_blocks;
+        const int token = tidx / 8;
+        const int64_t position = int64_t(effective_block) * kBlockN + token;
+        const int index = position >= 0 && position < length && position < storage
+            ? *pre_token_idx : -1;
+        is_valid = index >= 0 && int64_t(index) < int64_t(blocks) * page_size;
+        if constexpr (S == 0) {
+            if (tidx % 8 == 0) smem_valid_indices(vi_buf, token) = is_valid;
+        }
+        auto *base = reinterpret_cast<uint8_t*>(USE_EXTRA ? params.extra_k_ptr : params.k_ptr);
+        const int64_t stride = USE_EXTRA ? params.extra_k_batch_stride : params.k_batch_stride;
+        const int page = is_valid ? index >> __builtin_ctz(page_size) : 0;
+        const int off = is_valid ? index & (page_size - 1) : 0;
+        // Packed cache offsets are byte strides, not BF16 element strides.
+        return reinterpret_cast<InputT*>(base + int64_t(page) * stride +
+            int64_t(off) * kBytesPerToken + (tidx & 7) * 8);
+    }
 
     // Use if constexpr to force compile-time branch elimination (PPU compiler doesn't optimize ternary with template params)
     int effective_block, page_block_size, valid_len;
@@ -2332,10 +2360,135 @@ __forceinline__ __device__ const int* wg_query_indices(
     return indices + static_cast<int64_t>(query_idx) * row_stride;
 }
 
+template<int Tile, typename T, bool Pair = false, typename TensorSK>
+__forceinline__ __device__ void finish_v32_optimized_k_tile(
+    TensorSK &sK, const uint4 &packed, float scale, bool valid, int tidx) {
+    static_assert(T::kV32FP8 && Tile >= 0 && Tile < 9 && T::kBlockN == 32);
+    static_assert(!Pair || (Tile < 8 && Tile % 2 == 0));
+    const int row = tidx / 8, lane = tidx & 7;
+    const __ppu_bfloat162 scale_pair = __float2bfloat162_rn(scale);
+    #pragma unroll
+    for (int half = 0; half < (Pair ? 2 : 1); ++half) {
+        uint4 output{};
+        if constexpr (Tile == 8) {
+            output = packed; // Raw BF16 RoPE, never scaled or converted.
+        } else if (valid) {
+            const uint32_t words[2] = {half == 0 ? packed.x : packed.z,
+                                       half == 0 ? packed.y : packed.w};
+            uint32_t bits[4];
+            #pragma unroll
+            for (int word = 0; word < 2; ++word) {
+                const __hg_fp8x4_e4m3 fp8 = *reinterpret_cast<const __hg_fp8x4_e4m3*>(&words[word]);
+                const float4 values = (float4)fp8;
+                const __ppu_bfloat162 lo = __hmul2(
+                    __float22bfloat162_rn({values.x, values.y}), scale_pair);
+                const __ppu_bfloat162 hi = __hmul2(
+                    __float22bfloat162_rn({values.z, values.w}), scale_pair);
+                bits[word * 2] = *reinterpret_cast<const uint32_t*>(&lo);
+                bits[word * 2 + 1] = *reinterpret_cast<const uint32_t*>(&hi);
+            }
+            output = uint4{bits[0], bits[1], bits[2], bits[3]};
+        }
+        const int dst_lane = Pair ? (lane & 3) * 2 + half : lane;
+        const int col = (dst_lane ^ (row % 8)) * 8;
+        const int parity = Pair ? lane / 4 : Tile % 2;
+        const int offset = Tile == 8
+            ? Tile * T::kBlockN * 64 + row * 64 + col
+            : (Tile & ~1) * T::kBlockN * 64 + (row / 16) * 2048
+                + parity * 1024 + (row % 16) * 64 + col;
+        *reinterpret_cast<uint4*>(sK.data().get() + offset) = output;
+    }
+}
+
+template<int Tile, typename T, bool Pair = false, typename TensorSK>
+__forceinline__ __device__ void store_v32_optimized_k_tile(
+    TensorSK &sK, const uint8_t *row_ptr, bool valid, int tidx) {
+    const int lane = tidx & 7;
+    uint4 packed{};
+    float scale = 0.0f;
+    if (valid) {
+        if constexpr (Tile == 8) {
+            packed = __ldg(reinterpret_cast<const uint4*>(row_ptr + 528 + lane * 16));
+        } else {
+            if constexpr (Pair) {
+                packed = __ldg(reinterpret_cast<const uint4*>(row_ptr + Tile * 64 + lane * 16));
+            } else {
+                const uint2 part = __ldg(reinterpret_cast<const uint2*>(row_ptr + Tile * 64 + lane * 8));
+                packed.x = part.x;
+                packed.y = part.y;
+            }
+            scale = __ldg(reinterpret_cast<const float*>(row_ptr + 512) + Tile / 2);
+        }
+    }
+    finish_v32_optimized_k_tile<Tile, T, Pair>(sK, packed, scale, valid, tidx);
+}
+
+template<int S, int E, typename T, typename TensorSK>
+__forceinline__ __device__ void store_v32_optimized_k_tiles(
+    TensorSK &sK, const uint8_t *row_ptr, bool valid, int tidx) {
+    if constexpr (S < E) {
+        constexpr bool pair = S < 8 && S % 2 == 0 && S + 1 < E;
+        store_v32_optimized_k_tile<S, T, pair>(sK, row_ptr, valid, tidx);
+        store_v32_optimized_k_tiles<S + (pair ? 2 : 1), E, T>(sK, row_ptr, valid, tidx);
+    }
+}
+
+struct V32LowRegisterPacket {
+    uint4 tiles01, tiles23; // 16 FP8 values per lane per 128-dim scale group.
+    float scale01, scale23;
+};
+struct V32HighRegisterPacket {
+    uint4 tiles45, tiles67, tile8;
+    float scale45, scale67;
+};
+struct EmptyV32RegisterPacket {};
+template<typename T>
+using WgV32LowPacket = std::conditional_t<T::kV32FP8, V32LowRegisterPacket, EmptyV32RegisterPacket>;
+template<typename T>
+using WgV32HighPacket = std::conditional_t<T::kV32FP8, V32HighRegisterPacket, EmptyV32RegisterPacket>;
+template<int S, int E, typename T>
+using WgV32RegisterPacket = std::conditional_t<S == 4 && E == 9, WgV32HighPacket<T>, WgV32LowPacket<T>>;
+
+template<typename T>
+__forceinline__ __device__ V32LowRegisterPacket load_v32_low_register_packet(
+    WgKAddr<T> token_addr, bool valid, int tidx) {
+    static_assert(T::kV32FP8 && std::is_same_v<WgKAddr<T>, typename T::InputT*>);
+    V32LowRegisterPacket packet{};
+    if (valid) {
+        const auto *row = reinterpret_cast<const uint8_t*>(token_addr) - (tidx & 7) * 8;
+        const int lane = tidx & 7;
+        packet.tiles01 = __ldg(reinterpret_cast<const uint4*>(row + lane * 16));
+        packet.tiles23 = __ldg(reinterpret_cast<const uint4*>(row + 128 + lane * 16));
+        const float2 scales = __ldg(reinterpret_cast<const float2*>(row + 512));
+        packet.scale01 = scales.x;
+        packet.scale23 = scales.y;
+    }
+    return packet; // No shared writes, barrier operations, or forced load wait.
+}
+
+template<typename T>
+__forceinline__ __device__ V32HighRegisterPacket load_v32_high_register_packet(
+    WgKAddr<T> token_addr, bool valid, int tidx) {
+    static_assert(T::kV32FP8 && std::is_same_v<WgKAddr<T>, typename T::InputT*>);
+    V32HighRegisterPacket packet{};
+    if (valid) {
+        const auto *row = reinterpret_cast<const uint8_t*>(token_addr) - (tidx & 7) * 8;
+        const int lane = tidx & 7;
+        packet.tiles45 = __ldg(reinterpret_cast<const uint4*>(row + 256 + lane * 16));
+        packet.tiles67 = __ldg(reinterpret_cast<const uint4*>(row + 384 + lane * 16));
+        const float2 scales = __ldg(reinterpret_cast<const float2*>(row + 520));
+        packet.scale45 = scales.x;
+        packet.scale67 = scales.y;
+        packet.tile8 = __ldg(reinterpret_cast<const uint4*>(row + 528 + lane * 16));
+    }
+    return packet;
+}
+
 // Phase 2: Issue cp.async using precomputed token_ptr + prefetch next token index.
 // LOAD_USE_EXTRA removed: k_base_ptr is dummy (overwritten by token_ptr), only PREFETCH_USE_EXTRA matters
 template<int S, int E, bool PREFETCH_USE_EXTRA, typename T, bool DO_PREFETCH = true,
-         bool DO_COPY = true, bool DO_COMMIT = true, typename TensorSK>
+         bool DO_COPY = true, bool DO_COMMIT = true, bool USE_REGISTER_PACKET = false,
+         typename TensorSK>
 __forceinline__ __device__ void issue_K_load_bf16(
     const Flash_fwd_mla_params &params,
     TensorSK &sK_buf,
@@ -2350,14 +2503,43 @@ __forceinline__ __device__ void issue_K_load_bf16(
     int *pre_token_idx,
     int next_block_idx,
     int end_block_idx,
-    int extra_seqlen_k
+    int extra_seqlen_k,
+    const WgV32RegisterPacket<S, E, T> *packet = nullptr
 ) {
     using Base   = typename T::Base;
     using InputT = typename T::InputT;
     constexpr int kBlockN          = Base::kBlockN;
     constexpr int kThreadsPerWg    = Base::NUM_THREADS / 2;
+    static_assert(!USE_REGISTER_PACKET || (T::kV32FP8 && DO_COPY &&
+        ((S == 0 && E == 4) || (S == 4 && E == 9))));
 
-    if constexpr (DO_COPY) {
+    if constexpr (T::kV32FP8) {
+#if ACOMPUTE_VERSION >= 10500
+        static_assert(!T::IsFP8 && T::CvtGemmSwzlLd && T::kUsePv4x2);
+#endif
+        if constexpr (DO_COPY) {
+            if constexpr (USE_REGISTER_PACKET) {
+                if constexpr (S == 0 && E == 4) {
+                    finish_v32_optimized_k_tile<0, T, true>(sK_buf, packet->tiles01, packet->scale01, is_valid, tidx);
+                    finish_v32_optimized_k_tile<2, T, true>(sK_buf, packet->tiles23, packet->scale23, is_valid, tidx);
+                } else {
+                    finish_v32_optimized_k_tile<4, T, true>(sK_buf, packet->tiles45, packet->scale45, is_valid, tidx);
+                    finish_v32_optimized_k_tile<6, T, true>(sK_buf, packet->tiles67, packet->scale67, is_valid, tidx);
+                    finish_v32_optimized_k_tile<8, T, false>(sK_buf, packet->tile8, 0.0f, is_valid, tidx);
+                }
+            } else {
+                const auto *row = reinterpret_cast<const uint8_t*>(token_addr) - (tidx & 7) * 8;
+                store_v32_optimized_k_tiles<S, E, T>(sK_buf, row, is_valid, tidx);
+            }
+        }
+        if constexpr (DO_COMMIT) {
+            // Early high-bank copies must not publish before this commit.
+            __threadfence_block();
+            NamedBarrier::sync(256,
+                static_cast<cutlass::arch::ReservedNamedBarriers>(6 + (threadIdx.x >> 8)));
+            cutlass::arch::cpasync_barrier_arrive_noinc(barriers_K);
+        }
+    } else if constexpr (DO_COPY) {
         using KVCacheGmem = flash::KVCacheGmemBf16<InputT, kBlockN, kThreadsPerWg, T::kHeadDim>;
         using GmemTiledCopyKNoAiu = typename KVCacheGmem::GmemTiledCopy;
         GmemTiledCopyKNoAiu gmem_tiled_copy_K;
@@ -2963,7 +3145,8 @@ __forceinline__ __device__ void wg0_subroutine(
     WgKAddr<T> &precomp_ptr0,
     WgKAddr<T> &precomp_ptr1,
     bool &precomp_valid0,
-    bool &precomp_valid1
+    bool &precomp_valid1,
+    WgV32LowPacket<T> &first_register_packet
 ) {
     int start_token_idx = block_idx * T::kBlockN;
     int nxt_block0 = block_idx+2;
@@ -3017,9 +3200,10 @@ __forceinline__ __device__ void wg0_subroutine(
     // Cross-WG: wg0 loads tiles 0-3 for nxt_block0 (async cp.async, doesn't block)
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
         if constexpr (!T::IsFP8) {
-            issue_K_load_bf16<0, 4, NEXT_EXTRA, T>(params, nxt_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0],
+            // Preloaded bytes may be written only after this bank's readers retire.
+            issue_K_load_bf16<0, 4, NEXT_EXTRA, T, true, true, true, T::kV32FP8>(params, nxt_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0],
                 idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
-                pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k);
+                pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k, &first_register_packet);
         } else {
             int vi_preload_wg0 = 1 - vi_softmax_wg0;         // 1 or 0
             load_and_dequant_sparse_K_staged<0, 4, T, T::kV41FP8>(
@@ -3027,6 +3211,14 @@ __forceinline__ __device__ void wg0_subroutine(
                 /*buf_idx=*/(kv_idx + 2) % 3, &barriers_K0[0],
                 idx_in_warpgroup, ori_block_max, smem_valid_indices, vi_preload_wg0,
                 prefetched_idx0);
+        }
+    }
+
+    WgV32LowPacket<T> second_register_packet{};
+    if constexpr (T::kV32FP8 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        if (nxt_block1 < end_block_idx) {
+            second_register_packet = load_v32_low_register_packet<T>(
+                precomp_ptr1, precomp_valid1, idx_in_warpgroup);
         }
     }
 
@@ -3061,11 +3253,11 @@ __forceinline__ __device__ void wg0_subroutine(
     }
 
     // Cross-WG: wg0 loads tiles 0-3 for nxt_block1
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
+    if constexpr (!T::kV32FP8 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
         if constexpr (!T::IsFP8) {
-            issue_K_load_bf16<0, 4, NEXT_EXTRA, T>(params, nxt_sK1, batch_idx, nxt_block1, seqlen_k, &barriers_K1[0],
+            issue_K_load_bf16<0, 4, NEXT_EXTRA, T, true, true, true, T::kV32FP8>(params, nxt_sK1, batch_idx, nxt_block1, seqlen_k, &barriers_K1[0],
                 idx_in_warpgroup, ori_block_max, precomp_ptr1, precomp_valid1,
-                pre_token_idx_b, nxt_block1 + 2, end_block_idx, extra_seqlen_k);
+                pre_token_idx_b, nxt_block1 + 2, end_block_idx, extra_seqlen_k, &second_register_packet);
         } else {
             int vi_preload_wg1 = 3 - vi_softmax_wg0;    // 3 or 2 (BF16 nxt_block1 preload; FP8 skips nxt_block1)
             load_and_dequant_sparse_K_staged<0, 4, T, T::kV41FP8>(
@@ -3090,6 +3282,13 @@ __forceinline__ __device__ void wg0_subroutine(
     // __syncthreads after its arrive_and_wait(sP0Ready).
     if constexpr (T::kBlockM == 64) {
         __syncthreads();
+    }
+
+    // P0 publication does not depend on the next low K bank.
+    if constexpr (T::kV32FP8 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        issue_K_load_bf16<0, 4, NEXT_EXTRA, T, true, true, true, true>(params, nxt_sK1, batch_idx, nxt_block1, seqlen_k, &barriers_K1[0],
+            idx_in_warpgroup, ori_block_max, precomp_ptr1, precomp_valid1,
+            pre_token_idx_b, nxt_block1 + 2, end_block_idx, extra_seqlen_k, &second_register_packet);
     }
 
     // sP1 ready via sScale1Ready. remote PV can proceed after sP0Ready sync.
@@ -3119,6 +3318,14 @@ __forceinline__ __device__ void wg0_subroutine(
                 params, batch_idx, next_nxt_block1, seqlen_k,
                 idx_in_warpgroup, ori_block_max, smem_valid_indices, next_vi_preload_wg1,
                 pre_token_idx_b, extra_seqlen_k, precomp_valid1);
+        }
+    }
+
+    if constexpr (T::kV32FP8 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // The final iteration leaves the next index cache stale.
+        if (block_idx + 4 < end_block_idx) {
+            first_register_packet = load_v32_low_register_packet<T>(
+                precomp_ptr0, precomp_valid0, idx_in_warpgroup);
         }
     }
 
@@ -3310,49 +3517,57 @@ __forceinline__ __device__ void wg1_subroutine(
         __syncthreads();
     }
 
-    // Issue rO1 += rP1b @ sV1R
-    if constexpr (T::kUsePv4x2) {
-        __ppu_barrier_sync(7, 256, 15u);
-    }
-    wg1_scale0_rO1<T>(rO1, sScale0, sScale1, idx_in_warpgroup);
-    if constexpr (!IS_BLK0_LAST) {
-        if constexpr (T::kUsePv4x2) {
-            warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1R, rO1, idx_in_warpgroup, wg_idx);
-        } else if constexpr (T::kIsCrossCut) {
-            // (4,2) layout: each N-warp only has 16/32 P columns, localP broken.
-            // sP1 already saved above, use per-WG barrier then remoteP from SMEM.
-            const int barrier_id = 6 + static_cast<int>(threadIdx.x >> 8);
-            NamedBarrier::sync(
-                256, static_cast<cutlass::arch::ReservedNamedBarriers>(barrier_id));
-            warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1R, rO1, idx_in_warpgroup, wg_idx);
-        } else {
-            warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, idx_in_warpgroup, wg_idx);
+    {
+        WgV32HighPacket<T> even_register_packet{};
+        if constexpr (T::kV32FP8 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+            even_register_packet = load_v32_high_register_packet<T>(
+                precomp_ptr1, precomp_valid1, idx_in_warpgroup);
         }
-    }
 
-    // Sync with WG0: ensures WG0 doesn't overwrite sP0 before we read it.
-    NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sP0Ready);
+        // Issue rO1 += rP1b @ sV1R
+        if constexpr (T::kUsePv4x2) {
+            __ppu_barrier_sync(7, 256, 15u);
+        }
+        wg1_scale0_rO1<T>(rO1, sScale0, sScale1, idx_in_warpgroup);
+        if constexpr (!IS_BLK0_LAST) {
+            if constexpr (T::kUsePv4x2) {
+                warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1R, rO1, idx_in_warpgroup, wg_idx);
+            } else if constexpr (T::kIsCrossCut) {
+                // (4,2) layout: each N-warp only has 16/32 P columns, localP broken.
+                // sP1 already saved above, use per-WG barrier then remoteP from SMEM.
+                const int barrier_id = 6 + static_cast<int>(threadIdx.x >> 8);
+                NamedBarrier::sync(
+                    256, static_cast<cutlass::arch::ReservedNamedBarriers>(barrier_id));
+                warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1R, rO1, idx_in_warpgroup, wg_idx);
+            } else {
+                warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, idx_in_warpgroup, wg_idx);
+            }
+        }
 
-    // [BlockM=64 only] CTA-wide barrier for cross-wg SMEM visibility.
-    // Matches the __syncthreads() in wg0_subroutine after its arrive(sP0Ready).
-    // Also implicitly publishes wg1's sP1 store to wg0 for remote PV GEMM.
-    if constexpr (T::kBlockM == 64) {
-        __syncthreads();
-    }
+        // Sync with WG0: ensures WG0 doesn't overwrite sP0 before we read it.
+        NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sP0Ready);
 
-    // Cross-WG: wg1 loads tiles 4-8 for nxt_block0
-    if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem;
-        if constexpr (!T::IsFP8) {
-            issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T>(params, nxt_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[1],
-                idx_in_warpgroup, ori_block_max, precomp_ptr1, precomp_valid1,
-                pre_token_idx_b, nxt_block0 + 2, end_block_idx, extra_seqlen_k);
-        } else {
-            load_and_dequant_sparse_K_staged<4, kNumTiles, T, T::kV41FP8>(
-                params, sK, batch_idx, nxt_block0, seqlen_k,
-                /*buf_idx=*/kv_idx, &barriers_K0[0],
-                idx_in_warpgroup, ori_block_max, smem_valid_indices, 0,
-                prefetched_idx0);
+        // [BlockM=64 only] CTA-wide barrier for cross-wg SMEM visibility.
+        // Matches the __syncthreads() in wg0_subroutine after its arrive(sP0Ready).
+        // Also implicitly publishes wg1's sP1 store to wg0 for remote PV GEMM.
+        if constexpr (T::kBlockM == 64) {
+            __syncthreads();
+        }
+
+        // Cross-WG: wg1 loads tiles 4-8 for nxt_block0
+        if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
+            constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem;
+            if constexpr (!T::IsFP8) {
+                issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T, true, true, true, T::kV32FP8>(params, nxt_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[1],
+                    idx_in_warpgroup, ori_block_max, precomp_ptr1, precomp_valid1,
+                    pre_token_idx_b, nxt_block0 + 2, end_block_idx, extra_seqlen_k, &even_register_packet);
+            } else {
+                load_and_dequant_sparse_K_staged<4, kNumTiles, T, T::kV41FP8>(
+                    params, sK, batch_idx, nxt_block0, seqlen_k,
+                    /*buf_idx=*/kv_idx, &barriers_K0[0],
+                    idx_in_warpgroup, ori_block_max, smem_valid_indices, 0,
+                    prefetched_idx0);
+            }
         }
     }
 
@@ -3372,21 +3587,31 @@ __forceinline__ __device__ void wg1_subroutine(
         }
     }
 
-    // Remote PV GEMM: reads sP0 (ready via sP0Ready) and sV0R
-    warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup, wg_idx);
+    {
+        WgV32HighPacket<T> odd_register_packet{};
+        if constexpr (T::kV32FP8 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+            if (block_idx + 4 < end_block_idx) {
+                odd_register_packet = load_v32_high_register_packet<T>(
+                    precomp_ptr0, precomp_valid0, idx_in_warpgroup);
+            }
+        }
 
-    if constexpr (!T::IsFP8 && T::kBlockM == 128 && T::kUsePv4x2 &&
-                  T::CvtGemmSwzlLd &&
-                  std::is_same_v<typename T::InputT, cutlass::bfloat16_t> &&
-                  !IS_BLK0_LAST && !IS_BLK1_LAST) {
-        if (block_idx + 4 < end_block_idx) {
-            // Rendezvous after the old high-bank reader calls. The next payload
-            // does not alias either bank used by the following QK.
-            __ppu_barrier_sync(7, 256, 15u);
-            constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem;
-            issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T, false, true, false>(params, cur_sK0, batch_idx, block_idx + 5, seqlen_k, &barriers_K1[1],
-                idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
-                pre_token_idx, block_idx + 7, end_block_idx, extra_seqlen_k);
+        // Remote PV GEMM: reads sP0 (ready via sP0Ready) and sV0R
+        warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup, wg_idx);
+
+        if constexpr (!T::IsFP8 && T::kBlockM == 128 && T::kUsePv4x2 &&
+                      T::CvtGemmSwzlLd &&
+                      std::is_same_v<typename T::InputT, cutlass::bfloat16_t> &&
+                      !IS_BLK0_LAST && !IS_BLK1_LAST) {
+            if (block_idx + 4 < end_block_idx) {
+                // Rendezvous after the old high-bank reader calls. The next payload
+                // does not alias either bank used by the following QK.
+                __ppu_barrier_sync(7, 256, 15u);
+                constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem;
+                issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T, false, true, false, T::kV32FP8>(params, cur_sK0, batch_idx, block_idx + 5, seqlen_k, &barriers_K1[1],
+                    idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+                    pre_token_idx, block_idx + 7, end_block_idx, extra_seqlen_k, &odd_register_packet);
+            }
         }
     }
 
@@ -5402,6 +5627,14 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const typename SparseDecodeWGKer
                     &pre_token_idx1, extra_seqlen_k, precomp_valid1, init_load_extra);
             }
 
+            WgV32LowPacket<T> first_register_packet{};
+            if constexpr (T::kV32FP8) {
+                if (start_block_idx + 2 < end_block_idx) {
+                    first_register_packet = load_v32_low_register_packet<T>(
+                        precomp_ptr0, precomp_valid0, idx_in_warpgroup);
+                }
+            }
+
             #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA)    \
                 wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, NEXT_EXTRA>(                \
                 gmem_tiled_copy_K, tKgK, sQ, sK, sV_direct, cur_sK0, cur_sK1, nxt_sK0, sP0, sP1, sM, sScale0, sScale1, rQ8, \
@@ -5412,7 +5645,7 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const typename SparseDecodeWGKer
                 T::IsFP8 ? nullptr : &pre_token_idx0,                                \
                 T::IsFP8 ? nullptr : &pre_token_idx1,                                \
                 extra_seqlen_k,                                                      \
-                precomp_ptr0, precomp_ptr1, precomp_valid0, precomp_valid1);          \
+                precomp_ptr0, precomp_ptr1, precomp_valid0, precomp_valid1, first_register_packet); \
 
             int block_idx = start_block_idx;
             // 3-phase loop: NEXT_EXTRA controls prefetch/compute_addr cache selection

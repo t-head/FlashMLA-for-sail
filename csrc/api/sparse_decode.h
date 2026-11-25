@@ -16,6 +16,50 @@ template<typename T, bool IsFP8, int Headdim, int Headdim_V,
          bool IsV41FP8, bool IsExtraFP4 = false>
 void run_sparse_decode_fwd_dispatch(Flash_fwd_params &params, hggcStream_t stream);
 void get_mla_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
+void run_flash_sparse_decode_wg_kernel_v32_fp8(Flash_fwd_params &params, hggcStream_t stream);
+
+static bool use_v32_packed_wg(const Flash_fwd_params &p, bool is_m890) {
+    constexpr int64_t max_int = std::numeric_limits<int>::max();
+    constexpr int64_t max_offset = std::numeric_limits<int64_t>::max();
+    if (!is_m890 || p.d != 576 || p.d_v != 512 || p.ngroups != 128 ||
+        p.h != 1 || p.h_h_k_ratio != 1 || p.b <= 0 || p.q_orig <= 0 ||
+        int64_t(p.seqlen_q) != int64_t(p.q_orig) * 128 ||
+        p.num_sm_parts <= 0 || p.num_sm_parts > 65535 ||
+        p.extra_topk >= 0 || p.extra_k_ptr || p.extra_indices_ptr || p.extra_topk_len_ptr ||
+        !flashmla::dsa::sparse_decode_m128_index_tiles_supported(p) || p.topk > max_int - 127 ||
+        p.num_blocks <= 0 || p.page_block_size <= 0 ||
+        (p.page_block_size & (p.page_block_size - 1)) != 0)
+        return false;
+
+    const auto aligned16 = [](const void *ptr) {
+        return ptr && (reinterpret_cast<uintptr_t>(ptr) & uintptr_t{15}) == 0;
+    };
+    if (!aligned16(p.q_ptr) || !aligned16(p.o_ptr) || !aligned16(p.k_ptr) ||
+        !p.indices_ptr || !p.tile_scheduler_metadata_ptr || !p.num_splits_ptr ||
+        p.k_row_stride != 656 || p.k_batch_stride < int64_t(p.page_block_size) * 656 ||
+        p.k_batch_stride % 16 != 0 ||
+        p.q_row_stride < 576 || p.q_row_stride > max_int || p.q_row_stride % 8 != 0 ||
+        p.q_batch_stride <= 0 || p.q_batch_stride % 8 != 0 ||
+        p.o_row_stride < 512 || p.o_row_stride % 8 != 0 ||
+        p.o_batch_stride <= 0 || p.o_batch_stride % 8 != 0 ||
+        p.indices_batch_stride < 0 || p.indices_row_stride < 0)
+        return false;
+
+    // Split-output indexing remains int32 even when cache addresses are wide.
+    if ((int64_t(p.b) + p.num_sm_parts) * p.seqlen_q > max_int / 512)
+        return false;
+    const auto span_fits = [](int batches, int rows, int64_t batch_stride,
+                              int64_t row_stride, int64_t width, int64_t limit) {
+        if (row_stride > 0 && int64_t(rows - 1) > (limit - width) / row_stride)
+            return false;
+        const int64_t row_span = int64_t(rows - 1) * row_stride + width;
+        return batch_stride == 0 || int64_t(batches - 1) <= (limit - row_span) / batch_stride;
+    };
+    return span_fits(p.num_blocks, p.page_block_size, p.k_batch_stride, 656, 656, max_offset) &&
+           span_fits(p.b, p.seqlen_q, p.q_batch_stride, p.q_row_stride, 576, max_offset / 2) &&
+           span_fits(p.b, p.seqlen_q, p.o_batch_stride, p.o_row_stride, 512, max_offset / 2) &&
+           span_fits(p.b, p.q_orig, p.indices_batch_stride, p.indices_row_stride, p.topk, max_offset / 4);
+}
 
 namespace flashmla::dsa::v41 {
 void run_h8_fp8_fp4_direct(Flash_fwd_params &, hggcStream_t);
@@ -645,7 +689,16 @@ sparse_attn_decode_interface(
         flashmla::dsa::hs64::run_legacy_int8_decode(params, stream);
     } else if (is_fp8) {
         if (head_size == 576) {
-            run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 576, 512, false>(params, stream);
+            const bool use_v32_wg = kv.size(3) == 656 && !extra_kv && !extra_indices &&
+                !extra_topk_length && kv.device() == q.device() &&
+                indices.device() == q.device() && out.device() == q.device() &&
+                dense_vector(topk_length, batch_size) && dense_vector(attn_sink, ngroups) &&
+                use_v32_packed_wg(params, cc_major == 8 && cc_minor == 9);
+            if (use_v32_wg) {
+                run_flash_sparse_decode_wg_kernel_v32_fp8(params, stream);
+            } else {
+                run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 576, 512, false>(params, stream);
+            }
         } else if (is_v41_fp8) {
             if (is_extra_fp4) {
                 run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 512, 512, true, true>(params, stream);
