@@ -2421,6 +2421,50 @@ __forceinline__ __device__ void finish_v32_optimized_k_tile(
     }
 }
 
+struct V32DecodedPair { uint4 halves[2]; };
+
+__forceinline__ __device__ V32DecodedPair decode_v32_preloaded_pair(
+    const uint4 &packed, float scale, bool valid) {
+    V32DecodedPair decoded{};
+    const __ppu_bfloat162 scale_pair = __float2bfloat162_rn(scale);
+    #pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        if (valid) {
+            const uint32_t words[2] = {half == 0 ? packed.x : packed.z,
+                                       half == 0 ? packed.y : packed.w};
+            uint32_t bits[4];
+            #pragma unroll
+            for (int word = 0; word < 2; ++word) {
+                const __hg_fp8x4_e4m3 fp8 = *reinterpret_cast<const __hg_fp8x4_e4m3*>(&words[word]);
+                const float4 values = (float4)fp8;
+                const __ppu_bfloat162 lo = __hmul2(
+                    __float22bfloat162_rn({values.x, values.y}), scale_pair);
+                const __ppu_bfloat162 hi = __hmul2(
+                    __float22bfloat162_rn({values.z, values.w}), scale_pair);
+                bits[word * 2] = *reinterpret_cast<const uint32_t*>(&lo);
+                bits[word * 2 + 1] = *reinterpret_cast<const uint32_t*>(&hi);
+            }
+            decoded.halves[half] = uint4{bits[0], bits[1], bits[2], bits[3]};
+        }
+    }
+    return decoded;
+}
+
+template<typename T, typename TensorSK>
+__forceinline__ __device__ void store_v32_predecoded_tiles45(
+    TensorSK &sK, const V32DecodedPair &decoded, int tidx) {
+    static_assert(std::is_same_v<T, V32SingleTaskDecodeTraits> && T::kBlockN == 32);
+    const int row = tidx / 8, lane = tidx & 7;
+    #pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int dst_lane = (lane & 3) * 2 + half;
+        const int col = (dst_lane ^ (row % 8)) * 8;
+        const int offset = 4 * T::kBlockN * 64 + (row / 16) * 2048
+            + (lane / 4) * 1024 + (row % 16) * 64 + col;
+        *reinterpret_cast<uint4*>(sK.data().get() + offset) = decoded.halves[half];
+    }
+}
+
 template<int Tile, typename T, bool Pair = false, typename TensorSK>
 __forceinline__ __device__ void store_v32_optimized_k_tile(
     TensorSK &sK, const uint8_t *row_ptr, bool valid, int tidx) {
@@ -2525,7 +2569,8 @@ __forceinline__ __device__ void issue_K_load_bf16(
     int next_block_idx,
     int end_block_idx,
     int extra_seqlen_k,
-    const WgV32RegisterPacket<S, E, T> *packet = nullptr
+    const WgV32RegisterPacket<S, E, T> *packet = nullptr,
+    const V32DecodedPair *decoded45 = nullptr
 ) {
     using Base   = typename T::Base;
     using InputT = typename T::InputT;
@@ -2544,7 +2589,12 @@ __forceinline__ __device__ void issue_K_load_bf16(
                     finish_v32_optimized_k_tile<0, T, true>(sK_buf, packet->tiles01, packet->scale01, is_valid, tidx);
                     finish_v32_optimized_k_tile<2, T, true>(sK_buf, packet->tiles23, packet->scale23, is_valid, tidx);
                 } else {
-                    finish_v32_optimized_k_tile<4, T, true>(sK_buf, packet->tiles45, packet->scale45, is_valid, tidx);
+                    if constexpr (std::is_same_v<T, V32SingleTaskDecodeTraits>) {
+                        if (decoded45) store_v32_predecoded_tiles45<T>(sK_buf, *decoded45, tidx);
+                        else finish_v32_optimized_k_tile<4, T, true>(sK_buf, packet->tiles45, packet->scale45, is_valid, tidx);
+                    } else {
+                        finish_v32_optimized_k_tile<4, T, true>(sK_buf, packet->tiles45, packet->scale45, is_valid, tidx);
+                    }
                     finish_v32_optimized_k_tile<6, T, true>(sK_buf, packet->tiles67, packet->scale67, is_valid, tidx);
                     finish_v32_optimized_k_tile<8, T, false>(sK_buf, packet->tile8, 0.0f, is_valid, tidx);
                 }
@@ -3565,6 +3615,13 @@ __forceinline__ __device__ void wg1_subroutine(
             }
         }
 
+        std::conditional_t<std::is_same_v<T, V32SingleTaskDecodeTraits>,
+            V32DecodedPair, EmptyV32RegisterPacket> decoded45{};
+        if constexpr (std::is_same_v<T, V32SingleTaskDecodeTraits> && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+            decoded45 = decode_v32_preloaded_pair(
+                even_register_packet.tiles45, even_register_packet.scale45, precomp_valid1);
+        }
+
         // Sync with WG0: ensures WG0 doesn't overwrite sP0 before we read it.
         NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sP0Ready);
 
@@ -3579,9 +3636,15 @@ __forceinline__ __device__ void wg1_subroutine(
         if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
             constexpr int kNumTiles = T::kHeadDim / T::kBlockKSmem;
             if constexpr (!T::IsFP8) {
-                issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T, true, true, true, T::kV32FP8>(params, nxt_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[1],
-                    idx_in_warpgroup, ori_block_max, precomp_ptr1, precomp_valid1,
-                    pre_token_idx_b, nxt_block0 + 2, end_block_idx, extra_seqlen_k, &even_register_packet);
+                if constexpr (std::is_same_v<T, V32SingleTaskDecodeTraits>) {
+                    issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T, true, true, true, true>(params, nxt_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[1],
+                        idx_in_warpgroup, ori_block_max, precomp_ptr1, precomp_valid1,
+                        pre_token_idx_b, nxt_block0 + 2, end_block_idx, extra_seqlen_k, &even_register_packet, &decoded45);
+                } else {
+                    issue_K_load_bf16<4, kNumTiles, NEXT_EXTRA, T, true, true, true, T::kV32FP8>(params, nxt_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[1],
+                        idx_in_warpgroup, ori_block_max, precomp_ptr1, precomp_valid1,
+                        pre_token_idx_b, nxt_block0 + 2, end_block_idx, extra_seqlen_k, &even_register_packet);
+                }
             } else {
                 load_and_dequant_sparse_K_staged<4, kNumTiles, T, T::kV41FP8>(
                     params, sK, batch_idx, nxt_block0, seqlen_k,
