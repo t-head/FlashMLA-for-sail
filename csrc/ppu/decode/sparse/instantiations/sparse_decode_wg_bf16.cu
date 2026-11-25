@@ -35,7 +35,7 @@ static void launch_v32_packed_wg(Flash_fwd_params &params, hggcStream_t stream) 
 void run_flash_sparse_decode_wg_kernel_v32_fp8(Flash_fwd_params &params, hggcStream_t stream) {
     const int64_t tasks_bound = int64_t(params.b) + params.num_sm_parts - 1;
     const bool single_task = (params.q_orig == 4 || params.q_orig == 5) &&
-        params.b >= 128 && params.topk >= 2048 &&
+        (params.b >= 128 || int64_t(params.b) >= 8 * int64_t(params.num_sm_parts)) && params.topk >= 2048 &&
         params.num_sm_parts > 1 && !params.topk_len_ptr &&
         tasks_bound > 0 && tasks_bound <= 65535;
     if (single_task) {
