@@ -2191,6 +2191,27 @@ __forceinline__ __device__ void store_o(
     }
 }
 
+struct V32SingleTaskDecodeTraits : V32OptimizedDecodeTraits {};
+
+__forceinline__ __device__ bool resolve_v32_single_task(
+        const Flash_fwd_params &p, int ordinal, int &partition, int &batch) {
+    int64_t prefix = 0;
+    for (int candidate = 0; candidate < p.num_sm_parts; ++candidate) {
+        const int *metadata = p.tile_scheduler_metadata_ptr +
+            int64_t(candidate) * TileSchedulerMetaDataSize;
+        const int4 schedule = *reinterpret_cast<const int4*>(metadata);
+        if (schedule.x >= p.b) continue;
+        const int64_t count = int64_t(schedule.z) - schedule.x + 1;
+        if (ordinal >= prefix && int64_t(ordinal) - prefix < count) {
+            partition = candidate;
+            batch = schedule.x + int(int64_t(ordinal) - prefix);
+            return true;
+        }
+        prefix += count;
+    }
+    return false;
+}
+
 // Internal address representation for aligned, main-only cache spans below 64GiB.
 template<typename T>
 struct CompactKAddrTraits : T {
@@ -5302,7 +5323,14 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const typename SparseDecodeWGKer
     const int m_block_idx = blockIdx.x;
     const int k_head_idx = blockIdx.y;
     // Keep the parent's metadata identity; child parity changes only batch ownership.
-    const int partition_idx = blockIdx.z / T::kMetadataStripeFactor;
+    constexpr bool single_task = std::is_same_v<T, V32SingleTaskDecodeTraits>;
+    int partition_idx = blockIdx.z / T::kMetadataStripeFactor;
+    int task_batch_idx = -1;
+    if constexpr (single_task) {
+        static_assert(T::kV32FP8 && T::kMetadataStripeFactor == 1);
+        // CTA-uniform resolution/exit before shared-memory barrier initialization.
+        if (!resolve_v32_single_task(params, blockIdx.z, partition_idx, task_batch_idx)) return;
+    }
     const int metadata_stripe_idx = blockIdx.z % T::kMetadataStripeFactor;
     const int warpgroup_idx = __builtin_ppu_to_uniform_b32(threadIdx.x / 256);
     const int idx_in_warpgroup = threadIdx.x % 256;
@@ -5371,7 +5399,8 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const typename SparseDecodeWGKer
 
     // Descriptor begin/end stay unchanged: they still identify partial K ranges
     // and the original begin_n_split_idx. Only the first owned batch is shifted.
-    const int first_batch_idx = begin_idx + metadata_stripe_idx;
+    const int first_batch_idx = single_task ? task_batch_idx : begin_idx + metadata_stripe_idx;
+    const int owned_end_idx = single_task ? task_batch_idx : end_idx;
     if constexpr (T::kMetadataStripeFactor > 1) {
         // CTA-uniform exit before any Q load for an empty child stripe.
         if (first_batch_idx > end_idx || first_batch_idx >= params.b) return;
@@ -5381,7 +5410,7 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const typename SparseDecodeWGKer
 
 #pragma unroll 1
 #pragma clang loop licm(disable)
-    for (int batch_idx = first_batch_idx; batch_idx <= end_idx;
+    for (int batch_idx = first_batch_idx; batch_idx <= owned_end_idx;
          batch_idx += T::kMetadataStripeFactor) {
         constexpr int kBlockN = T::kBlockN;
         const int n_split_idx = batch_idx == begin_idx ? begin_n_split_idx : 0;
@@ -5877,7 +5906,7 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const typename SparseDecodeWGKer
                 }
             }
 
-            if (batch_idx + T::kMetadataStripeFactor <= end_idx) {
+            if (batch_idx + T::kMetadataStripeFactor <= owned_end_idx) {
                 // Skip mbarrier reinit: barrier phases are consistent across batches.
                 // store_o<T, true> writes directly to GMEM, no sO_addr SMEM race.
                 launch_q_copy<T>(params, batch_idx + T::kMetadataStripeFactor, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
@@ -5919,7 +5948,7 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const typename SparseDecodeWGKer
 
             store_o<T, false>(rO, gOAccum, output_norm, sO_addr, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
 
-            if (batch_idx + T::kMetadataStripeFactor <= end_idx) {
+            if (batch_idx + T::kMetadataStripeFactor <= owned_end_idx) {
                 // Keep mbarrier reinit for split path (store_o<T,false> uses sO_addr)
                 wg_init_copy_barriers<32 * (T::kBlockM / T::kBlockMPerLoad)>(barrier_Q, barriers_K0, barriers_K1);
                 __syncthreads();
@@ -5932,11 +5961,11 @@ flash_sparse_decode_wg_kernel(__grid_constant__ const typename SparseDecodeWGKer
         if constexpr (T::kMetadataStripeFactor > 1) {
             // A child's last batch may be end_idx-1. Do not prefetch or reset
             // phases for the other child, or retain an unmatched async Q copy.
-            if (batch_idx + T::kMetadataStripeFactor <= end_idx)
+            if (batch_idx + T::kMetadataStripeFactor <= owned_end_idx)
                 __syncthreads();
         } else {
             // Keep the original generic image's exact terminal condition.
-            if (batch_idx != end_idx)
+            if (batch_idx != owned_end_idx)
                 __syncthreads();
         }
     }
