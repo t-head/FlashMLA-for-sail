@@ -468,7 +468,8 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
     const float *__restrict__ gAttnSink, const int *__restrict__ gTopkLength,
     const int *request_errors, int lse_queries = 0, const E4M3 *extra_kv = nullptr,
     const int *extra_ids = nullptr, const int *extra_lengths = nullptr,
-    int primary_width = 0, int primary_rows = 0, int request_queries = 1) {
+    int primary_width = 0, int primary_rows = 0, int request_queries = 1,
+    int gather_cache_rows = 0) {
     using Traits = Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>;
     constexpr int BN = BlockN;
     constexpr bool SingleTile = BlockN == 128;
@@ -622,25 +623,45 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
     }
     __syncthreads();
 
-    // Per-thread gather offsets are tile-invariant: compute the swizzled
-    // destinations once instead of re-deriving the XOR on every granule.
-    // Gather whole 16-byte granules cooperatively; wider groups amortize
-    // sparse row lookups when the grid has enough parallel work.
-    static constexpr int GATHER_LANES = GatherLanes;
-    static constexpr int GATHER_ROWS = NTHR / GATHER_LANES;
-    static constexpr int GATHER_REPEATS = BN / GATHER_ROWS;
-    static constexpr int GATHER_WIDTH = GATHER_LANES * 16;
-    static constexpr int KSEGS = (DQK + GATHER_WIDTH - 1) / GATHER_WIDTH;
-    const int grow = tid / GATHER_LANES, glane = tid % GATHER_LANES, col0 = glane * 16;
-    // Both gather widths are multiples of the 64-byte cube width.
-    // Keep one lane offset; later cubes add a constant physical stride.
-    int gather_offsets[GATHER_REPEATS];
-    CUTE_UNROLL
-    for (int r = 0; r < GATHER_REPEATS; ++r)
-        gather_offsets[r] = (int)(reinterpret_cast<const uint8_t *>(
-            &sKt0(grow + r * GATHER_ROWS, col0)) - reinterpret_cast<const uint8_t *>(pK));
+    bool wide_gather = false;
+    if constexpr (GatherLanes == 0) {
+        static_assert(BM == 64 && NTHR == 256 && BN == 64 && !Dual);
+        if (wp == 0) {
+            const int slot = lane * max(0, topk_length - 1) / 31;
+            const int token = topk_length > 0 ? sIdx[slot] : -1;
+            const bool valid = (unsigned)token < (unsigned)s_kv;
+            int low = valid ? token : s_kv, high = valid ? token : 0;
+            bool repeated = false;
+            if (q_token > 0) {
+                const int previous_length = gTopkLength
+                    ? max(0, min(n_tiles * BN, gTopkLength[q_token - 1])) : n_tiles * BN;
+                repeated = slot < previous_length && token == gIdx[slot - n_tiles * BN];
+            }
+            const bool shared_history = __all_sync(0xffffffff, repeated);
+            CUTE_UNROLL
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                low = min(low, __shfl_xor_sync(0xffffffff, low, offset));
+                high = max(high, __shfl_xor_sync(0xffffffff, high, offset));
+            }
+            if (lane == 0)
+                *sFlag = !shared_history && gather_cache_rows > 0 && high - low > gather_cache_rows;
+        }
+        __syncthreads();
+        wide_gather = *sFlag;
+    }
 
-    auto issue_K = [&](int t) {
+    auto gather_K = [&](auto lanes, int t) {
+        constexpr int GATHER_LANES = decltype(lanes)::value;
+        constexpr int GATHER_ROWS = NTHR / GATHER_LANES;
+        constexpr int GATHER_REPEATS = BN / GATHER_ROWS;
+        constexpr int GATHER_WIDTH = GATHER_LANES * 16;
+        constexpr int KSEGS = (DQK + GATHER_WIDTH - 1) / GATHER_WIDTH;
+        const int grow = tid / GATHER_LANES, col0 = (tid % GATHER_LANES) * 16;
+        int gather_offsets[GATHER_REPEATS];
+        CUTE_UNROLL
+        for (int r = 0; r < GATHER_REPEATS; ++r)
+            gather_offsets[r] = (int)(reinterpret_cast<const uint8_t *>(
+                &sKt0(grow + r * GATHER_ROWS, col0)) - reinterpret_cast<const uint8_t *>(pK));
         uint8_t *kdst = reinterpret_cast<uint8_t *>(pK + (t & 1) * KTILE);
         CUTE_UNROLL
         for (int r = 0; r < GATHER_REPEATS; ++r) {
@@ -688,6 +709,16 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
                             *reinterpret_cast<cute::uint128_t *>(kdst + kdst0 + j * GATHER_WIDTH * BN),
                             ok);
             }
+        }
+    };
+    auto issue_K = [&](int t) {
+        if constexpr (GatherLanes == 0) {
+            if (wide_gather)
+                gather_K(Int<8>{}, t);
+            else
+                gather_K(Int<4>{}, t);
+        } else {
+            gather_K(Int<GatherLanes>{}, t);
         }
     };
     // PV reads the same swizzled KV stage as QK for both head tiles.
@@ -885,7 +916,8 @@ void launch(const flashmla::sparse_native_fp8::AttentionParams &params) {
         params.q, static_cast<const E4M3 *>(params.kv), params.idx,
         static_cast<cutlass::bfloat16_t *>(params.out), params.scale, (params.width / 64),
         params.kvrows, params.os, params.heads, params.maxima, params.lse, params.sink,
-        params.lengths, nullptr, params.lse_queries, nullptr, nullptr, nullptr, 0, 0, 1);
+        params.lengths, nullptr, params.lse_queries, nullptr, nullptr, nullptr, 0, 0, 1,
+        GatherLanes == 0 ? int(int64_t(params.cache_bytes) * 4 / D) : 0);
 }
 template <int Threads, int Prefix = 0, int GatherLanes = 8, bool GuardGatherReuse = false>
 void dispatch(const flashmla::sparse_native_fp8::AttentionParams &params) {
