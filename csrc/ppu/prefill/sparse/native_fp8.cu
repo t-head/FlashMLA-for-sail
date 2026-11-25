@@ -962,6 +962,15 @@ bool try_sparse_fp8_std(const flashmla::sparse_native_fp8::AttentionParams &para
             flashmla_fp8_std::dispatch<256, 8, 16, true>(params);
             return true;
         }
+        const bool adaptive_gather = enough_scan && device->cache_bytes > 0 &&
+            int64_t(params.kvrows) * params.dim > int64_t(device->cache_bytes) * 4 &&
+            int64_t(params.queries) * (params.heads / 64) >= MinGridWaves * device->compute_units;
+        if (!params.maxima && !params.lse && adaptive_gather) {
+            auto launch = params.trusted_full_topk ? flashmla_fp8_std::launch<576, 256, true, 8, 0>
+                                                  : flashmla_fp8_std::launch<576, 256, false, 8, 0>;
+            launch(params);
+            return true;
+        }
         auto launch = !params.maxima && !params.lse ? flashmla_fp8_std::dispatch<256, 8, 4>
                       : streaming                   ? flashmla_fp8_std::dispatch<256, 8, 16>
                                                     : flashmla_fp8_std::dispatch<256, 8, 8>;

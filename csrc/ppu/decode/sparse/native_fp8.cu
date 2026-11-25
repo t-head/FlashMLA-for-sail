@@ -344,7 +344,7 @@ static void launch_native_d512_small(const flashmla::sparse_native_fp8::Attentio
         static_cast<cutlass::bfloat16_t *>(params.out), params.scale,
         (params.width / 64) * 64 / BlockN, params.kvrows, params.os, Heads, params.maxima,
         params.lse, params.sink, params.lengths, params.errors, params.lse_queries, nullptr,
-        nullptr, nullptr, 0, 0, params.qpr);
+        nullptr, nullptr, 0, 0, params.qpr, 0);
 }
 
 // Full head groups share KV; long lists trade more per-thread work for fewer warps.
@@ -360,7 +360,7 @@ void run_native_d512_compact(const flashmla::sparse_native_fp8::AttentionParams 
                                   static_cast<cutlass::bfloat16_t *>(params.out), params.scale, 1,
                                   params.kvrows, params.os, params.heads, params.maxima, params.lse,
                                   params.sink, params.lengths, nullptr, params.lse_queries, nullptr,
-                                  nullptr, nullptr, 0, 0, 1);
+                                  nullptr, nullptr, 0, 0, 1, 0);
         return;
     }
     if ((params.width / 64) == 2 && (params.heads == 8 || params.heads == 16)) {
@@ -420,7 +420,7 @@ void launch_native_d512_dual_compact(const flashmla::sparse_native_fp8::Attentio
         (params.width + params.extra_width) / 64, params.kvrows + params.extra_rows, 1.f,
         params.heads, nullptr, params.lse, params.sink, params.lengths, params.errors,
         params.lse_queries, static_cast<const E4M3 *>(params.extra), params.extra_idx,
-        params.extra_lengths, params.width, params.kvrows, params.qpr);
+        params.extra_lengths, params.width, params.kvrows, params.qpr, 0);
 }
 
 void run_native_d512_dual_compact(const flashmla::sparse_native_fp8::AttentionParams &params) {
