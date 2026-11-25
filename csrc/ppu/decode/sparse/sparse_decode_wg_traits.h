@@ -460,6 +460,8 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
     static constexpr bool kMultiPrefillHeadTiles = false;
     static constexpr bool kParkQ5Fragment = false;
     static constexpr bool kV41FP8 = IsV41FP8;
+    static constexpr bool kV40FP8 = false;
+    static constexpr bool kQuantizedCache = IsV41FP8;
     static constexpr bool kExtraFP4 = IsExtraFP4;
 
     static constexpr int kHeadDim = HeadDimK;
@@ -718,6 +720,13 @@ struct Hs64Traits : public Hs64BaseTraits<Arch> {
             cute::array_aligned<InputT, cosize_v<SmemLayoutKHigh4>, kSPAlign>>;
         EvenHighBank smem_even_high;
     };
+};
+
+struct Hs64V40Traits : Hs64Traits<512, true, 89, true, false> {
+    static constexpr bool kV41FP8 = false;
+    static constexpr bool kV40FP8 = true;
+    static constexpr bool kQuantizedCache = true;
+    static constexpr int kBytesPerToken = 576;
 };
 
 // Each CTA owns one M64 head tile, without split-KV. Query grouping is

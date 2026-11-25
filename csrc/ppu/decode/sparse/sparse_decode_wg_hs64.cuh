@@ -100,8 +100,7 @@ struct Copy_Traits<HS64_TSM_K_UNIT16>
 
 namespace flashmla::dsa::hs64 {
 
-// Packed V4.1 decode owns a complete (request, query) per task. Other H64
-// instances keep their existing split scheduler or grouped prefill schedule.
+// Worklist ownership does not imply packed KV addressing.
 enum class Hs64Worklist { Single, Batch, Flat };
 template<int MainCapacity, Hs64Worklist Worklist, int Arch = 89, bool FloatKV = true>
 struct Hs64PackedDecode : Hs64Traits<512, true, Arch, true, true> {
@@ -110,6 +109,12 @@ struct Hs64PackedDecode : Hs64Traits<512, true, Arch, true, true> {
 struct Hs64PackedFp8ExtraDecode : Hs64Traits<512, true, 89, true, false> {};
 template<int MainCapacity, Hs64Worklist W>
 struct Hs64PackedFp8ExtraWorklist : Hs64PackedFp8ExtraDecode {};
+template<Hs64Worklist W>
+struct Hs64V40CompleteDecode : Hs64V40Traits {};
+
+template<typename T> inline constexpr bool kV40CompleteQueries = false;
+template<Hs64Worklist W>
+inline constexpr bool kV40CompleteQueries<Hs64V40CompleteDecode<W>> = true;
 
 template<typename T> inline constexpr int kPackedMain = 0;
 template<int MainCapacity, Hs64Worklist W, int Arch, bool FloatKV>
@@ -123,6 +128,8 @@ inline constexpr Hs64Worklist kWorklist<Hs64PackedDecode<MainCapacity, W, Arch, 
 template<> inline constexpr Hs64Worklist kWorklist<Hs64PackedFp8ExtraDecode> = Hs64Worklist::Flat;
 template<int MainCapacity, Hs64Worklist W>
 inline constexpr Hs64Worklist kWorklist<Hs64PackedFp8ExtraWorklist<MainCapacity, W>> = W;
+template<Hs64Worklist W>
+inline constexpr Hs64Worklist kWorklist<Hs64V40CompleteDecode<W>> = W;
 
 template<typename T> struct Hs64PackedExtraStep : T {};
 template<typename T> inline constexpr int kPackedMain<Hs64PackedExtraStep<T>> = kPackedMain<T>;
@@ -202,6 +209,7 @@ __forceinline__ __device__ auto hs64_convert_layout_acc_rowcol(Layout acc_layout
 // Build tag printed once per kernel launch, for log attribution.
 inline constexpr char kHs64BuildTag[] = "HS64_BF16_LOCAL_K_PIPELINE";
 inline constexpr char kHs64V41BuildTag[] = "HS64_V41_WI2_QUANT";
+inline constexpr char kHs64V40BuildTag[] = "HS64_V40_WI2_QUANT";
 
 // Three independent Prefill queries share one CTA. Their output staging
 // uses the retired second K bank so the next Q copy can overlap the epilogue.
@@ -242,6 +250,8 @@ inline constexpr int kPackedMain<Hs64KvOffsetTraits<T, KvOffset>> = kPackedMain<
 template<typename T, typename KvOffset>
 inline constexpr Hs64Worklist kWorklist<Hs64KvOffsetTraits<T, KvOffset>> = kWorklist<T>;
 template<typename T, typename KvOffset>
+inline constexpr bool kV40CompleteQueries<Hs64KvOffsetTraits<T, KvOffset>> = kV40CompleteQueries<T>;
+template<typename T, typename KvOffset>
 inline constexpr bool kPackedExtraStep<Hs64KvOffsetTraits<T, KvOffset>> = kPackedExtraStep<T>;
 template<typename T, typename KvOffset>
 inline constexpr bool kHs64PrefillFourQueryGroups<Hs64KvOffsetTraits<T, KvOffset>> =
@@ -261,7 +271,7 @@ inline constexpr bool kHs64RowUnitOffsets<Hs64RowUnitOffsetTraits<T>> = true;
 // and on D576. WG0 publishes completion of its old odd-low PV readers first.
 template <typename T>
 inline constexpr bool kHs64LocalOddLow =
-    T::kHasExtraKTile || T::kV41FP8 || ((T::kIsPrefill || !T::kGuardIndices) &&
+    T::kHasExtraKTile || T::kQuantizedCache || ((T::kIsPrefill || !T::kGuardIndices) &&
                          T::kArch == 89 && T::kHeadDim == 512 &&
                          T::kIsCrossCut && T::kUseQkWeave && T::kUseEvenHighBank);
 
@@ -1437,7 +1447,7 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
         } else {
             load0(_0{});
         }
-        if constexpr (kPackedMain<T> != 0) {
+        if constexpr (kPackedMain<T> != 0 || kV40CompleteQueries<T>) {
             // V columns have separate output accumulators. Issue the next
             // V fragment between independent PV products in the current K slice.
             auto multiply_columns = [&](auto step, auto& current_p, auto& current_v,
@@ -2896,7 +2906,7 @@ __forceinline__ __device__ void compute_K_addr_bf16(
     constexpr int kBlockN        = T::kBlockN;
     constexpr int kBytesPerToken = T::kV41FP8
         ? (USE_EXTRA && T::kExtraFP4 ? 288 : 528) : T::kBytesPerToken;
-    constexpr int kAddressUnitBytes = T::kV41FP8
+    constexpr int kAddressUnitBytes = T::kQuantizedCache
         ? (USE_EXTRA && T::kExtraFP4 ? 4 : 8) : 16;
     // Coarser units are only valid for the narrow, row-aligned non-packed path.
     constexpr bool kUseRowUnits = [] {
@@ -2919,14 +2929,14 @@ __forceinline__ __device__ void compute_K_addr_bf16(
         valid_len = extra_seqlen_k;
         k_base_ptr = reinterpret_cast<InputT*>(params.extra_k_ptr);
         k_stride_elems = static_cast<size_t>(params.extra_k_batch_stride) /
-            (T::kV41FP8 ? sizeof(InputT) : 1);
+            (T::kQuantizedCache ? sizeof(InputT) : 1);
     } else {
         effective_block = block_idx_kv;
         page_block_size = params.page_block_size;
         valid_len = seqlen_k;
         k_base_ptr = reinterpret_cast<InputT*>(params.k_ptr);
         k_stride_elems = static_cast<size_t>(params.k_batch_stride) /
-            (T::kV41FP8 || kHs64LegacyInt8<T> ? sizeof(InputT) : 1);
+            (T::kQuantizedCache || kHs64LegacyInt8<T> ? sizeof(InputT) : 1);
     }
     int tile_valid = valid_len - effective_block * kBlockN;
 
@@ -3007,7 +3017,7 @@ __forceinline__ __device__ void compute_K_addr_bf16(
                 static_cast<size_t>(t_idx) * k_stride_elems * sizeof(InputT)
                 / kRowUnitBytes);
         } else {
-            const bool linear_pages = !T::kV41FP8 && (page_block_size > 0)
+            const bool linear_pages = !T::kQuantizedCache && (page_block_size > 0)
                 & ((static_cast<unsigned>(page_block_size)
                     & (static_cast<unsigned>(page_block_size) - 1u)) == 0)
                 & (k_stride_elems == static_cast<size_t>(page_block_size)
@@ -3107,7 +3117,7 @@ __forceinline__ __device__ void compute_K_addr_bf16(
         }
     }
 
-    if constexpr (PREFETCH_K && !T::kIsPrefill && !T::kV41FP8 && !kHs64LegacyInt8<T>) {
+    if constexpr (PREFETCH_K && !T::kIsPrefill && !T::kQuantizedCache && !kHs64LegacyInt8<T>) {
         // The optional prefetch hint accepts a narrow byte offset.
         constexpr unsigned kAtomLimit = 0x0fffffffu
             - T::kNumKTiles * T::kGmemThrPerTok;
@@ -3592,6 +3602,62 @@ __forceinline__ __device__ void hs64_store_v41_fp8_tile(
     hs64_store_v41_fp8_from_stage<T>(dst, token, lane, dst_tile, packed, scale_raw, valid);
 }
 
+template<typename TensorDst>
+__forceinline__ __device__ void hs64_store_v40_raw_rope(
+    TensorDst &dst, int token, int lane, int dst_tile,
+    uint4 bits0, uint4 bits1) {
+    const int dst_dim = dst_tile * 64 + lane * 8;
+    cutlass::arch::shared_store<16>(cute::cast_smem_ptr_to_uint(&dst(token, dst_dim)), &bits0);
+    cutlass::arch::shared_store<16>(cute::cast_smem_ptr_to_uint(&dst(token, dst_dim + 8)), &bits1);
+}
+
+template<int S, int E, bool MergeHigh, bool EvenHighOnly, bool EvenLowOnly,
+         typename T, typename TensorDst, typename TensorHigh>
+__forceinline__ __device__ void hs64_store_v40_fp8_preloaded(
+    TensorDst &dst, TensorHigh *high, int token, int wide_lane,
+    const uint8_t *row, const uint8_t *scales, bool valid) {
+    static_assert(S % 4 == 0 && E % 4 == 0 && S < E && E <= 8);
+    static_assert(!MergeHigh || (S == 0 && E == 4));
+    static_assert(!(EvenHighOnly && EvenLowOnly));
+    static_assert((!EvenHighOnly && !EvenLowOnly) || MergeHigh);
+    constexpr int FirstTile = EvenHighOnly ? 4 : S;
+    constexpr int LastTile = MergeHigh && !EvenLowOnly ? 8 : E;
+    uint4 packed[LastTile - FirstTile]{};
+    uint4 rope0{}, rope1{};
+    uint64_t scale_word = 0;
+    if (valid) {
+        scale_word = __ldg(reinterpret_cast<const uint64_t*>(scales));
+        #pragma unroll
+        for (int tile = FirstTile; tile < LastTile && tile < 7; ++tile) {
+            packed[tile - FirstTile] = __ldg(
+                reinterpret_cast<const uint4*>(row + tile * 64 + wide_lane * 16));
+        }
+        if constexpr (LastTile == 8) {
+            const auto *rope = row + 448 + wide_lane * 32;
+            rope0 = __ldg(reinterpret_cast<const uint4*>(rope));
+            rope1 = __ldg(reinterpret_cast<const uint4*>(rope + 16));
+        }
+    }
+    const int lane = wide_lane * 2;
+    auto store_tile = [&](auto &out, int tile, int dst_tile) {
+        if (tile == 7) {
+            hs64_store_v40_raw_rope(out, token, lane, dst_tile, rope0, rope1);
+        } else {
+            const uint8_t raw = static_cast<uint8_t>(scale_word >> (tile * 8));
+            hs64_store_v41_fp8_from_stage<T, true>(out, token, lane, dst_tile,
+                packed[tile - FirstTile], raw, valid);
+        }
+    };
+    if constexpr (!EvenHighOnly) {
+        #pragma unroll
+        for (int tile = S; tile < E; ++tile) store_tile(dst, tile, tile);
+    }
+    if constexpr (MergeHigh && !EvenLowOnly) {
+        #pragma unroll
+        for (int tile = 4; tile < 8; ++tile) store_tile(*high, tile, tile - 4);
+    }
+}
+
 template<int S, int E, bool MergeHigh, typename T, typename TensorDst, typename TensorHigh>
 __forceinline__ __device__ void hs64_store_v41_fp8_preloaded(
     TensorDst &dst, TensorHigh *high, int token, int lane,
@@ -4068,6 +4134,30 @@ __forceinline__ __device__ void issue_K_load_bf16(
         hs64_store_legacy_int8<S, E, T, LOCAL_COPY_GROUP, MERGE_EVEN_HIGH,
                              ODD_LOW_ONLY, EVEN_HIGH_ONLY, EVEN_LOW_ONLY>(
             params, sK_buf, even_high, token_ptr[pass], is_valid[pass], tidx);
+    } else if constexpr (T::kV40FP8) {
+        static_assert(T::kArch == 89 && !T::kUsePairedCubes && T::kGmemPasses == 2 &&
+                      T::kGmemThrPerTok == 8 && T::kBytesPerToken == 576);
+        const bool use_extra = ori_block_max >= 0 && block_idx_kv >= ori_block_max;
+        const int page_size = use_extra ? params.extra_page_block_size : params.page_block_size;
+        const size_t stride = static_cast<size_t>(
+            use_extra ? params.extra_k_batch_stride : params.k_batch_stride);
+        const auto *base = reinterpret_cast<const uint8_t*>(
+            use_extra ? params.extra_k_ptr : params.k_ptr);
+        const int pass = (tidx >> 2) & 1;
+        const int token = (tidx >> 3) + pass * T::kGmemTokPerPass;
+        const bool valid = is_valid[pass];
+        const uint8_t *scales = base;
+        if (valid) {
+            const int index = pre_token_idx[0];
+            const int page = index >> __builtin_ctz(page_size);
+            const int offset = index & (page_size - 1);
+            scales = base + static_cast<size_t>(page) * stride +
+                static_cast<size_t>(page_size) * T::kBytesPerToken +
+                static_cast<size_t>(offset) * 8;
+        }
+        const auto *row = reinterpret_cast<const uint8_t*>(token_ptr[pass]) - (tidx & 7) * 8;
+        hs64_store_v40_fp8_preloaded<S, E, MERGE_EVEN_HIGH, EVEN_HIGH_ONLY, EVEN_LOW_ONLY, T>(
+            sK_buf, even_high, token, tidx & 3, row, scales, valid);
     } else if constexpr (T::kV41FP8) {
         const bool use_extra = kPackedExtraStep<T> ||
             (ori_block_max >= 0 && block_idx_kv >= ori_block_max);
@@ -4268,7 +4358,7 @@ __forceinline__ __device__ void issue_K_load_bf16(
     // One completion after both copy waves. WG-local K1-high/K0-low use
     // the async group; cross-WG publications retain their shared mbarrier.
     if constexpr (LOCAL_COPY_GROUP) {
-        static_assert(!ODD_LOW_ONLY || ((T::kHasExtraKTile || T::kV41FP8) && S == 0 && E == 4));
+        static_assert(!ODD_LOW_ONLY || ((T::kHasExtraKTile || T::kQuantizedCache) && S == 0 && E == 4));
         static_assert((S == 0 && E == T::kStage1KTiles) ||
                       (S == T::kStage1KTiles &&
                        (E == T::kNumKTiles || (T::kHasExtraKTile && E == 8))));
@@ -4410,16 +4500,16 @@ __forceinline__ __device__ void load_K_tiles_bf16(
     }
 }
 
-// Both caches of this codec use 528-byte FP8 rows. The prologue keeps all
-// eight tiles in flight and keeps the split high/low completion signals.
+// High and low prologue tiles share token addresses and retain split completion signals.
 template<bool kLowLocal, typename T, typename TensorSK, typename TensorVI>
 __forceinline__ __device__ void hs64_load_packed_fp8_prolog(
     const Flash_fwd_mla_params &params, TensorSK &sK_buf, int batch_idx,
     int block_idx_kv, int seqlen_k, __mbarrier_t *barrier_low, int tidx,
     int ori_block_max, TensorVI &smem_valid_indices, int vi_buf,
     int *pre_token_idx, int next_block_idx, int end_block_idx, int extra_seqlen_k) {
-    static_assert(T::kV41FP8 && !T::kExtraFP4 && kPackedMain<T> != 0 &&
-                  !T::kHasExtraKTile && T::kGmemPasses == 2 && T::kGmemThrPerTok == 8);
+    static_assert(T::kArch == 89 && !T::kExtraFP4 && !T::kHasExtraKTile &&
+                  T::kGmemPasses == 2 && T::kGmemThrPerTok == 8 &&
+                  ((T::kV41FP8 && kPackedMain<T> != 0) || kV40CompleteQueries<T>));
     typename T::InputT* token_ptr[T::kGmemPasses];
     bool is_valid[T::kGmemPasses];
     compute_K_addr_bf16_dynamic<0, T>(
@@ -4429,9 +4519,31 @@ __forceinline__ __device__ void hs64_load_packed_fp8_prolog(
     const int pass = (tidx & 4) ? 1 : 0;
     const int wide_lane = tidx & 3;
     const uint8_t *row = reinterpret_cast<const uint8_t*>(token_ptr[pass]) - (tidx & 7) * 8;
-    hs64_store_v41_fp8_preloaded<0, 8, false, T>(
-        sK_buf, static_cast<TensorSK*>(nullptr), (tidx >> 3) + pass * T::kGmemTokPerPass,
-        wide_lane * 2, row + wide_lane * 16, row + 512, is_valid[pass]);
+    if constexpr (T::kV40FP8) {
+        const bool use_extra = ori_block_max >= 0 && block_idx_kv >= ori_block_max;
+        const int page_size = use_extra ? params.extra_page_block_size : params.page_block_size;
+        const size_t stride = static_cast<size_t>(
+            use_extra ? params.extra_k_batch_stride : params.k_batch_stride);
+        const auto *base = reinterpret_cast<const uint8_t*>(
+            use_extra ? params.extra_k_ptr : params.k_ptr);
+        const int token = (tidx >> 3) + pass * T::kGmemTokPerPass;
+        const bool valid = is_valid[pass];
+        const uint8_t *scales = base;
+        if (valid) {
+            const int index = pre_token_idx[0];
+            const int page = index >> __builtin_ctz(page_size);
+            const int offset = index & (page_size - 1);
+            scales = base + static_cast<size_t>(page) * stride +
+                static_cast<size_t>(page_size) * T::kBytesPerToken +
+                static_cast<size_t>(offset) * 8;
+        }
+        hs64_store_v40_fp8_preloaded<0, 8, false, false, false, T>(
+            sK_buf, static_cast<TensorSK*>(nullptr), token, wide_lane, row, scales, valid);
+    } else {
+        hs64_store_v41_fp8_preloaded<0, 8, false, T>(
+            sK_buf, static_cast<TensorSK*>(nullptr), (tidx >> 3) + pass * T::kGmemTokPerPass,
+            wide_lane * 2, row + wide_lane * 16, row + 512, is_valid[pass]);
+    }
     __pipeline_commit();
     if constexpr (kLowLocal) {
         __pipeline_commit();
@@ -4761,7 +4873,7 @@ __forceinline__ __device__ void wg0_subroutine(
     }();
 
     Wg0ScaleFactors wg0_scale_factors;
-    if constexpr (T::kV41FP8) {
+    if constexpr (T::kQuantizedCache) {
         // WG1 consumes new P0 only after the unchanged bar3 rendezvous.
         // Publishing P0 here ends the old score/BF16 fragment live ranges
         // before the register-intensive quantized KV conversion.
@@ -4775,8 +4887,15 @@ __forceinline__ __device__ void wg0_subroutine(
         __ppu_barrier_arrive(3, T::NUM_THREADS, 15u);
     }
 
-    if constexpr (T::kV41FP8 && !T::kExtraFP4 &&
-                  !IS_BLK0_LAST && !IS_BLK1_LAST) {
+    if constexpr (T::kV40FP8 && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // Retain this block's scale indices until even-high is supplied after remote PV.
+        issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
+                         false, true, true, false, false, true>(
+            params, cur_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0],
+            idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+            pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k);
+    } else if constexpr (T::kV41FP8 && !T::kExtraFP4 &&
+                         !IS_BLK0_LAST && !IS_BLK1_LAST) {
         static_assert(T::kUseEvenHighBank && !T::kHasExtraKTile);
         // Local PV has released even-low. Expand this half while WG1
         // supplies odd-high; keep high expansion after remote PV/bar4.
@@ -4804,7 +4923,7 @@ __forceinline__ __device__ void wg0_subroutine(
             idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
             pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k);
     }
-    if constexpr (!kSplitEvenHighCopy && (!T::kV41FP8 || T::kExtraFP4) && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+    if constexpr (!kSplitEvenHighCopy && (!T::kQuantizedCache || T::kExtraFP4) && !IS_BLK0_LAST && !IS_BLK1_LAST) {
 
 
         if constexpr (T::kUseEvenHighBank) {
@@ -4869,7 +4988,7 @@ __forceinline__ __device__ void wg0_subroutine(
 
     // For M64, bar.sync(2) publishes WG1's sScale1/sM update to WG0.
 
-    if constexpr (!T::kV41FP8) {
+    if constexpr (!T::kQuantizedCache) {
         wg0_scale_factors = wg0_scale_rP0<T>(
             sScale1, rP0, rPb, idx_in_warpgroup,
             T::kUsePv2x4 && !IS_BLK0_LAST ? &early_scale_factors : nullptr);
@@ -4881,7 +5000,7 @@ __forceinline__ __device__ void wg0_subroutine(
     }
 
     // Quantized P0 is published above; BF16 retains its upstream exchange.
-    if constexpr (!T::kV41FP8) {
+    if constexpr (!T::kQuantizedCache) {
     // WG1 reads P0 after bar3; the next CTA bar1 retires that reader before
     // WG0 can overwrite P0 in the following iteration. On parked-Q5 Prefill,
     // WG1 also snapshots its peer scale0 before bar2, so WG0 need only publish.
@@ -4937,7 +5056,7 @@ __forceinline__ __device__ void wg0_subroutine(
             // WG1 waits for all 256 readers before overwriting this low half.
             __ppu_barrier_arrive(4, T::NUM_THREADS, 15u);
         }
-        if constexpr (T::kIsCrossCut && (!T::kV41FP8 || T::kExtraFP4)) {
+        if constexpr (T::kIsCrossCut && (!T::kQuantizedCache || T::kExtraFP4)) {
             // The following low-half reload writes the same buf1 image that
             // remote PV just read. Drain all WG0 readers before any warp starts
             // the asynchronous overwrite. The same rendezvous publishes the
@@ -4961,7 +5080,7 @@ __forceinline__ __device__ void wg0_subroutine(
         }
     }
 
-    if constexpr (T::kV41FP8 && !T::kExtraFP4) {
+    if constexpr (T::kQuantizedCache && !T::kExtraFP4) {
         // Publish the old odd-low reader release before expensive even
         // expansion. WG1 can now supply odd-low while WG0 expands even KV.
         // Current remote PV reads odd-low; both next-even banks are disjoint.
@@ -4979,7 +5098,14 @@ __forceinline__ __device__ void wg0_subroutine(
                     ? buf0_tile4.data() : scratch_base;
                 Tensor next_sK0_high4 = make_tensor(
                     next_high_base, (typename T::SmemLayoutKHigh4){});
-                if constexpr (T::kV41FP8 && !T::kExtraFP4 && !T::kHasExtraKTile) {
+                if constexpr (T::kV40FP8) {
+                    issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
+                                     true, true, true, false, true>(
+                        params, cur_sK0, batch_idx, nxt_block0, seqlen_k, &barriers_K0[0],
+                        idx_in_warpgroup, ori_block_max, precomp_ptr0, precomp_valid0,
+                        pre_token_idx, nxt_block0 + 2, end_block_idx, extra_seqlen_k,
+                        &next_sK0_high4);
+                } else if constexpr (T::kV41FP8 && !T::kExtraFP4 && !T::kHasExtraKTile) {
                     auto scale_scratch = local_tile(
                         sQ, Shape<Int<T::kBlockM>, _64>{}, Coord<_0, Int<4>>{}).data();
                     hs64_finish_v41_fp8_even_high<T>(
@@ -5060,7 +5186,7 @@ __forceinline__ __device__ void wg0_subroutine(
                 idx_in_warpgroup, ori_block_max, smem_valid_indices, vi_softmax_wg0,
                 pre_token_idx, extra_seqlen_k, precomp_ptr0, precomp_valid0);
         }
-        if constexpr (!T::kHasExtraKTile && !T::kV41FP8) {
+        if constexpr (!T::kHasExtraKTile && !T::kQuantizedCache) {
 
             int next_nxt_block1 = block_idx + 5;
             int next_vi_preload_wg1 = vi_softmax_wg0 + 2;
@@ -5261,7 +5387,7 @@ __forceinline__ __device__ void wg1_subroutine(
     if constexpr (!IS_BLK0_LAST) {
         save_rP1_to_sP<T>(rP1b, sP1, idx_in_warpgroup);
     }
-    if constexpr (T::kV41FP8 && T::kUsePv2x4) {
+    if constexpr (T::kQuantizedCache && T::kUsePv2x4) {
         // All primary N-warps must publish sScale1 before partner reads.
         // Complete every shared scale read before acknowledging bar2: WG0
         // may otherwise reach the next softmax after a nonblocking bar3.
@@ -5311,7 +5437,7 @@ __forceinline__ __device__ void wg1_subroutine(
     }
 
     // Issue rO1 += rP1b @ sV1R
-    if constexpr (T::kUsePv2x4 && !T::kV41FP8) {
+    if constexpr (T::kUsePv2x4 && !T::kQuantizedCache) {
         if constexpr (T::kParkQ5Fragment) {
             scale_rO_pv_product_with_cache<T>(
                 rO1, sScale0, sScale1, wg1_scale_cache, rL, idx_in_warpgroup,
@@ -5347,7 +5473,7 @@ __forceinline__ __device__ void wg1_subroutine(
         constexpr int kNumTiles = T::kNumKTiles;
         // Quantized low supply still needs this token's scale address.
         // Advance its sparse-index cache only after the low half is supplied.
-        issue_K_load_bf16<T::kStage1KTiles, kNumTiles, NEXT_EXTRA, T, !T::kV41FP8, true>(
+        issue_K_load_bf16<T::kStage1KTiles, kNumTiles, NEXT_EXTRA, T, !T::kQuantizedCache, true>(
             params, cur_sK0, batch_idx, nxt_block1, seqlen_k,
             &barriers_K1[1], idx_in_warpgroup, ori_block_max,
             precomp_ptr0, precomp_valid0, pre_token_idx,
@@ -5407,7 +5533,7 @@ __forceinline__ __device__ void wg1_subroutine(
         // Both WGs have issued their remote PV independently. Receive only
         // the old odd-low reader release, then cover low-copy latency with
         // high QK, whose separate local group was issued before remote PV.
-        if constexpr (T::kV41FP8)
+        if constexpr (T::kQuantizedCache)
             hs64_shared_exchange_sync<T>(4, T::NUM_THREADS);
         else
             __ppu_barrier_sync(4, T::NUM_THREADS, 15u);
@@ -5420,7 +5546,7 @@ __forceinline__ __device__ void wg1_subroutine(
                 nxt_block1 + 2, end_block_idx);
         } else {
             issue_K_load_bf16<0, T::kStage1KTiles, NEXT_EXTRA, T,
-                             T::kV41FP8, true, false, (T::kHasExtraKTile || T::kV41FP8)>(
+                             T::kQuantizedCache, true, false, (T::kHasExtraKTile || T::kQuantizedCache)>(
 
                 params, cur_sK0, batch_idx, nxt_block1, seqlen_k,
                 &barriers_K1[0], idx_in_warpgroup, ori_block_max,
@@ -5471,7 +5597,7 @@ __forceinline__ __device__ void wg1_subroutine(
                 // FP8 even K is entirely supplied by WG0. WG1 has no
                 // consumer for this register-only even-index cache.
                 // Keep FP4 hints: their removal regressed measured timing.
-                if constexpr (!T::kV41FP8 || T::kExtraFP4) {
+                if constexpr (!T::kQuantizedCache || T::kExtraFP4) {
                     hs64_prefetch_next_indices<NEXT_EXTRA, T>(
                         params, batch_idx, idx_in_warpgroup, ori_block_max,
                         pre_token_idx_b, nxt_block0 + 2, end_block_idx);
@@ -5549,7 +5675,7 @@ __forceinline__ __device__ void wg1_subroutine(
 
         if constexpr (T::kIsCrossCut && T::kUseQkWeave) {
             int next_nxt_block1 = block_idx + 5;
-            if constexpr (T::kHasExtraKTile || T::kV41FP8) {
+            if constexpr (T::kHasExtraKTile || T::kQuantizedCache) {
                 // This old validity slot has been consumed by this iteration's
                 // softmax. The next odd epoch uses the other slot first.
                 if constexpr (!kEarlyNextOddAddr) {
@@ -5565,7 +5691,7 @@ __forceinline__ __device__ void wg1_subroutine(
                     pre_token_idx, extra_seqlen_k, precomp_ptr0, precomp_valid0);
             }
         }
-        if constexpr (!(T::kV41FP8 && !T::kExtraFP4 && T::kUseEvenHighBank &&
+        if constexpr (!(T::kQuantizedCache && !T::kExtraFP4 && T::kUseEvenHighBank &&
                         T::kIsCrossCut && T::kUseQkWeave)) {
             int next_nxt_block0 = block_idx + 4;
             compute_K_addr_bf16<4, NEXT_EXTRA, T, true>(
@@ -5730,7 +5856,7 @@ __forceinline__ __device__ void hs64_attention(
         begin_idx = block * rows + min(block, remainder);
         end_idx = begin_idx + rows - 1 + (block < remainder);
         begin_seqlen = end_seqlen = 0;
-    } else if constexpr (kPackedMain<T> != 0) {
+    } else if constexpr (kPackedMain<T> != 0 || kV40CompleteQueries<T>) {
         begin_idx = int(blockIdx.z);
         end_idx = kWorklist<T> == Hs64Worklist::Single ? begin_idx : params.b - 1;
         begin_seqlen = end_seqlen = 0;
@@ -5747,7 +5873,8 @@ __forceinline__ __device__ void hs64_attention(
     if (begin_idx >= params.b)
         return;
     int begin_n_split_idx = 0;
-    if constexpr (!T::kIsPrefill && kPackedMain<T> == 0 && !kHs64FusedDirectQueries<T>)
+    if constexpr (!T::kIsPrefill && kPackedMain<T> == 0 &&
+                  !kHs64FusedDirectQueries<T> && !kV40CompleteQueries<T>)
         begin_n_split_idx = *(tile_scheduler_metadata_ptr + 4);
 
     // Copy the first Q
@@ -5812,9 +5939,9 @@ __forceinline__ __device__ void hs64_attention(
             }
         } else if (params.topk_len_ptr) {
             seqlen_k = __ldg(params.topk_len_ptr + length_row);
-            // Fused complete-query paths clamp lengths inside their CTA.
+            // Complete-query paths clamp lengths inside their CTA.
             if constexpr ((T::kIsPrefill && Hs64HasFusedHooks<T>::value) ||
-                          kHs64FusedDirectQueries<T>)
+                          kHs64FusedDirectQueries<T> || kV40CompleteQueries<T>)
                 seqlen_k = min(max(seqlen_k, 0), params.topk);
         } else {
             seqlen_k = params.topk;
@@ -5871,7 +5998,7 @@ __forceinline__ __device__ void hs64_attention(
                 }
                 if constexpr (kPackedMain<T> != 0)
                     extra_seqlen_k = min(max(extra_seqlen_k, 0), 512);
-                else if constexpr (kHs64FusedDirectQueries<T>)
+                else if constexpr (kHs64FusedDirectQueries<T> || kV40CompleteQueries<T>)
                     extra_seqlen_k = min(max(extra_seqlen_k, 0), params.extra_topk);
                 ori_block_max = cute::ceil_div(seqlen_kpad, kBlockN);
             }
@@ -5884,9 +6011,11 @@ __forceinline__ __device__ void hs64_attention(
             : total_k / kBlockN;
         if constexpr (kFixedPrefillBlocks != 0)
             end_block_idx = kFixedPrefillBlocks;
-        else if constexpr (T::kIsPrefill || kPackedMain<T> != 0 || kHs64FusedDirectQueries<T>)
+        else if constexpr (T::kIsPrefill || kPackedMain<T> != 0 ||
+                           kHs64FusedDirectQueries<T> || kV40CompleteQueries<T>)
             end_block_idx = total_k / kBlockN;
-        const bool is_no_split = T::kIsPrefill || kPackedMain<T> != 0 || kHs64FusedDirectQueries<T> ||
+        const bool is_no_split = T::kIsPrefill || kPackedMain<T> != 0 ||
+            kHs64FusedDirectQueries<T> || kV40CompleteQueries<T> ||
             (start_block_idx == 0 && end_block_idx == (total_k / kBlockN));
 
 
@@ -5989,8 +6118,9 @@ __forceinline__ __device__ void hs64_attention(
         int prolog_vi_wg0 = (start_block_idx / 2) % 2;       // 0 or 1
         int prolog_vi_wg1 = 2 + (start_block_idx / 2) % 2;    // 2 or 3
         constexpr int kNumTiles = T::kNumKTiles;
-        constexpr bool kMergedPackedFp8Prolog = T::kV41FP8 && !T::kExtraFP4 &&
-            T::kArch == 89 && kPackedMain<T> != 0 && !T::kHasExtraKTile;
+        constexpr bool kMergedPackedFp8Prolog = T::kArch == 89 && !T::kExtraFP4 &&
+            !T::kHasExtraKTile &&
+            ((T::kV41FP8 && kPackedMain<T> != 0) || kV40CompleteQueries<T>);
         if constexpr (kSinglePrefillPair) {
             static_assert(kNumTiles == 8);
             auto load_pair_half = [&](auto& buffer, auto even, int* tokens, int vi,
@@ -7074,9 +7204,11 @@ static void launch_flash_sparse_decode_wg_hs64(Flash_fwd_params &params, hggcStr
     auto mla_kernel = &flash_sparse_decode_wg_kernel_hs64<Hs64KvOffsetTraits<T, uint32_t>, AllowExtra>;
     if constexpr (!kHs64LegacyInt8<T>) {
         // Keep the original narrow encoding while it still fits, including padded pages.
-        const bool narrow = T::kV41FP8
-            ? sparse_decode_hs64_v41_kv_offsets_fit_u32<true>(params, T::kExtraFP4)
-            : sparse_decode_hs64_kv_offsets_fit_u32(params);
+        const bool narrow = T::kV40FP8
+            ? sparse_decode_hs64_v40_kv_offsets_fit_u32(params)
+            : (T::kV41FP8
+                ? sparse_decode_hs64_v41_kv_offsets_fit_u32<true>(params, T::kExtraFP4)
+                : sparse_decode_hs64_kv_offsets_fit_u32(params));
         if (!narrow) {
             mla_kernel = &flash_sparse_decode_wg_kernel_hs64<
                 Hs64KvOffsetTraits<T, typename T::index_t>, AllowExtra>;
@@ -7094,7 +7226,7 @@ static void launch_flash_sparse_decode_wg_hs64(Flash_fwd_params &params, hggcStr
     hggcFuncSetAttribute(
         mla_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
-    const int grid_rows = kPackedMain<T> == 0 ? params.num_sm_parts :
+    const int grid_rows = kPackedMain<T> == 0 && !kV40CompleteQueries<T> ? params.num_sm_parts :
         (kWorklist<T> == Hs64Worklist::Single ? params.b : std::min(39, params.b));
     const dim3 grid(kWorklist<T> == Hs64Worklist::Flat ? 1 : params.q_orig,
                     params.ngroups / T::kBlockM, grid_rows);
@@ -7110,9 +7242,11 @@ static void launch_flash_sparse_decode_wg_hs64(Flash_fwd_params &params, hggcStr
         static bool tag_printed = false;
         if (!tag_printed) {
             tag_printed = true;
-            printf("[WG_HS64_TAG] %s blockM=64 d=%d no_extra=%d index_guard=%d\n",
-                   T::kV41FP8 ? kHs64V41BuildTag : kHs64BuildTag,
-                   T::kHeadDim, int(!AllowExtra), int(T::kGuardIndices));
+            printf("[WG_HS64_TAG] %s blockM=64 d=%d no_extra=%d index_guard=%d v40_complete=%d worklist=%d\n",
+                   T::kV40FP8 ? kHs64V40BuildTag :
+                       (T::kV41FP8 ? kHs64V41BuildTag : kHs64BuildTag),
+                   T::kHeadDim, int(!AllowExtra), int(T::kGuardIndices),
+                   int(kV40CompleteQueries<T>), int(kWorklist<T>));
         }
 
         hggcFuncAttributes attr;
@@ -7149,7 +7283,7 @@ static void launch_flash_sparse_decode_wg_hs64(Flash_fwd_params &params, hggcStr
     hggcLaunchKernelEx(&kernel_config, mla_kernel, params);
     CHECK_CUDA_KERNEL_LAUNCH();
 
-    if constexpr (kPackedMain<T> == 0)
+    if constexpr (kPackedMain<T> == 0 && !kV40CompleteQueries<T>)
         ::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(params, stream);
 }
 

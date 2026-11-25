@@ -6,6 +6,47 @@ template void flashmla::dsa::hs64::run_flash_sparse_prefill_fwd_hs64<512, 89>(Sp
 template void flashmla::dsa::hs64::run_flash_sparse_prefill_fwd_hs64<576, 89>(SparsePrefillParams &params);
 
 namespace flashmla::dsa::hs64 {
+template<Hs64Worklist W>
+static void run_v40_complete_decode(Flash_fwd_params &params, hggcStream_t stream) {
+    using T = Hs64V40CompleteDecode<W>;
+    static_assert(kPackedMain<T> == 0);
+    if (params.extra_topk >= 0) {
+        launch_flash_sparse_decode_wg_hs64<T, true>(params, stream);
+    } else {
+        launch_flash_sparse_decode_wg_hs64<T, false>(params, stream);
+    }
+}
+
+void run_flash_sparse_decode_wg_kernel_hs64_v40_fp8(
+    Flash_fwd_params &params, hggcStream_t stream) {
+    const int sq = params.q_orig;
+    const int64_t queries = int64_t(params.b) * sq;
+    FLASH_ASSERT(params.b > 0 && sq > 0 && params.h == 1 && params.ngroups == 64 &&
+                 params.seqlen_q == int64_t(sq) * 64 && queries >= 2 * 39 &&
+                 queries <= std::numeric_limits<int>::max() / 64);
+    const auto affine = [](int64_t batch_pitch, int64_t row_pitch, int rows) {
+        return batch_pitch > 0 && row_pitch > 0 &&
+               batch_pitch % rows == 0 && batch_pitch / rows == row_pitch;
+    };
+    if (affine(params.q_batch_stride, params.q_row_stride, sq * 64) &&
+        affine(params.o_batch_stride, params.o_row_stride, sq * 64) &&
+        affine(params.indices_batch_stride, params.indices_row_stride, sq) &&
+        (params.extra_topk < 0 ||
+         affine(params.extra_indices_batch_stride, params.extra_indices_row_stride, sq))) {
+        Flash_fwd_params view = params;
+        view.b *= sq;
+        view.seqlen_q = 64;
+        view.q_batch_stride /= sq;
+        view.o_batch_stride /= sq;
+        view.indices_batch_stride = view.indices_row_stride;
+        if (view.extra_topk >= 0)
+            view.extra_indices_batch_stride = view.extra_indices_row_stride;
+        run_v40_complete_decode<Hs64Worklist::Flat>(view, stream);
+    } else {
+        run_v40_complete_decode<Hs64Worklist::Batch>(params, stream);
+    }
+}
+
 
 template<int HeadDim>
 struct Hs64LegacyInt8Decode : Hs64Traits<HeadDim, true, 80> {

@@ -19,6 +19,9 @@ void run_flash_sparse_decode_wg_kernel_hs64(
     bool is_v41_fp8 = false,
     bool is_extra_fp4 = false);
 
+void run_flash_sparse_decode_wg_kernel_hs64_v40_fp8(
+    Flash_fwd_params &params, hggcStream_t stream);
+
 } // namespace hs64
 
 // FP8 caches 64-token metadata; V4.1 H64 MTP creates a private 128-token schedule.
@@ -112,6 +115,45 @@ inline bool sparse_decode_hs64_v41_kv_offsets_fit_u32(
            (p.extra_topk < 0 || sparse_decode_hs64_v41_cache_range_supported(
                p.extra_num_blocks, p.extra_page_block_size,
                extra_fp4 ? 288 : 528, extra_fp4 ? fp4_unit : fp8_unit,
+               p.extra_k_batch_stride));
+}
+
+inline bool sparse_decode_hs64_v40_supported(const Flash_fwd_params &p) {
+    const auto aligned = [](const void *ptr) {
+        return ptr != nullptr && (reinterpret_cast<uintptr_t>(ptr) & 15u) == 0;
+    };
+    const auto cache_supported = [&](const void *ptr, int blocks, int page_size,
+                                     Flash_fwd_params::index_t stride, int64_t row_stride) {
+        if (!aligned(ptr) || blocks <= 0 || page_size <= 0 ||
+            (page_size & (page_size - 1)) != 0 || stride <= 0 || stride % 16 != 0 ||
+            row_stride != 584) return false;
+        const uint64_t page_bytes = uint64_t(page_size) * 584;
+        const uint64_t limit = std::numeric_limits<Flash_fwd_params::index_t>::max();
+        return uint64_t(stride) >= page_bytes && page_bytes <= limit &&
+               uint64_t(blocks - 1) <= (limit - page_bytes) / uint64_t(stride);
+    };
+    constexpr int64_t max_stride = std::numeric_limits<int>::max();
+    return p.b > 0 && p.ngroups == 64 && p.h == 1 && p.d == 512 && p.d_v == 512 &&
+           p.q_orig > 0 && p.num_sm_parts > 0 && p.topk >= 0 && p.extra_topk >= -1 &&
+           int64_t(p.topk) + (p.extra_topk > 0 ? p.extra_topk : 0) <= max_stride - 255 &&
+           aligned(p.q_ptr) && p.q_batch_stride > 0 && p.q_batch_stride % 8 == 0 &&
+           p.q_row_stride >= 512 && p.q_row_stride <= max_stride && p.q_row_stride % 8 == 0 &&
+           p.indices_batch_stride >= 0 && p.indices_row_stride >= 0 &&
+           p.indices_row_stride <= max_stride &&
+           cache_supported(p.k_ptr, p.num_blocks, p.page_block_size,
+                           p.k_batch_stride, p.k_row_stride) &&
+           (p.extra_topk < 0 ||
+            (p.extra_indices_batch_stride >= 0 && p.extra_indices_row_stride >= 0 &&
+             p.extra_indices_row_stride <= max_stride &&
+             cache_supported(p.extra_k_ptr, p.extra_num_blocks, p.extra_page_block_size,
+                             p.extra_k_batch_stride, p.extra_k_row_stride)));
+}
+
+inline bool sparse_decode_hs64_v40_kv_offsets_fit_u32(const Flash_fwd_params &p) {
+    return sparse_decode_hs64_v41_cache_range_supported(
+               p.num_blocks, p.page_block_size, 584, 8, p.k_batch_stride) &&
+           (p.extra_topk < 0 || sparse_decode_hs64_v41_cache_range_supported(
+               p.extra_num_blocks, p.extra_page_block_size, 584, 8,
                p.extra_k_batch_stride));
 }
 

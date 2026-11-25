@@ -381,6 +381,9 @@ sparse_attn_decode_interface(
                 .reshape({batch_size, seqlen_q, num_heads, head_size_v});
         KU_CHECK_CONTIGUOUS(out);
         KU_CHECK_DEVICE(out);
+        TORCH_CHECK(!(cc_major == 8 && cc_minor == 9 && is_fp8 && !is_v41_fp8 && head_size == 512) ||
+                    (reinterpret_cast<uintptr_t>(out.data_ptr()) & uintptr_t{15}) == 0,
+                    "V4 FP8 out must have a 16-byte-aligned base address");
     } else {
         out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts);
     }
@@ -557,8 +560,16 @@ sparse_attn_decode_interface(
     }
     const bool legacy_int8_hs64 = is_fp8 && !is_v41_fp8 && !v41_float_kv && !enable_batch_invariant &&
         use_sm80_legacy_int8_hs64(params);
+    const int64_t v40_queries = int64_t(params.b) * params.q_orig;
+    // Complete-query LSE offsets are still computed in int.
+    const bool use_v40_hs64 = !enable_batch_invariant && is_fp8 && !is_v41_fp8 &&
+        cc_major == 8 && cc_minor == 9 && q_dtype == torch::kBFloat16 &&
+        (params.q_orig == 4 || params.q_orig == 5) &&
+        at::cuda::getCurrentDeviceProperties()->multiProcessorCount == 39 &&
+        params.b >= 2 * 39 && v40_queries <= std::numeric_limits<int>::max() / 64 &&
+        flashmla::dsa::sparse_decode_hs64_v40_supported(params);
     at::Tensor hs64_metadata, hs64_num_splits_t;
-    if (legacy_int8_hs64 || (!packed_h64 && !packed_fp8_extra_h64 && is_v41_fp8 &&
+    if (legacy_int8_hs64 || use_v40_hs64 || (!packed_h64 && !packed_fp8_extra_h64 && is_v41_fp8 &&
         flashmla::dsa::sparse_decode_hs64_v41_supported(params, is_extra_fp4) &&
         is_sm89_or_newer())) {
         // The default packed-cache scheduler advances by 64 tokens. HS64
@@ -643,6 +654,8 @@ sparse_attn_decode_interface(
         flashmla::dsa::hs64::run_v41_packed_page_decode(params, stream, cc_major == 8 && cc_minor == 0);
     } else if (legacy_int8_hs64) {
         flashmla::dsa::hs64::run_legacy_int8_decode(params, stream);
+    } else if (use_v40_hs64) {
+        flashmla::dsa::hs64::run_flash_sparse_decode_wg_kernel_hs64_v40_fp8(params, stream);
     } else if (is_fp8) {
         if (head_size == 576) {
             run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 576, 512, false>(params, stream);
