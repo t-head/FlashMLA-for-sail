@@ -239,7 +239,8 @@ sparse_attn_decode_interface(
         const auto *dprops = at::cuda::getCurrentDeviceProperties();
         const bool is_810e = std::string(dprops->name).find("810E") != std::string::npos;
         const int logical_sm_count = is_810e ? 20 : dprops->multiProcessorCount;
-        const int q_aware_parts = is_810e && is_fp8 && kv.size(3) == 584 && sizes[1] <= logical_sm_count
+        const bool legacy_810e_kv = !is_fp8 || kv.size(3) == 584 || kv.size(3) == 656;
+        const int q_aware_parts = is_810e && legacy_810e_kv && sizes[1] <= logical_sm_count
             ? num_sm_parts
             : std::max(logical_sm_count / std::max(int(sizes[1]), 1), 1);
         num_sm_parts = enable_batch_invariant ? 1 : std::min(num_sm_parts, q_aware_parts);

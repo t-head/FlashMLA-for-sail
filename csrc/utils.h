@@ -590,7 +590,11 @@ __forceinline__ __device__ void store(const Flash_fwd_params &params, const int 
     const int seqlen_q_max = IsSparse ? params.ngroups - h_k_idx * kBlockM : params.seqlen_q - m_block * kBlockM;
 
     const index_t row_offset_o = bidb * params.o_batch_stride + bidh * params.o_head_stride + row_base * params.o_row_stride;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 800
+    const index_t row_offset_oaccum = Split && !IsSparse
+#else
     const index_t row_offset_oaccum = Split && !IsSparse && Kernel_traits::CvtGemm0SwzlLd && kBlockM == 64
+#endif
         ? (index_t(split_offset) + n_split_idx) * params.o_batch_stride + bidh * params.oaccum_head_stride + row_base * params.o_head_stride
         : (((index_t(split_offset) + n_split_idx) * params.h + bidh) * params.seqlen_q + row_base) * params.d_v;
     const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + row_base;
