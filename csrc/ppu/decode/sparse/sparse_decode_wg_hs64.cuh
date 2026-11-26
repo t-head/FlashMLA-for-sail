@@ -3611,11 +3611,36 @@ __forceinline__ __device__ void hs64_store_v40_raw_rope(
     cutlass::arch::shared_store<16>(cute::cast_smem_ptr_to_uint(&dst(token, dst_dim + 8)), &bits1);
 }
 
+template<typename T>
+inline constexpr bool kV40High45RegPrefetch = T::kV40FP8 &&
+    kV40CompleteQueries<T> && kWorklist<T> == Hs64Worklist::Flat &&
+    std::is_same_v<typename T::kv_offset_t, uint32_t>;
+
+struct Hs64V40High45Packet { uint4 tile4, tile5; };
+struct Hs64EmptyV40High45Packet {};
+
+template<typename T>
+__forceinline__ __device__ Hs64V40High45Packet hs64_read_v40_high45(
+    int tidx, typename T::InputT* (&ptr)[T::kGmemPasses],
+    bool (&valid)[T::kGmemPasses]) {
+    static_assert(kV40High45RegPrefetch<T> && T::kGmemPasses == 2);
+    Hs64V40High45Packet packet{};
+    const int pass = (tidx >> 2) & 1;
+    if (valid[pass]) {
+        const auto *row = reinterpret_cast<const uint8_t*>(ptr[pass]) - (tidx & 7) * 8;
+        const int wide_lane = tidx & 3;
+        packet.tile4 = __ldg(reinterpret_cast<const uint4*>(row + 256 + wide_lane * 16));
+        packet.tile5 = __ldg(reinterpret_cast<const uint4*>(row + 320 + wide_lane * 16));
+    }
+    return packet; // No conversion, shared store, barrier, or forced load wait.
+}
+
 template<int S, int E, bool MergeHigh, bool EvenHighOnly, bool EvenLowOnly,
          typename T, typename TensorDst, typename TensorHigh>
 __forceinline__ __device__ void hs64_store_v40_fp8_preloaded(
     TensorDst &dst, TensorHigh *high, int token, int wide_lane,
-    const uint8_t *row, const uint8_t *scales, bool valid) {
+    const uint8_t *row, const uint8_t *scales, bool valid,
+    const Hs64V40High45Packet *register_high45 = nullptr) {
     static_assert(S % 4 == 0 && E % 4 == 0 && S < E && E <= 8);
     static_assert(!MergeHigh || (S == 0 && E == 4));
     static_assert(!(EvenHighOnly && EvenLowOnly));
@@ -3629,6 +3654,13 @@ __forceinline__ __device__ void hs64_store_v40_fp8_preloaded(
         scale_word = __ldg(reinterpret_cast<const uint64_t*>(scales));
         #pragma unroll
         for (int tile = FirstTile; tile < LastTile && tile < 7; ++tile) {
+            if constexpr (kV40High45RegPrefetch<T> && S == 4 && E == 8 && !MergeHigh) {
+                if (register_high45 != nullptr && (tile == 4 || tile == 5)) {
+                    packed[tile - FirstTile] = tile == 4
+                        ? register_high45->tile4 : register_high45->tile5;
+                    continue;
+                }
+            }
             packed[tile - FirstTile] = __ldg(
                 reinterpret_cast<const uint4*>(row + tile * 64 + wide_lane * 16));
         }
@@ -4121,7 +4153,8 @@ __forceinline__ __device__ void issue_K_load_bf16(
     int end_block_idx,
     int extra_seqlen_k,
     TensorHigh *even_high = nullptr,
-    const Hs64OddHighPacket *packet = nullptr
+    const Hs64OddHighPacket *packet = nullptr,
+    const Hs64V40High45Packet *v40_high45 = nullptr
 ) {
     static_assert(!(EVEN_HIGH_ONLY && EVEN_LOW_ONLY));
     static_assert((!EVEN_HIGH_ONLY && !EVEN_LOW_ONLY) || MERGE_EVEN_HIGH);
@@ -4157,7 +4190,7 @@ __forceinline__ __device__ void issue_K_load_bf16(
         }
         const auto *row = reinterpret_cast<const uint8_t*>(token_ptr[pass]) - (tidx & 7) * 8;
         hs64_store_v40_fp8_preloaded<S, E, MERGE_EVEN_HIGH, EVEN_HIGH_ONLY, EVEN_LOW_ONLY, T>(
-            sK_buf, even_high, token, tidx & 3, row, scales, valid);
+            sK_buf, even_high, token, tidx & 3, row, scales, valid, v40_high45);
     } else if constexpr (T::kV41FP8) {
         const bool use_extra = kPackedExtraStep<T> ||
             (ori_block_max >= 0 && block_idx_kv >= ori_block_max);
@@ -5436,6 +5469,14 @@ __forceinline__ __device__ void wg1_subroutine(
             "r"(unsigned(packet.scales[3])) : "memory");
     }
 
+    std::conditional_t<kV40High45RegPrefetch<T>,
+        Hs64V40High45Packet, Hs64EmptyV40High45Packet> v40_high45{};
+    if constexpr (kV40High45RegPrefetch<T> && !IS_BLK0_LAST && !IS_BLK1_LAST) {
+        // WG1's argument swap makes precomp_ptr0 the next physical odd K1.
+        // Read raw tiles 4/5 while local PV still consumes the old odd bank.
+        v40_high45 = hs64_read_v40_high45<T>(idx_in_warpgroup, precomp_ptr0, precomp_valid0);
+    }
+
     // Issue rO1 += rP1b @ sV1R
     if constexpr (T::kUsePv2x4 && !T::kQuantizedCache) {
         if constexpr (T::kParkQ5Fragment) {
@@ -5478,7 +5519,11 @@ __forceinline__ __device__ void wg1_subroutine(
             &barriers_K1[1], idx_in_warpgroup, ori_block_max,
             precomp_ptr0, precomp_valid0, pre_token_idx,
             nxt_block1 + 2, end_block_idx, extra_seqlen_k,
-            static_cast<std::remove_reference_t<decltype(cur_sK0)>*>(nullptr), &packet);
+            static_cast<std::remove_reference_t<decltype(cur_sK0)>*>(nullptr), &packet,
+            [&]() -> const Hs64V40High45Packet* {
+                if constexpr (kV40High45RegPrefetch<T>) return &v40_high45;
+                else return nullptr;
+            }());
     }
 
     // Physical buffer ownership (wg1 arguments are swapped):
