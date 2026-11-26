@@ -64,6 +64,11 @@ on:
         required: false
         type: string
         default: pypi
+      runs_on:
+        description: 'CPU runner for all jobs; accepts a single label or a JSON array of labels'
+        required: false
+        type: string
+        default: x86-ubuntu2404-8-32
       build_command:
         description: 'Custom Bash build command; leave empty to build flash_mla from the repository root; only trusted configuration is accepted'
         required: false
@@ -86,6 +91,7 @@ jobs:
       release_username: ${{ secrets.RELEASE_USERNAME }}
       release_token: ${{ secrets.RELEASE_TOKEN }}
     with:
+      runs_on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on || 'x86-ubuntu2404-8-32' }}
       package_name: ${{ inputs.package_name || 'flash_mla' }}
       framework: ${{ inputs.framework || 'torch' }}
       template_repository: t-head/ci-infra
