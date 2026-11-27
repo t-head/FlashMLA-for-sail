@@ -962,9 +962,11 @@ bool try_sparse_fp8_std(const flashmla::sparse_native_fp8::AttentionParams &para
             flashmla_fp8_std::dispatch<256, 8, 16, true>(params);
             return true;
         }
+        // Use a cheap pool-size screen to avoid sampling overhead when cache reuse may favor four lanes.
+        const int64_t gather_locality_budget_bytes = int64_t(device->cache_bytes) *
+            flashmla::sparse_native_fp8::GatherLocalityCacheFootprints;
         const bool adaptive_gather = enough_scan && device->cache_bytes > 0 &&
-            int64_t(params.kvrows) * params.dim > int64_t(device->cache_bytes) * 4 &&
-            int64_t(params.queries) * (params.heads / 64) >= MinGridWaves * device->compute_units;
+            int64_t(params.kvrows) * params.dim > gather_locality_budget_bytes;
         if (!params.maxima && !params.lse && adaptive_gather) {
             auto launch = params.trusted_full_topk ? flashmla_fp8_std::launch<576, 256, true, 8, 0>
                                                   : flashmla_fp8_std::launch<576, 256, false, 8, 0>;

@@ -11,6 +11,8 @@ inline constexpr int ValueDim = 512;
 inline constexpr int TileKeys = 64;
 inline constexpr int MaxTopk = 2048;
 inline constexpr int MaxVerifyQueries = 32;
+// L2 scales the cache-reuse heuristic; the measured 4x margin is conservative, not a hardware limit.
+inline constexpr int GatherLocalityCacheFootprints = 4;
 
 // Measured M890P reuse crossover for sparse FP8 gathers. This is a launch
 // policy budget, not a claim about physical cache capacity. Pools below it
@@ -626,25 +628,33 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
     bool wide_gather = false;
     if constexpr (GatherLanes == 0) {
         static_assert(BM == 64 && NTHR == 256 && BN == 64 && !Dual);
+        // With cheap cache hits, eight lanes' extra row pass can outweigh wider transactions.
         if (wp == 0) {
             const int slot = lane * max(0, topk_length - 1) / 31;
             const int token = topk_length > 0 ? sIdx[slot] : -1;
-            const bool valid = (unsigned)token < (unsigned)s_kv;
-            int low = valid ? token : s_kv, high = valid ? token : 0;
             bool repeated = false;
             if (q_token > 0) {
                 const int previous_length = gTopkLength
                     ? max(0, min(n_tiles * BN, gTopkLength[q_token - 1])) : n_tiles * BN;
                 repeated = slot < previous_length && token == gIdx[slot - n_tiles * BN];
             }
+            // Sample agreement favors KV reuse; each query still loads its own complete index list.
             const bool shared_history = __all_sync(0xffffffff, repeated);
-            CUTE_UNROLL
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                low = min(low, __shfl_xor_sync(0xffffffff, low, offset));
-                high = max(high, __shfl_xor_sync(0xffffffff, high, offset));
+            bool scattered_indices = false;
+            // Shared histories choose four lanes without paying for the span reduction.
+            if (!shared_history && gather_cache_rows > 0) {
+                const bool valid = (unsigned)token < (unsigned)s_kv;
+                int low = valid ? token : s_kv, high = valid ? token : 0;
+                CUTE_UNROLL
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    low = min(low, __shfl_xor_sync(0xffffffff, low, offset));
+                    high = max(high, __shfl_xor_sync(0xffffffff, high, offset));
+                }
+                // Address span is a locality hint, not a working-set size or cache-miss guarantee.
+                scattered_indices = high - low > gather_cache_rows;
             }
             if (lane == 0)
-                *sFlag = !shared_history && gather_cache_rows > 0 && high - low > gather_cache_rows;
+                *sFlag = scattered_indices;
         }
         __syncthreads();
         wide_gather = *sFlag;
@@ -912,12 +922,16 @@ void launch(const flashmla::sparse_native_fp8::AttentionParams &params) {
     auto kernel = flash_fwd_sparse_fp8_std_kernel<64, D, Trusted, Threads, Prefix, false, 64, 64,
                                                   false, GatherLanes, false, GuardGatherReuse, QBF16>;
     hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, Shared);
+    const int gather_cache_rows = GatherLanes == 0
+        ? int(int64_t(params.cache_bytes) *
+              flashmla::sparse_native_fp8::GatherLocalityCacheFootprints / D)
+        : 0;
     kernel<<<dim3(int64_t(params.queries) * (params.heads / 64)), Threads, Shared, params.stream>>>(
         params.q, static_cast<const E4M3 *>(params.kv), params.idx,
         static_cast<cutlass::bfloat16_t *>(params.out), params.scale, (params.width / 64),
         params.kvrows, params.os, params.heads, params.maxima, params.lse, params.sink,
         params.lengths, nullptr, params.lse_queries, nullptr, nullptr, nullptr, 0, 0, 1,
-        GatherLanes == 0 ? int(int64_t(params.cache_bytes) * 4 / D) : 0);
+        gather_cache_rows);
 }
 template <int Threads, int Prefix = 0, int GatherLanes = 8, bool GuardGatherReuse = false>
 void dispatch(const flashmla::sparse_native_fp8::AttentionParams &params) {
