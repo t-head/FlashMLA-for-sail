@@ -165,7 +165,20 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int AtomLayoutP = CrossCut ? AtomLayoutP_ : kNWarps;
     static constexpr bool Share_Q_K_smem = Share_Q_K_smem_; // CrossCut ? Share_Q_K_smem_ : 1;
     static constexpr bool Is_Q_in_regs = Is_Q_in_regs_|| Share_Q_K_smem; // CrossCut ? Is_Q_in_regs_|| Share_Q_K_smem : 1;
-    static constexpr int KEEP_Q_NUM = 24;  // tuned for EP32 decode (sweep on case1)
+    // FIX: the number of A(Q)-fragments pre-kept in registers.
+    // It must stay strictly below MMA_K = kHeadDim / tile_size_K, because
+    // gemm_rss re-loads A only for the steps in [KEEP_Q_NUM-1, MMA_K).
+    //   bf16: tile K 16 -> MMA_K 32, so 24 < 32 leaves 9 A-loads to gemm_rss.
+    //   fp8 : tile K 32 -> MMA_K 16, so a fixed 24 EXCEEDS MMA_K:
+    //         the prefetch loop at splitkv_mla.cuh:998 runs past the end of
+    //         tSsQ's k-mode, and gemm_rss's second loop is empty, so A is
+    //         never loaded from smem and the QK^T accumulates stale registers.
+    //         That is the measured "score = 0.5x of truth, independent of Q".
+    // MMA_K = kHeadDim / tile_size_K, and tile_size_K is 32 for the fp8 e4m3
+    // atom and 16 for bf16 -- the same expression TiledMmaS uses below.
+    static constexpr int kQkTileK = QKV_FP8 ? 32 : 16;
+    static constexpr int kQkMmaK = kHeadDim_ / kQkTileK;
+    static constexpr int KEEP_Q_NUM = kQkMmaK > 24 ? 24 : kQkMmaK - 1;
     /// end for CrossCut ///
 
     static constexpr int MMA_ATOM_M = USE_MMA_M8 ? 8 : 16;

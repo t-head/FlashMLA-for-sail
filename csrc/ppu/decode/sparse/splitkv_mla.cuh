@@ -90,7 +90,18 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         __syncthreads();
     }
 
-    using KVCacheGmem = KVCacheG2SFP8<kBlockN, Kernel_traits::kNThreads, kHeadDim, IsV41FP8>;
+    // FIX (device-verified): the E4M3 staging must be written
+    // with the Swizzle<3,4,3> layout the swizzled TSM loads require.  The the K-layout fix round
+    // note claimed V-direct indexes a plain (8,128) walk, so Fp8VDirectK forced the
+    // plain atom -- but the probe measured the opposite: the V-direct TsmOp (b16 trans
+    // swzl, CUBE 64x64) reading plain staging mismatches on 32/32 probe points,
+    // and reading Swizzle<3,4,3> staging matches 32/32 (multiset over all lanes;
+    // evidence/raw/p0_afrag_s45.txt).  The QK^T B-side TSM load on plain staging
+    // is 87.5% lane-permuted as well.  V-direct's own walk needs no change: it
+    // already issues swizzled loads over the same logical cube order, so with the
+    // staging swizzled both consumers read correct data.
+    using KVCacheGmem = KVCacheG2SFP8<kBlockN, Kernel_traits::kNThreads, kHeadDim, IsV41FP8,
+                                      /*Fp8VDirectK=*/false>;
 
     using ElementKVCache = typename KVCacheGmem::ElementKVCache;
     using SmemLayoutKNoAiu = typename KVCacheGmem::SmemLayoutK;
@@ -241,12 +252,27 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
                             make_stride(params.q_row_stride, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename Kernel_traits::SmemLayoutQ{});
-    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), SmemLayoutKNoAiu{});
+    // FP8 compute reads K straight out of the E4M3 staging that load_g2s_async
+// filled, so the smem view must use the FP8 element type.  It must ALSO use the
+// same tiling that gemm_pv_fp8_vdirect indexes, because V is read out of this
+// same buffer: V-direct computes
+//     cube = (kv0/kCubeH) * (kHeadDim/kCubeWFp8) + j0/kCubeWFp8
+// i.e. it assumes Kernel_traits' own FP8 K tiling (kBlockKSmem=128 columns per
+// cube).  KVCacheGmem::SmemLayoutKNopeFP8 looks similar but bakes in a
+// Swizzle<3,4,3> and a different cube order, so using it here made V-direct read
+// the wrong elements -- which showed up as garbage attention output.
+//
+// Kernel_traits::SmemLayoutK is the layout the dense FP8 path pairs with
+// V-direct, and it covers the same (kBlockN, kHeadDim) element count as the BF16
+// layout, so the surrounding offsets (sK_double, sP, ...) are unchanged.
+using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
+    typename Kernel_traits::SmemLayoutK, SmemLayoutKNoAiu>;
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), SmemLayoutKActive{});
     Tensor sVt = make_tensor(sK.data(), SmemLayoutVtransposedNoAiu{});
     Tensor sVtNoSwizzle = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
     // double shared memory for k/v cache.
-    Tensor sK_double = make_tensor(sK.data() + size(sK), SmemLayoutKNoAiu{});
+    Tensor sK_double = make_tensor(sK.data() + size(sK), SmemLayoutKActive{});
     Tensor sP = make_tensor(sK_double.data() + size(sK_double), typename Kernel_traits::SmemLayoutP{});
 
     Tensor smem_row_scale = make_tensor(make_smem_ptr(reinterpret_cast<float *>((sP.data() + size(sP)).get())),
@@ -327,7 +353,18 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         __syncthreads();
     }
 
-    auto smem_tiled_copy_S = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
+    // for fp8 the QK^T accumulator is produced by the V-direct atom in
+    // pi_k order, so the sP store must use the EpiPerm twin of TiledMmaS --
+    // exactly as the dense fp8 path does.  This is the atom's documented purpose
+    // ("EpiPerm CLayout for the pi_k sP order"); it is NOT for the O store.
+    auto smem_tiled_copy_S = [&] {
+        if constexpr (Kernel_traits::QKV_FP8) {
+            return make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{},
+                                     typename Kernel_traits::TiledMmaSPStore{});
+        } else {
+            return make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
+        }
+    }();
     auto smem_thr_copy_S = smem_tiled_copy_S.get_thread_slice(tidx);
     Tensor tSsS = smem_thr_copy_S.partition_D(sP);
 
@@ -350,7 +387,17 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
     auto tOsVt = smem_thr_copy_V.partition_S(sVt);
 #else
-    auto smem_tiled_copy_K = make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomK{}, tiled_mma_s);
+    // The K copy atom must match the K smem layout.  For FP8 that is
+// Kernel_traits::SmemCopyAtomK, the same atom the dense FP8 path pairs with the
+// same layout and with gemm_pv_fp8_vdirect.  Inventing a separate FP8 atom here
+// gave a combination whose tiling disagreed with V-direct's cube indexing.
+    auto smem_tiled_copy_K = [&] {
+        if constexpr (Kernel_traits::QKV_FP8) {
+            return make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomK{}, tiled_mma_s);
+        } else {
+            return make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomK{}, tiled_mma_s);
+        }
+    }();
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tid_thread_slice);
     auto tSsK = smem_thr_copy_K.partition_S(make_mix_tensor_like(sK));
 
@@ -480,14 +527,45 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         auto sK_cvt = make_tensor(sK.data() + buf_idx * size(sK), layout(sK));
         if constexpr (IsExtraFP4) {
             if (block_idx < ori_block_max) {
-                kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4, FloatKV>(
-                    sK_cvt, sK_cvt, tKrScale);
+                // the fp8-compute path must NOT dequantize the staged
+                // E4M3 to bf16 -- the QK^T MMA and V-direct both consume E4M3
+                // directly.  the FP8-compute round guarded only the non-ExtraFP4 branch below and
+                // missed this one, so every ExtraFP4 layer silently fed bf16
+                // bytes to an fp8 MMA.
+                if constexpr (Kernel_traits::QKV_FP8) {
+                    // apply the V4.1 per-32-channel scale but keep the
+                    // result in E4M3 -- the QK^T MMA and V-direct both read E4M3,
+                    // and dropping the scale made every score ~60x too large.
+                    kvload_gmem.template scale_fp8_inplace(sK_cvt, tKrScale);
+                } else {
+                    kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4, FloatKV>(
+                        sK_cvt, sK_cvt, tKrScale);
+                }
             } else {
-                fp4load_gmem.template cvt_fp4_store<FloatKV && kFusedSplitKV && kBlockM == 64, FloatKV>(sK_cvt);
+                // on the fp8 arm the extra FP4 pool must be staged
+                // as E4M3, not BF16 -- cvt_fp4_store writes bf16 through
+                // SmemLayoutKBF16, which the e4m3 readers misinterpret and
+                // which needs 2x the fp8 staging buffer.  Both extra-block
+                // consumers (QK^T MMA, V-direct) then read the extra blocks
+                // exactly like regular e4m3 blocks.
+                if constexpr (Kernel_traits::QKV_FP8) {
+                    fp4load_gmem.cvt_fp4_store_fp8(sK_cvt);
+                } else {
+                    fp4load_gmem.template cvt_fp4_store<FloatKV && kFusedSplitKV && kBlockM == 64, FloatKV>(sK_cvt);
+                }
             }
         } else {
-            kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4, FloatKV>(
-                sK_cvt, sK_cvt, tKrScale);
+            // FP8 compute keeps the staged E4M3 in place: both GEMMs consume FP8
+            // operands (QK^T directly, PV via the vdirect reader), so the usual
+            // in-place dequantize-to-BF16 step must not run.  Note the V4.1-FP8
+            // cache row holds K and V as the same 512 E4M3 values, so K and V
+            // cannot carry different precisions -- they are one buffer.
+            if constexpr (Kernel_traits::QKV_FP8) {
+                kvload_gmem.template scale_fp8_inplace(sK_cvt, tKrScale);
+            } else {
+                kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4, FloatKV>(
+                    sK_cvt, sK_cvt, tKrScale);
+            }
         }
         __syncthreads();
 
@@ -520,6 +598,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
             }
             flash::apply_indices_mask<kBlockN / 4>(acc_s, smem_valid_indices, warpN_idx, buf_idx);
 
+
             if constexpr (IS_FIRST_BLOCK) {
                 softmax.template softmax_rescale_per_warp</*Is_first=*/true,  /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.scale_softmax_log2);
             } else {
@@ -544,8 +623,17 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         }
 
         auto tOsVt_curr = make_tensor(tOsVt.data() + buf_idx * size(sK), layout(tOsVt));
+        if constexpr (Kernel_traits::QKV_FP8) {
+            // FP8 PV: V is read straight out of the E4M3 staging as bf16 pairs
+            // (this device has no b8 transposing ldmatrix), and the resulting
+            // pi_n column interleave is undone outside the main loop.  See
+            // gemm_pv_fp8_vdirect / permute_output_fp8 in csrc/utils.h.
+            flash::gemm_pv_fp8_vdirect<Kernel_traits>(acc_o, tOrP, tOrVt, tOsP,
+                sK.data().get(), buf_idx, tiled_mma_o, smem_tiled_copy_P, smem_thr_copy_P);
+        } else {
         flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_curr, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
                 smem_thr_copy_P, smem_thr_copy_V);
+        }
 
         if constexpr (!IS_LAST_BLOCK) {
             smem_valid_indices(nxt_buf_idx, col_in_indices) = valid;
@@ -802,7 +890,18 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
         __syncthreads();
     }
 
-    auto smem_tiled_copy_S = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
+    // for fp8 the QK^T accumulator is produced by the V-direct atom in
+    // pi_k order, so the sP store must use the EpiPerm twin of TiledMmaS --
+    // exactly as the dense fp8 path does.  This is the atom's documented purpose
+    // ("EpiPerm CLayout for the pi_k sP order"); it is NOT for the O store.
+    auto smem_tiled_copy_S = [&] {
+        if constexpr (Kernel_traits::QKV_FP8) {
+            return make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{},
+                                     typename Kernel_traits::TiledMmaSPStore{});
+        } else {
+            return make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
+        }
+    }();
     auto smem_thr_copy_S = smem_tiled_copy_S.get_thread_slice(tidx);
     Tensor tSsS = smem_thr_copy_S.partition_D(sP);
 
@@ -991,8 +1090,13 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
         }
 
         auto tOsVt_curr = make_tensor(tOsVt.data() + buf_idx * size(sK), layout(tOsVt));
+        if constexpr (Kernel_traits::QKV_FP8) {
+            flash::gemm_pv_fp8_vdirect<Kernel_traits>(acc_o, tOrP, tOrVt, tOsP,
+                sK.data().get(), buf_idx, tiled_mma_o, smem_tiled_copy_P, smem_thr_copy_P);
+        } else {
         flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_curr, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
             smem_thr_copy_P, smem_thr_copy_V);
+        }
     };
 
     if constexpr (kHeadDim == 512) {

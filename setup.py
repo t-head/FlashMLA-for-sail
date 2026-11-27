@@ -36,6 +36,7 @@ def get_sources():
         "csrc/ppu/decode/sparse/instantiations/hdim512_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/fused_v41_splitkv_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/fused_v41_h64_bf16.cu",
+        "csrc/ppu/decode/sparse/instantiations/fused_v41_h64_fp8.cu",
         "csrc/ppu/decode/sparse/instantiations/fused_v41_h128_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/sparse_decode_wg_hs64_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/sparse_decode_wg_bf16.cu",

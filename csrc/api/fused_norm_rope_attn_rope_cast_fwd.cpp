@@ -358,6 +358,20 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
             if (fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_native_wi<EnableNorm>(p, splitkv)) return;
         }
     }
+    // the FP8-compute arm differs from the BF16 arm only here.  Both
+    // share the same launcher, params and grid; only the kernel's element type
+    // (and therefore the MMA atom) changes.
+    //
+    // Only Heads == 64 has an FP8 instantiation, so the branch is compiled for
+    // that case alone -- otherwise the linker demands symbols for the H8/H128
+    // variants too.  The entry point rejects fp8_compute for other head counts,
+    // so reaching the else path with the flag set cannot happen at runtime.
+    if constexpr (Heads == 64) {
+        if (p.fp8_compute) {
+            fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_fp8_kernel<Heads, EnableNorm, ExtraFP4>(p, splitkv);
+            return;
+        }
+    }
     fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<Heads, EnableNorm, ExtraFP4>(p, splitkv);
 }
 
@@ -457,7 +471,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     double rms_norm_eps, const at::Tensor& token_positions, bool is_rope_neox_style,
     int64_t rope_dim, const at::Tensor& cos_sin_cache, int64_t n_wv_group,
     int64_t num_per_channels, bool use_tma_aligned_col_major_sf,
-    bool round_sf, bool use_packed_ue8m0) {
+    bool round_sf, bool use_packed_ue8m0, bool fp8_compute) {
     KU_CHECK_DEVICE(q);
     at::cuda::CUDAGuard guard(q.device());
     auto p = make_fused_params(q, sm_scale, d_v, attn_sink, topk_length, enable_q_norm,
@@ -540,6 +554,13 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
         p.stride_out_sf_word = out_sf.stride(2);
     }
     p.lse = lse.data_ptr<float>();
+    // select the FP8-compute five-in-one.  Only the H64 splitkv decode
+    // path has an FP8 instantiation; other shapes keep BF16, and the launcher
+    // re-checks that, so a stray flag cannot silently change kernels on a path
+    // that has no FP8 variant.
+    p.fp8_compute = fp8_compute;
+    TORCH_CHECK(!p.fp8_compute || p.h_q == 64,
+                "fp8_compute requires the H64 five-in-one decode path");
     dispatch_fused_decode(p, q);
     return {out, out_sf, lse};
 }
