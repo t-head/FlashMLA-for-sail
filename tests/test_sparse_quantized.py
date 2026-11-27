@@ -7,6 +7,9 @@ Numerical LSE proximity is deliberately not an acceptance criterion.
 """
 
 import math
+import os
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -188,6 +191,45 @@ def capture(call):
         result = call()
     torch.cuda.empty_cache()
     return graph, result
+
+
+@pytest.mark.parametrize("kind", ["prefill", "decode"])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("bf16", [False, True])
+def test_native_fp8_profiling(kind, enabled, bf16):
+    env = dict(os.environ, PPU_LIB_PERF_INSTRUMENT=str(int(enabled)),
+               PPU_LIB_SHOW_PARAMS=str(int(enabled)))
+    env["PYTHONPATH"] = os.pathsep.join(sys.path)
+    script = f"""
+import runpy
+import torch
+scope = runpy.run_path({__file__!r})
+q, kv, ids = scope["inputs"](bf16={bf16})
+if {kind!r} == "decode":
+    kv = kv.to(torch.float8_e4m3fn)
+lengths = torch.tensor([0, 1, 65, 128, 127], device="cuda", dtype=torch.int32)
+sink = torch.zeros(q.shape[1], device="cuda")
+def call():
+    return scope["quantized_attention"]({kind!r}, q, kv, ids,
+                                         topk_length=lengths, attn_sink=sink)
+scope["check"](call(), scope["reference"](q, kv, ids, lengths=lengths, sink=sink))
+graph, result = scope["capture"](call)
+lengths.fill_(128)
+ids[0, 0, 0] = 7
+graph.replay()
+scope["check"](result, scope["reference"](q, kv, ids, lengths=lengths, sink=sink))
+"""
+    result = subprocess.run([sys.executable, "-c", script], env=env,
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    labels = [line for line in result.stdout.splitlines() if line.startswith("[MLA]")]
+    assert len(labels) == (5 if enabled else 0), result.stdout
+    expected = [f"sparse:{kind}", "is_fp8:1", "topk:128", "seqlen_q:5",
+                "seqlen_k:193", "num_heads:64", "num_heads_kv:1", "head_dim:576",
+                "head_dim_v:512", f"dtype:{'bf16' if bf16 else 'fp8'}",
+                "have_attn_sink:1", "topk_len:[0,1,65,128,127]"]
+    for label in labels:
+        assert all(field in label for field in expected), label
 
 
 @pytest.mark.parametrize("heads", [1, 6, 12, 24, 31, 33, 48, 63, 65, 96])

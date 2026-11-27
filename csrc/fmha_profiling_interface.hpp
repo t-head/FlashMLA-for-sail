@@ -39,7 +39,7 @@ void add_mha_params(const std::string& key, const T& val) {
 }
 
 template <typename T>
-std::string nvtx_param2str(void* addr, int sz, hggcStream_t stream) {
+std::string nvtx_param2str(const void* addr, int sz, hggcStream_t stream) {
   std::vector<T> tmp(sz);
   hggcMemcpyAsync(tmp.data(), addr, sizeof(T) * sz, hggcMemcpyDeviceToHost, stream);
   hggcStreamSynchronize(stream);
@@ -118,6 +118,31 @@ void set_flash_attn_sparse_prefill_params(bool is_bf16,
   add_mha_params("head_dim", head_dim);
   add_mha_params("head_dim_v", head_dim_value);
   // add_mha_params("causal", is_causal);
+  add_mha_params("dtype", data_type);
+  add_mha_params("have_attn_sink", have_attn_sink);
+  if (!topk_len.empty()) {
+    add_mha_params("topk_len", topk_len);
+  }
+}
+
+void set_flash_attn_sparse_native_fp8_params(bool is_prefill, bool is_bf16,
+                                             int num_heads, int head_dim,
+                                             int head_dim_value, int seqlen_q,
+                                             int seqlen_k, int topk,
+                                             bool have_attn_sink,
+                                             const std::string &topk_len) {
+  initialize_args();
+  const std::string sparse_type = is_prefill ? "prefill" : "decode";
+  const std::string data_type = is_bf16 ? "bf16" : "fp8";
+  add_mha_params("sparse", sparse_type);
+  add_mha_params("is_fp8", true);
+  add_mha_params("topk", topk);
+  add_mha_params("seqlen_q", seqlen_q);
+  add_mha_params("seqlen_k", seqlen_k);
+  add_mha_params("num_heads", num_heads);
+  add_mha_params("num_heads_kv", 1);
+  add_mha_params("head_dim", head_dim);
+  add_mha_params("head_dim_v", head_dim_value);
   add_mha_params("dtype", data_type);
   add_mha_params("have_attn_sink", have_attn_sink);
   if (!topk_len.empty()) {

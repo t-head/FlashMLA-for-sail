@@ -286,6 +286,34 @@ struct Request {
     }
 };
 
+inline void prepare_native_fp8_profiling_params(ppu::fmha::FmhaProfParam &profiling_params,
+                                              const Request &request, bool prefill) {
+    if (!ppu::fmha::ProfilingInterface::Instance().get_op_info())
+        return;
+    const auto &params = request.params;
+    std::string topk_len_str;
+    if (params.lengths) {
+        hggcStreamCaptureStatus capture_status;
+        hggcStreamIsCapturing(params.stream, &capture_status);
+        if (capture_status != hggcStreamCaptureStatusNone) {
+            GraphCaptureModeSuspender protector(hggcStreamCaptureModeRelaxed);
+            // Read profiling parameters on a side stream to avoid synchronizing the capture stream.
+            hggcStream_t side_stream;
+            if (hggcStreamCreateWithFlags(&side_stream, hggcStreamNonBlocking) == hggcSuccess) {
+                topk_len_str = profiling_params.nvtx_param2str<int>(
+                    params.lengths, params.queries, side_stream);
+                hggcStreamDestroy(side_stream);
+            }
+        } else {
+            topk_len_str = profiling_params.nvtx_param2str<int>(
+                params.lengths, params.queries, params.stream);
+        }
+    }
+    profiling_params.set_flash_attn_sparse_native_fp8_params(
+        prefill, params.qbf, params.heads, params.dim, sparse_native_fp8::ValueDim,
+        params.queries, params.kvrows, params.width, bool(params.sink), topk_len_str);
+}
+
 inline void execute_decode(AttentionParams params, const at::Tensor &out, const at::Tensor &lse,
                            const at::Tensor &maxima = at::Tensor()) {
     using namespace sparse_native_fp8;
@@ -385,6 +413,10 @@ std::vector<at::Tensor> sparse_quantized_fwd(
     constexpr int h_kv = 1;
     const bool kv_is_bf16 = kv.scalar_type() == torch::kBFloat16;
     auto stream = launch.stream;
+    ppu::fmha::FmhaProfParam fmha_prof_params;
+    prepare_native_fp8_profiling_params(fmha_prof_params, request, true);
+    auto &profiler = ppu::fmha::ProfilingInterface::Instance();
+    profiler.instrument(true, fmha_prof_params);
     at::Tensor kv_fp8 = kv;
     auto lengths = topk_length;
     if (kv_is_bf16 && s_q > 0) {
@@ -409,6 +441,7 @@ std::vector<at::Tensor> sparse_quantized_fwd(
                        compute_aux ? request.maxima : at::Tensor());
     else
         run_sparse_prefill_fp8_fwd(launch);
+    profiler.instrument(false, fmha_prof_params);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {request.output, request.maxima, request.lse};
 }
@@ -421,7 +454,12 @@ std::vector<at::Tensor> sparse_quantized_decode_fwd(
     using namespace flashmla::quantized_attention;
     Request request(q, kv, indices, sm_scale, quantization.value_or(Config{}), d_v, sink, lengths,
                     out);
+    ppu::fmha::FmhaProfParam fmha_prof_params;
+    prepare_native_fp8_profiling_params(fmha_prof_params, request, false);
+    auto &profiler = ppu::fmha::ProfilingInterface::Instance();
+    profiler.instrument(true, fmha_prof_params);
     execute_decode(request.params, request.output, request.lse);
+    profiler.instrument(false, fmha_prof_params);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {request.output, request.lse};
 }
