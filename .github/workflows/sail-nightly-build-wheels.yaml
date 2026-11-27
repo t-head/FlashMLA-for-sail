@@ -88,7 +88,7 @@ jobs:
       release_username: ${{ secrets.RELEASE_USERNAME }}
       release_token: ${{ secrets.RELEASE_TOKEN }}
     with:
-      runs_on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on || 'x86-ubuntu2404-64-256-1' }}
+      runs_on: ${{ inputs.runs_on || 'x86-ubuntu2404-64-256-1' }}
       package_name: ${{ inputs.package_name || 'flash_mla' }}
       framework: ${{ inputs.framework || 'torch' }}
       template_repository: t-head/ci-infra
