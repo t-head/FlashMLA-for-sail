@@ -340,15 +340,15 @@ def test_flash_mla(p: TestParam) -> Result:
 
         splitkv_kernel_name = "flash_sparse_decode_fwd_kernel"
         combine_kernel_name = "flash_fwd_splitkv_mla_combine_kernel"
-        if p.fp8_kvcache_layout == quant.FP8KVCacheLayout.V41_FP8Sparse:
-            kernel_names = result.get_kernel_names()
-            direct_kernel_name = "flash_sparse_decode_fwd_h8_fp8_fp4_direct_kernel"
-            if any(direct_kernel_name in kernel for kernel in kernel_names):
-                splitkv_kernel_name = direct_kernel_name
-            elif any("flash_sparse_decode_wg_kernel" in kernel for kernel in kernel_names):
-                splitkv_kernel_name = "flash_sparse_decode_wg_kernel"
-            if any("flash_fwd_mla_combine_kernel" in name for name in kernel_names):
-                combine_kernel_name = "flash_fwd_mla_combine_kernel"
+        # M890 routes packed V3.2 FP8 caches through the warpgroup kernel too.
+        kernel_names = result.get_kernel_names()
+        direct_kernel_name = "flash_sparse_decode_fwd_h8_fp8_fp4_direct_kernel"
+        if any(direct_kernel_name in kernel for kernel in kernel_names):
+            splitkv_kernel_name = direct_kernel_name
+        elif any("flash_sparse_decode_wg_kernel" in kernel for kernel in kernel_names):
+            splitkv_kernel_name = "flash_sparse_decode_wg_kernel"
+        if any("flash_fwd_mla_combine_kernel" in name for name in kernel_names):
+            combine_kernel_name = "flash_fwd_mla_combine_kernel"
 
         # Get individual kernel time usages
         kernel_time_usages_us: Dict[str, Optional[float]] = {}

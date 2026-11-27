@@ -121,6 +121,8 @@ struct Traits_v2 : public Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE
 
     // Whether the KV cache stores FP8 (with dequant) or BF16 (direct read).
     static constexpr bool IsFP8 = IsFP8_;
+    // Independent cache codec flag: V3.2 still uses the BF16 paired operands.
+    static constexpr bool kV32FP8 = false;
     static constexpr bool kV41PairedPipeline = false;
     // Original metadata images process each parent's batch interval contiguously.
     static constexpr int kMetadataStripeFactor = 1;
@@ -357,6 +359,18 @@ struct Traits_v2 : public Traits<InputT_, !IsFP8_ && BlockM_ == 128 && (ACOMPUTE
         __mbarrier_t barriers_K0[kNumKBarriers];
         __mbarrier_t barriers_K1[kNumKBarriers];
     };
+};
+
+// Keep BF16 paired operands and PV4x2 while changing only the KV codec.
+struct V32OptimizedDecodeTraits : Traits_v2<cutlass::bfloat16_t, 576, false, 128> {
+    static constexpr bool kV32FP8 = true;
+    static constexpr int kBytesPerToken = 656;
+    static_assert(!IsFP8 && !kV41PairedPipeline && kHasExtraRopeTile &&
+                  kBlockN == 32 && kHeadDimV == 512 && kMetadataStripeFactor == 1);
+    // The host pass uses SDK 10000; only the M890 device image is launched.
+#if ACOMPUTE_VERSION >= 10500
+    static_assert(CvtGemmSwzlLd && kUsePv4x2);
+#endif
 };
 
 // Two private CTAs process alternate batch atoms of one unchanged metadata row.
