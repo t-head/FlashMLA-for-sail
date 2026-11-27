@@ -22,7 +22,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     double rms_norm_eps, const at::Tensor& token_positions, bool is_rope_neox_style,
     int64_t rope_dim, const at::Tensor& cos_sin_cache, int64_t n_wv_group,
     int64_t num_per_channels, bool use_tma_aligned_col_major_sf,
-    bool round_sf, bool use_packed_ue8m0);
+    bool round_sf, bool use_packed_ue8m0, bool fp8_compute = false);
 
 std::vector<at::Tensor> permute_q_b_proj(
     const at::Tensor& q_b_proj, const at::Tensor& scale_factors, int64_t h_q, int64_t d_q);

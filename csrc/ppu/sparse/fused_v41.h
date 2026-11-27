@@ -41,6 +41,11 @@ struct Params {
     float* max_logits;
     float* lse;
     int64_t stride_out_sf_token, stride_out_sf_group, stride_out_sf_word;
+    // run the decode five-in-one's GEMMs on the PPU1.5 E4M3xE4M3->F32
+    // atom instead of the BF16 atom (Q is quantized to E4M3 after RoPE).  This
+    // is the single switch between the two measurement arms; default false so
+    // existing callers keep the BF16 path bit-for-bit.
+    bool fp8_compute = false;
     hggcStream_t stream;
 };
 
@@ -74,6 +79,12 @@ struct SplitKVParams {
 template<int Heads, bool EnableNorm, bool ExtraFP4>
 void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
     const Params& params, const SplitKVParams& splitkv);
+
+// FP8-compute variant of the decode splitkv kernel (E4M3 QK^T and PV).
+// Declared after SplitKVParams, which it takes by reference.
+template<int Heads, bool EnableNorm, bool ExtraFP4>
+void run_fused_norm_rope_attn_rope_cast_decode_splitkv_fp8_kernel(
+    const Params& params, const SplitKVParams& split);
 
 template<bool Norm>
 bool run_fused_norm_rope_attn_rope_cast_decode_native_wi(
